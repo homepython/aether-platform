@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="pt-BR" data-theme="comfortable" data-scale="100" data-motion="full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aether — Comunicação & Streaming</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Iluminação Ambiental Suave -->
+  <div class="ambient-Transfer-canvas">
+    <div class="ambient-orb orb-petrol"></div>
+    <div class="ambient-orb orb-indigo"></div>
+  </div>
+
+  <!-- Notificações Flutuantes -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- ================= TELA INICIAL ================= -->
+  <section id="entry-screen" class="entry-overlay active">
+    <div class="entry-card surface-glass">
+      <div class="brand-header">
+        <div class="brand-logo-orb">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        </div>
+        <div>
+          <span class="brand-badge">EXPERIÊNCIA DE PRÓXIMA GERAÇÃO</span>
+          <h1>Aether</h1>
+        </div>
+      </div>
+      <p class="entry-subtitle">
+        Voz cristalina, partilha de ecrã em até <strong>1440p 60FPS</strong> e uma interface desenhada para o seu conforto diário.
+      </p>
+
+      <form id="entry-form" autocomplete="off" novalidate>
+        <div class="field-group">
+          <label for="input-name">Nome</label>
+          <input type="text" id="input-name" placeholder="Ex: Leo Silva" maxlength="28" required />
+          <span class="field-hint">O seu nome de exibição nas salas e transmissões.</span>
+        </div>
+
+        <div class="field-group">
+          <label for="input-nick">Nickname</label>
+          <div class="nick-input-wrapper">
+            <span class="nick-prefix">@</span>
+            <input type="text" id="input-nick" placeholder="Ex: Leo FPS" maxlength="20" required />
+          </div>
+          <span class="field-hint">Utilizado para menções rápidas com @ no chat.</span>
+        </div>
+
+        <button type="submit" id="btn-enter-app" class="btn-apple-primary btn-full" disabled>
+          <span>Continuar para o Aether</span>
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ================= WORKSPACE PRINCIPAL ================= -->
+  <main id="app-shell" class="app-shell hidden">
+    <!-- BARRA LATERAL ESPACIAL -->
+    <aside class="spatial-sidebar surface-glass">
+      <div class="sidebar-top">
+        <div class="app-identity">
+          <div class="app-glyph">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+          </div>
+          <div class="app-title-stack">
+            <strong>Aether</strong>
+            <span class="connection-caption">
+              <i id="net-status-dot" class="dot-indicator online"></i>
+              <span id="net-status-text">Ligado</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="sidebar-quick-actions">
+          <button type="button" id="btn-quick-theme" class="icon-btn-round" title="Alternar Tema (Confortável / Profundo)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+          <button type="button" id="btn-open-settings" class="icon-btn-round" title="Abrir Configurações">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-group-header">
+          <span>Espaços</span>
+          <button type="button" id="btn-open-create-room" class="btn-pill-mini" title="Nova Sala">+ Nova</button>
+        </div>
+        <div id="rooms-list" class="rooms-list"></div>
+      </div>
+
+      <div class="sidebar-group sidebar-group-fill">
+        <div class="sidebar-group-header">
+          <span>Na Sala (<span id="room-user-count">0</span>)</span>
+          <small class="subtle-label">Clique p/ ajustar som</small>
+        </div>
+        <div id="participants-list" class="participants-list"></div>
+      </div>
+
+      <div class="sidebar-profile-card">
+        <div class="profile-left">
+          <div class="avatar-circle" id="self-avatar">L</div>
+          <div class="profile-meta">
+            <strong id="self-name">Leo Silva</strong>
+            <span id="self-nick" class="mono">@leofps</span>
+          </div>
+        </div>
+        <div class="voice-activity-ring" title="Atividade do Microfone">
+          <div id="local-mic-level" class="voice-activity-bar"></div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- CANVAS PRINCIPAL ESPACIAL -->
+    <div id="workspace-grid" class="spatial-main-canvas no-streams-mode">
+      <header class="canvas-header surface-glass">
+        <div class="canvas-header-left">
+          <span id="current-room-icon" class="room-badge-icon">🔊</span>
+          <div class="room-heading">
+            <h2 id="current-room-title">Lobby Principal</h2>
+            <span id="active-streams-counter" class="room-sub-status">Conversa em tempo real</span>
+          </div>
+        </div>
+
+        <div class="canvas-header-right">
+          <div class="network-chip" title="Latência e Estabilidade da Ligação">
+            <span class="net-bar"></span>
+            <span class="mono" id="telemetry-ping">-- ms</span>
+            <span class="subtle-sep">•</span>
+            <span class="mono" id="telemetry-loss">0%</span>
+          </div>
+
+          <button type="button" id="btn-quick-stream-header" class="btn-apple-soft">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            <span>Partilhar Ecrã</span>
+          </button>
+        </div>
+      </header>
+
+      <div class="canvas-body">
+        <!-- PALCO DE TRANSMISSÕES -->
+        <section id="stage-area" class="stage-area surface-glass">
+          <div id="focused-controls" class="stage-floating-bar hidden">
+            <div class="stream-quality-hud mono" id="focused-telemetry-hud">1080p • 60 FPS</div>
+            <div class="stage-bar-actions">
+              <button type="button" id="btn-toggle-sharpen" class="btn-chip active-sharpen" title="Realce Seguro de Contraste via GPU">
+                ✨ Nitidez
+              </button>
+              <div class="volume-pill">
+                <span>🔊</span>
+                <input type="range" id="focused-stream-volume" min="0" max="200" value="100" />
+                <span class="mono" id="focused-volume-label">100%</span>
+              </div>
+              <button type="button" id="btn-mute-focused-stream" class="btn-chip">Silenciar</button>
+              <button type="button" id="btn-fullscreen-stream" class="btn-chip">Ecrã Inteiro</button>
+              <button type="button" id="btn-stop-watching" class="btn-chip danger">Fechar</button>
+              <button type="button" id="btn-minimize-stream" class="btn-chip primary">Grade</button>
+            </div>
+          </div>
+
+          <div id="stage-empty-state" class="stage-empty hidden"></div>
+          <div id="streams-grid" class="streams-grid"></div>
+        </section>
+
+        <!-- ÁREA DE CONVERSA -->
+        <section class="chat-panel surface-glass" id="chat-dropzone">
+          <div id="dropzone-overlay" class="dropzone-overlay hidden">
+            <div class="dropzone-box">
+              <div class="dropzone-icon">📂</div>
+              <strong>Largue o ficheiro para partilhar</strong>
+              <small>Imagens, Vídeos, ZIP, PDF, Documentos e Executáveis</small>
+            </div>
+          </div>
+
+          <div id="chat-messages" class="chat-messages"></div>
+
+          <div class="composer-dock">
+            <div id="clipboard-preview-bar" class="composer-attachment-bar hidden">
+              <div class="attachment-preview-left">
+                <img id="clipboard-preview-img" src="" alt="Preview" />
+                <div class="attachment-preview-meta">
+                  <strong id="clipboard-preview-name">imagem.png</strong>
+                  <small id="clipboard-preview-size">Pronta a enviar</small>
+                </div>
+              </div>
+              <button type="button" id="btn-cancel-clipboard" class="icon-btn-Ghost">✕</button>
+            </div>
+
+            <div id="reply-preview-bar" class="composer-reply-bar hidden">
+              <div class="reply-bar-text">
+                A responder a <strong id="reply-target-nick">@user</strong>: <span id="reply-target-snippet"></span>
+              </div>
+              <button type="button" id="btn-cancel-reply" class="icon-btn-Ghost">✕</button>
+            </div>
+
+            <div id="emoji-picker-bar" class="emoji-popover hidden">
+              <button type="button" class="emoji-btn">🔥</button>
+              <button type="button" class="emoji-btn">🚀</button>
+              <button type="button" class="emoji-btn">🎮</button>
+              <button type="button" class="emoji-btn">🎧</button>
+              <button type="button" class="emoji-btn">👏</button>
+              <button type="button" class="emoji-btn">😂</button>
+              <button type="button" class="emoji-btn">⚡</button>
+              <button type="button" class="emoji-btn">💎</button>
+              <button type="button" class="emoji-btn">❤️</button>
+              <button type="button" class="emoji-btn">👀</button>
+            </div>
+
+            <div id="mention-autocomplete" class="mention-autocomplete hidden">
+              <div class="mention-autocomplete-header">Mencionar pessoa na sala</div>
+              <div id="mention-autocomplete-list" class="mention-autocomplete-list"></div>
+            </div>
+
+            <form id="chat-form" class="composer-bar" autocomplete="off">
+              <input type="file" id="file-input-hidden" hidden />
+              <button type="button" id="btn-attach-file" class="composer-tool-btn" title="Anexar Ficheiro">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+              </button>
+              <button type="button" id="btn-toggle-emoji" class="composer-tool-btn" title="Inserir Emoji">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></svg>
+              </button>
+              <input type="text" id="chat-input" placeholder="Escreva uma mensagem, @ para mencionar ou cole uma imagem..." maxlength="1000" />
+              <button type="submit" class="composer-send-btn" title="Enviar">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+              </button>
+            </form>
+          </div>
+        </section>
+      </div>
+
+      <!-- CÁPSULA FLUTUANTE DE CONTROLO DE MÍDIA -->
+      <div class="floating-media-capsule surface-glass">
+        <button type="button" id="btn-toggle-mic" class="capsule-btn active" title="Ativar / Silenciar Microfone">
+          <span id="icon-mic" class="capsule-icon">🎙️</span>
+          <span class="capsule-label">Microfone</span>
+        </button>
+
+        <button type="button" id="btn-toggle-deafen" class="capsule-btn active" title="Ativar / Desativar Som da Sala">
+          <span id="icon-deafen" class="capsule-icon">🎧</span>
+          <span class="capsule-label">Áudio</span>
+        </button>
+
+        <div class="capsule-divider"></div>
+
+        <button type="button" id="btn-start-stream" class="capsule-btn stream-action" title="Transmitir Ecrã ou Aplicação">
+          <span class="capsule-icon">🖥️</span>
+          <span id="label-stream-btn" class="capsule-label">Transmitir</span>
+        </button>
+
+        <button type="button" id="btn-capsule-settings" class="capsule-btn icon-only" title="Configurações">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ================= MENU DEDICADO DE CONFIGURAÇÕES ================= -->
+  <div id="modal-settings" class="modal-backdrop hidden">
+    <div class="settings-window surface-glass">
+      <aside class="settings-sidebar">
+        <div class="settings-sidebar-header">
+          <strong>Configurações</strong>
+          <span>Preferências do Sistema</span>
+        </div>
+
+        <nav class="settings-nav">
+          <button type="button" class="settings-nav-item active" data-tab="tab-audio">
+            <span class="nav-icon">🎙️</span>
+            <div>
+              <strong>Áudio & Voz</strong>
+              <small>Microfone, Gate e Dispositivos</small>
+            </div>
+          </button>
+
+          <button type="button" class="settings-nav-item" data-tab="tab-stream">
+            <span class="nav-icon">🖥️</span>
+            <div>
+              <strong>Transmissão</strong>
+              <small>Resolução, FPS e Bitrate</small>
+            </div>
+          </button>
+
+          <button type="button" class="settings-nav-item" data-tab="tab-interface">
+            <span class="nav-icon">🎨</span>
+            <div>
+              <strong>Interface</strong>
+              <small>Temas, Escala e Animações</small>
+            </div>
+          </button>
+        </nav>
+      </aside>
+
+      <div class="settings-content">
+        <div class="settings-content-header">
+          <h3 id="settings-panel-title">Áudio & Processamento Vocal</h3>
+          <button type="button" id="btn-close-settings" class="icon-btn-round">✕</button>
+        </div>
+
+        <!-- ABA 1: ÁUDIO -->
+        <div id="tab-audio" class="settings-tab-pane active">
+          <div class="settings-group-card">
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Modo de Ativação do Microfone</strong>
+                <small>Escolha entre deteção vocal inteligente ou tecla dedicada.</small>
+              </div>
+              <select id="select-voice-mode" class="apple-select">
+                <option value="vad">Detecção de Voz (Automático)</option>
+                <option value="ptt">Push-To-Talk (Segurar Tecla V)</option>
+              </select>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Sensibilidade do Noise Gate (<span id="gate-threshold-label" class="mono">38 dB</span>)</strong>
+                <small>Bloqueia respiração, movimentos na cadeira e toques no microfone. (<span id="vad-gate-state-text">Silêncio</span>)</small>
+              </div>
+              <input type="range" id="input-gate-threshold" min="15" max="65" value="38" class="apple-slider" />
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Noise Gate Inteligente</strong>
+                <small>Silencia automaticamente o canal quando não há voz humana.</small>
+              </div>
+              <label class="apple-switch">
+                <input type="checkbox" id="toggle-noise-gate" checked />
+                <span class="switch-slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Noise Suppression & Filtro Vocal</strong>
+                <small>Filtra ruídos de fundo preservando o timbre natural da voz (sem afetar lives).</small>
+              </div>
+              <label class="apple-switch">
+                <input type="checkbox" id="toggle-noise-suppression" checked />
+                <span class="switch-slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-group-card">
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Dispositivo de Entrada (Microfone)</strong>
+                <small>Selecione o microfone utilizado nas salas de voz.</small>
+              </div>
+              <select id="select-audio-input" class="apple-select">
+                <option value="default">Microfone Padrão do Sistema</option>
+              </select>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Dispositivo de Saída (Auscultadores / Colunas)</strong>
+                <small>Selecione onde deseja ouvir as vozes e transmissões.</small>
+              </div>
+              <select id="select-audio-output" class="apple-select">
+                <option value="default">Saída Padrão do Sistema</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- ABA 2: TRANSMISSÃO -->
+        <div id="tab-stream" class="settings-tab-pane hidden">
+          <div class="settings-group-card">
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Resolução Predefinida</strong>
+                <small>Qualidade de imagem ao iniciar uma partilha de ecrã.</small>
+              </div>
+              <select id="settings-stream-res" class="apple-select">
+                <option value="720">720p HD (1280×720)</option>
+                <option value="1080" selected>1080p Full HD (1920×1080)</option>
+                <option value="1440">1440p 2K QHD (2560×1440)</option>
+              </select>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Taxa de Quadros (FPS)</strong>
+                <small>Fluidez de movimento para vídeos e jogos competitivos.</small>
+              </div>
+              <select id="settings-stream-fps" class="apple-select">
+                <option value="30">30 FPS Reais (Cinema / Software)</option>
+                <option value="60" selected>60 FPS Reais (Jogos & Fluidez Máxima)</option>
+              </select>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Limite de Bitrate de Vídeo</strong>
+                <small>Maior bitrate elimina pixelização em movimentos rápidos.</small>
+              </div>
+              <select id="settings-stream-bitrate" class="apple-select">
+                <option value="auto" selected>Automático Inteligente (Até 20 Mbps)</option>
+                <option value="8000">Equilibrado (8 Mbps)</option>
+                <option value="14000">Alta Fidelidade (14 Mbps)</option>
+                <option value="20000">Ultra Sem Compressão Visível (20 Mbps)</option>
+              </select>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Perfil de Qualidade e Nitidez</strong>
+                <small>Priorizar leitura de textos pequenos ou movimento rápido de câmara.</small>
+              </div>
+              <select id="select-content-hint" class="apple-select">
+                <option value="detail" selected>Nitidez de Textos & Uso Misto (1:1)</option>
+                <option value="motion">Jogos FPS / Corrida (Fluidez Extrema)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- ABA 3: INTERFACE -->
+        <div id="tab-interface" class="settings-tab-pane hidden">
+          <div class="settings-group-card">
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Tema Visual da Plataforma</strong>
+                <small>Escolha entre o tom suave de grafite/azul petróleo ou escuro profundo.</small>
+              </div>
+              <div class="theme-selector-pills">
+                <button type="button" class="theme-pill active" data-theme-val="comfortable">
+                  <span class="theme-swatch comfortable-swatch"></span>
+                  <span>Escuro Confortável</span>
+                </button>
+                <button type="button" class="theme-pill" data-theme-val="deep">
+                  <span class="theme-swatch deep-swatch"></span>
+                  <span>Escuro Profundo</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Escala da Interface</strong>
+                <small>Ajusta o dimensionamento geral dos textos e painéis.</small>
+              </div>
+              <select id="select-ui-scale" class="apple-select">
+                <option value="95">Compacta (95%)</option>
+                <option value="100" selected>Padrão Apple (100%)</option>
+                <option value="105">Confortável Ampliada (105%)</option>
+              </select>
+            </div>
+
+            <div class="setting-divider"></div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <strong>Microinterações e Animações Fluídas</strong>
+                <small>Transições suaves ao abrir painéis, passar o rato e enviar mensagens.</small>
+              </div>
+              <label class="apple-switch">
+                <input type="checkbox" id="toggle-ui-animations" checked />
+                <span class="switch-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= MODAL RÁPIDO ANTES DE TRANSMITIR ================= -->
+  <div id="modal-stream-config" class="modal-backdrop hidden">
+    <div class="modal-card surface-glass">
+      <div class="modal-header">
+        <h3>Partilhar Ecrã ou Aplicação</h3>
+        <button type="button" id="btn-close-stream-modal" class="icon-btn-round">✕</button>
+      </div>
+      <p class="modal-desc">
+        O áudio do vídeo, filme ou jogo mantém-se <strong>100% constante e independente</strong> do seu microfone.
+      </p>
+
+      <div class="config-section">
+        <label>Resolução</label>
+        <div class="segmented-options" id="resolution-options">
+          <button type="button" class="seg-btn" data-res="720">
+            <strong>720p</strong>
+            <small>HD Fluido</small>
+          </button>
+          <button type="button" class="seg-btn active" data-res="1080">
+            <strong>1080p</strong>
+            <small>Full HD Nitidez</small>
+          </button>
+          <button type="button" class="seg-btn" data-res="1440">
+            <strong>1440p (2K)</strong>
+            <small>Ultra QHD</small>
+          </button>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <label>Taxa de Quadros</label>
+        <div class="segmented-options" id="fps-options">
+          <button type="button" class="seg-btn" data-fps="30">
+            <strong>30 FPS</strong>
+            <small>Filmes & Apps</small>
+          </button>
+          <button type="button" class="seg-btn active" data-fps="60">
+            <strong>60 FPS</strong>
+            <small>Jogos & Fluidez</small>
+          </button>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" id="btn-cancel-stream-modal" class="btn-apple-secondary">Cancelar</button>
+        <button type="button" id="btn-confirm-start-stream" class="btn-apple-primary">
+          <span>Escolher Janela ou Ecrã</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= MODAL: CRIAR NOVA SALA ================= -->
+  <div id="modal-create-room" class="modal-backdrop hidden">
+    <div class="modal-card surface-glass">
+      <div class="modal-header">
+        <h3>Novo Espaço de Voz & Live</h3>
+        <button type="button" id="btn-close-room-modal" class="icon-btn-round">✕</button>
+      </div>
+      <form id="form-create-room" autocomplete="off">
+        <div class="field-group">
+          <label for="new-room-name">Nome do Espaço</label>
+          <input type="text" id="new-room-name" placeholder="Ex: Lounge Principal / Cinema 2K" required maxlength="32" />
+        </div>
+        <div class="field-group checkbox-row">
+          <input type="checkbox" id="new-room-private" />
+          <label for="new-room-private">Espaço Privado (Protegido por Palavra-passe)</label>
+        </div>
+        <div class="field-group hidden" id="password-field-group">
+          <label for="new-room-password">Palavra-passe</label>
+          <input type="password" id="new-room-password" placeholder="Digite a palavra-passe..." maxlength="24" />
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="btn-cancel-room-modal" class="btn-apple-secondary">Cancelar</button>
+          <button type="submit" class="btn-apple-primary">Criar Espaço</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ================= LIGHTBOX: EXPANSÃO E ZOOM DE IMAGENS ================= -->
+  <div id="image-lightbox" class="lightbox-backdrop hidden">
+    <div class="lightbox-toolbar surface-glass">
+      <span id="lightbox-caption" class="mono">imagem.png</span>
+      <div class="lightbox-actions">
+        <button type="button" id="btn-zoom-out" class="btn-chip">➖</button>
+        <span id="lightbox-zoom-label" class="mono" style="font-size:12px;min-width:48px;text-align:center;">100%</span>
+        <button type="button" id="btn-zoom-in" class="btn-chip">➕</button>
+        <button type="button" id="btn-zoom-reset" class="btn-chip">100%</button>
+        <a id="btn-lightbox-download" href="#" download="imagem.png" class="btn-chip primary" style="text-decoration:none;">Transferir</a>
+        <button type="button" id="btn-close-lightbox" class="btn-chip danger">✕</button>
+      </div>
+    </div>
+    <div id="lightbox-stage" class="lightbox-stage">
+      <img id="lightbox-img" src="" alt="Visualização Ampliada" draggable="false" />
+    </div>
+  </div>
+
+  <!-- Contentor oculto exclusivo para os fluxos de voz isolados -->
+  <div id="remote-voice-audios" style="display:none;"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
