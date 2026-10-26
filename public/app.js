@@ -2,14 +2,14 @@
   const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 
   // ================= CONFIGURAÇÃO DO SERVIDOR CLOUD 24/7 OU LOCAL =================
-  const savedServerMode = localStorage.getItem('aether_server_mode') || 'auto'; // 'auto' | 'cloud'
+  const savedServerMode = localStorage.getItem('aether_server_mode') || 'auto';
   const savedCloudUrl = (localStorage.getItem('aether_cloud_url') || '').trim().replace(/\/+$/, '');
 
   function resolveSocketServerUrl() {
     if (savedServerMode === 'cloud' && savedCloudUrl && /^https?:\/\//i.test(savedCloudUrl)) {
       return savedCloudUrl;
     }
-    return undefined; // Conecta automaticamente ao servidor da origem atual / local
+    return undefined;
   }
 
   const activeServerEndpoint = resolveSocketServerUrl();
@@ -23,15 +23,27 @@
     : io({
         reconnection: true,
         reconnectionDelay: 500,
-        reconnectionDelayMax: 3000
+        reconnectionDelayMax: 3000,
+        transports: ['websocket', 'polling']
       });
 
+  // Inclui servidores STUN + TURN (UDP/TCP/TLS) para garantir ligação de voz direta
+  // entre todos os amigos na sala mesmo atrás de CGNAT ou firewalls de operadoras
   const RTC_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' }
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      {
+        urls: [
+          'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:443',
+          'turn:openrelay.metered.ca:443?transport=tcp'
+        ],
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
     ],
     iceCandidatePoolSize: 10,
     bundlePolicy: 'max-bundle',
@@ -47,13 +59,10 @@
     localMicRawStream: null,
     localMicFilterNodes: null,
     localScreenStream: null,
-    relayCaptureVideo: null,
-    relayCaptureCanvas: null,
-    relayIntervalId: null,
     audioContext: null,
     voiceGateEnabled: true,
     noiseSuppressionEnabled: true,
-    localNoiseLevel: localStorage.getItem('aether_local_nr_level') || 'auto', // 'auto' | 'low' | 'medium' | 'high'
+    localNoiseLevel: localStorage.getItem('aether_local_nr_level') || 'auto',
     voiceGateThreshold: 18,
     isSelfSpeaking: false,
     voiceMode: 'vad',
@@ -101,7 +110,7 @@
     },
     peers: new Map(),
     userVolumes: new Map(),
-    userNoiseLevels: new Map() // socketId -> 'auto' | 'low' | 'medium' | 'high'
+    userNoiseLevels: new Map()
   };
 
   const el = {
@@ -209,7 +218,6 @@
     toggleUiAnimations: document.getElementById('toggle-ui-animations')
   };
 
-  // ================= INJEÇÃO AUTOMÁTICA DE ESTILOS E COMPONENTES (CLOUD 24/7 + FILTRO RUÍDO + HUD) =================
   function injectAuxiliaryStyles() {
     if (document.getElementById('aether-final-injected-styles')) return;
     const style = document.createElement('style');
@@ -298,9 +306,7 @@
   }
   injectAuxiliaryStyles();
 
-  // Injeta nas Configurações e na Tela Inicial o Seletor Cloud 24/7, Nível de Ruído e Efeitos Sonoros
   function injectAdvancedSettingsAndCloudUI() {
-    // 1. Aba de Áudio: Seletor de Nível de Cancelamento de Ruído (Automático, Baixo, Médio, Alto) + Efeitos Sonoros de Sala
     const tabAudio = document.getElementById('tab-audio');
     if (tabAudio && !document.getElementById('select-local-nr-level')) {
       const audioExtraCard = document.createElement('div');
@@ -353,7 +359,6 @@
       }
     }
 
-    // 2. Aba de Interface / Servidor Cloud 24/7 nas Configurações
     const tabInterface = document.getElementById('tab-interface');
     if (tabInterface && !document.getElementById('cloud-server-settings-card')) {
       const cloudCard = document.createElement('div');
@@ -421,7 +426,6 @@
       });
     }
 
-    // 3. Atalho Rápido de Servidor Cloud 24/7 na Tela Inicial (Entry Screen)
     if (el.entryForm && !document.getElementById('entry-cloud-box')) {
       const entryCloud = document.createElement('div');
       entryCloud.id = 'entry-cloud-box';
@@ -480,9 +484,8 @@
       osc.type = 'sine';
 
       if (type === 'self-join') {
-        // Acorde ascendente suave (Você entrou na sala)
-        osc.frequency.setValueAtTime(440, now);        // A4
-        osc.frequency.exponentialRampToValueAtTime(659.25, now + 0.14); // E5
+        osc.frequency.setValueAtTime(440, now);
+        osc.frequency.exponentialRampToValueAtTime(659.25, now + 0.14);
         gain.gain.setValueAtTime(0.07, now);
         gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
         osc.connect(gain);
@@ -490,9 +493,8 @@
         osc.start(now);
         osc.stop(now + 0.3);
       } else if (type === 'self-leave') {
-        // Acorde descendente suave (Você saiu da sala)
-        osc.frequency.setValueAtTime(587.33, now);     // D5
-        osc.frequency.exponentialRampToValueAtTime(349.23, now + 0.16); // F4
+        osc.frequency.setValueAtTime(587.33, now);
+        osc.frequency.exponentialRampToValueAtTime(349.23, now + 0.16);
         gain.gain.setValueAtTime(0.07, now);
         gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
         osc.connect(gain);
@@ -500,9 +502,8 @@
         osc.start(now);
         osc.stop(now + 0.3);
       } else if (type === 'peer-join') {
-        // Toque duplo cristalino (Um amigo entrou na sala)
-        osc.frequency.setValueAtTime(523.25, now);     // C5
-        osc.frequency.setValueAtTime(783.99, now + 0.08); // G5
+        osc.frequency.setValueAtTime(523.25, now);
+        osc.frequency.setValueAtTime(783.99, now + 0.08);
         gain.gain.setValueAtTime(0.06, now);
         gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
         osc.connect(gain);
@@ -510,9 +511,8 @@
         osc.start(now);
         osc.stop(now + 0.28);
       } else if (type === 'peer-leave') {
-        // Toque duplo suave descendente (Um amigo saiu da sala)
-        osc.frequency.setValueAtTime(659.25, now);     // E5
-        osc.frequency.setValueAtTime(440.0, now + 0.09); // A4
+        osc.frequency.setValueAtTime(659.25, now);
+        osc.frequency.setValueAtTime(440.0, now + 0.09);
         gain.gain.setValueAtTime(0.055, now);
         gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
         osc.connect(gain);
@@ -782,12 +782,14 @@
   el.settingsStreamRes?.addEventListener('change', () => {
     state.streamSettings.resolution = Number(el.settingsStreamRes.value);
     syncStreamModalButtons();
+    if (state.isStreaming) enforceHighQualityForAllViewers();
     updateBroadcasterControlPanel();
   });
 
   el.settingsStreamFps?.addEventListener('change', () => {
     state.streamSettings.fps = Number(el.settingsStreamFps.value);
     syncStreamModalButtons();
+    if (state.isStreaming) enforceHighQualityForAllViewers();
     updateBroadcasterControlPanel();
   });
 
@@ -858,9 +860,8 @@
     });
   });
 
-  // ================= 2. MOTOR DE VOZ E PERFIS DE FILTRAGEM DE RUÍDO (AUTO / BAIXO / MÉDIO / ALTO) =================
+  // ================= 2. MOTOR DE VOZ E PERFIS DE FILTRAGEM DE RUÍDO =================
   function getNoiseFilterFrequencies(level) {
-    // Atenua frequências de ventilador/ar-condicionado (hum grave + chiado agudo) sem bloquear a voz humana (300Hz-3400Hz)
     switch (level) {
       case 'low':
         return { hpFreq: 80, lpFreq: 12000 };
@@ -1016,7 +1017,7 @@
     updateLocalMicTrackEnabledState();
   });
 
-  // ================= 3. ESPAÇOS / SALAS COM EFEITOS SONOROS DE ENTRADA E SAÍDA =================
+  // ================= 3. ESPAÇOS / SALAS =================
   function renderRoomsList() {
     el.roomsList.innerHTML = '';
     state.rooms.forEach((room) => {
@@ -1104,7 +1105,7 @@
     });
   });
 
-  // ================= 4. WEBRTC ENGINE =================
+  // ================= 4. WEBRTC ENGINE (ALTA QUALIDADE SDP + MALHA DE VOZ SEM COLISÃO) =================
   function getTargetBitrateKbps() {
     if (state.streamSettings.bitrateMode !== 'auto') {
       return Number(state.streamSettings.bitrateMode);
@@ -1114,6 +1115,31 @@
       : state.streamSettings.resolution === 1080
         ? 12000
         : 6500;
+  }
+
+  // Injeta parâmetros de bitrate alto diretamente no SDP de vídeo para impedir compressão excessiva na nuvem
+  function enhanceSdpForHighQualityStream(sdp) {
+    if (!sdp) return sdp;
+    const targetMax = getTargetBitrateKbps();
+    const startBitrate = Math.min(10000, targetMax);
+    const minBitrate = Math.min(4500, Math.round(targetMax * 0.5));
+
+    const sections = sdp.split('\r\nm=');
+    for (let i = 1; i < sections.length; i++) {
+      if (sections[i].startsWith('video')) {
+        if (!/b=AS:\d+/.test(sections[i])) {
+          sections[i] = sections[i].replace(
+            /(c=IN IP[46] [^\r\n]+\r\n)/,
+            `$1b=AS:${targetMax}\r\n`
+          );
+        }
+        sections[i] = sections[i].replace(
+          /(a=fmtp:\d+ (?!.*x-google-max-bitrate)[^\r\n]+)/g,
+          `$1;x-google-max-bitrate=${targetMax};x-google-min-bitrate=${minBitrate};x-google-start-bitrate=${startBitrate}`
+        );
+      }
+    }
+    return sections.join('\r\nm=');
   }
 
   function buildLocalStreamMeta() {
@@ -1177,7 +1203,7 @@
     }
   }
 
-  async function negotiateWithPeer(peerId, peerObj) {
+  async function negotiateWithPeer(peerId, peerObj, iceRestart = false) {
     const pc = peerObj.pc;
     if (peerObj.makingOffer) {
       peerObj.needsAnotherNegotiation = true;
@@ -1192,10 +1218,15 @@
       peerObj.makingOffer = true;
       peerObj.needsAnotherNegotiation = false;
 
-      const offer = await pc.createOffer();
+      const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
       if (pc.signalingState !== 'stable') return;
 
-      await pc.setLocalDescription(offer);
+      const enhancedOffer = {
+        type: offer.type,
+        sdp: enhanceSdpForHighQualityStream(offer.sdp)
+      };
+
+      await pc.setLocalDescription(enhancedOffer);
       socket.emit('webrtc:signal', {
         to: peerId,
         data: {
@@ -1238,12 +1269,15 @@
       webrtcVideoConfirmed: false,
       makingOffer: false,
       needsAnotherNegotiation: false,
-      ignoreOffer: false
+      ignoreOffer: false,
+      suppressAutoNegotiation: true
     };
     state.peers.set(peerId, peerObj);
 
     sendStreamIdsMeta(peerId);
 
+    // Suprime onnegotiationneeded durante a adição inicial das faixas para evitar que
+    // ambos os utilizadores enviem ofertas ao mesmo tempo (Glare) quando conectados via Render!
     if (state.localVoiceStream) {
       state.localVoiceStream.getTracks().forEach((track) => {
         const alreadySent = pc.getSenders().some(s => s.track === track);
@@ -1258,6 +1292,8 @@
       });
     }
 
+    peerObj.suppressAutoNegotiation = false;
+
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
         socket.emit('webrtc:signal', { to: peerId, data: { candidate } });
@@ -1265,8 +1301,20 @@
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected' && state.isStreaming) {
-        setTimeout(() => enforceHighQualityForAllViewers(), 300);
+      if (pc.connectionState === 'connected') {
+        if (state.isStreaming) {
+          setTimeout(() => enforceHighQualityForAllViewers(), 250);
+        }
+      }
+    };
+
+    // Recuperação automática de ICE caso a ligação direta entre dois amigos oscile
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed') {
+        const polite = socket.id < peerId;
+        if (!polite && pc.signalingState === 'stable') {
+          negotiateWithPeer(peerId, peerObj, true);
+        }
       }
     };
 
@@ -1321,13 +1369,13 @@
         return;
       }
 
-      // 2. Trilha de ÁUDIO
+      // 2. Trilha de ÁUDIO (Determinístico: nunca desvia voz de microfone para stream de vídeo)
       if (incomingTrack.kind === 'audio') {
-        const isDefinitelyScreenAudio =
+        const isDefinitelyScreenAudio = Boolean(
           (peerObj.screenAudioTrackId && incomingTrack.id === peerObj.screenAudioTrackId) ||
           (incomingStream && peerObj.screenStreamId && incomingStream.id === peerObj.screenStreamId) ||
-          (incomingStream && incomingStream.getVideoTracks().length > 0) ||
-          (peerObj.attachedVoiceTrackId && incomingTrack.id !== peerObj.attachedVoiceTrackId && (!peerObj.voiceTrackId || incomingTrack.id !== peerObj.voiceTrackId));
+          (incomingStream && incomingStream.getVideoTracks().length > 0)
+        );
 
         if (isDefinitelyScreenAudio) {
           peerObj.screenAudioTrackId = incomingTrack.id;
@@ -1488,13 +1536,6 @@
       return;
     }
 
-    if (data.relayFrame) {
-      if (state.stoppedWatchingPeers.has(from)) return;
-      renderRelayFrameOnTile(from, peerObj.user, data.relayFrame);
-      socket.emit('webrtc:signal', { to: from, data: { viewerStatus: 'watching' } });
-      return;
-    }
-
     if (data.streamMeta) {
       applyRemoteStreamMeta(from, peerObj, data.streamMeta);
       if (!data.description && !data.candidate) return;
@@ -1524,7 +1565,11 @@
 
           if (desc.type === 'offer') {
             const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
+            const enhancedAnswer = {
+              type: answer.type,
+              sdp: enhanceSdpForHighQualityStream(answer.sdp)
+            };
+            await pc.setLocalDescription(enhancedAnswer);
             socket.emit('webrtc:signal', {
               to: from,
               data: {
@@ -1532,11 +1577,24 @@
                 streamMeta: buildLocalStreamMeta()
               }
             });
-            setTimeout(() => enforceHighQualityForAllViewers(), 300);
+
+            // Se estivermos a transmitir ecrã quando um novo utilizador nos envia uma oferta de entrada,
+            // garante a negociação imediata das nossas faixas de vídeo/áudio da live para ele
+            if (state.isStreaming && state.localScreenStream) {
+              setTimeout(() => {
+                negotiateWithPeer(from, peerObj);
+                enforceHighQualityForAllViewers();
+              }, 120);
+            } else {
+              setTimeout(() => enforceHighQualityForAllViewers(), 250);
+            }
           } else if (desc.type === 'answer') {
             if (peerObj.needsAnotherNegotiation && pc.signalingState === 'stable') {
               peerObj.needsAnotherNegotiation = false;
               negotiateWithPeer(from, peerObj);
+            }
+            if (state.isStreaming) {
+              setTimeout(() => enforceHighQualityForAllViewers(), 200);
             }
           }
         } else if (data.candidate) {
@@ -1738,85 +1796,26 @@
       updateBroadcasterControlPanel();
       updateStageLayout();
       syncMultiStreamAudioBus();
-      startHybridFrameRelayLoop(stream);
-      setTimeout(() => enforceHighQualityForAllViewers(), 500);
+      setTimeout(() => enforceHighQualityForAllViewers(), 350);
     } catch (err) {
       console.log('Partilha de ecrã cancelada:', err);
     }
-  }
-
-  function startHybridFrameRelayLoop(stream) {
-    stopHybridFrameRelayLoop();
-
-    const hiddenVideo = document.createElement('video');
-    hiddenVideo.muted = true;
-    hiddenVideo.playsInline = true;
-    hiddenVideo.autoplay = true;
-    hiddenVideo.srcObject = stream;
-    hiddenVideo.play().catch(() => {});
-
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d', { alpha: false });
-
-    state.relayCaptureVideo = hiddenVideo;
-    state.relayCaptureCanvas = canvas;
-
-    state.relayIntervalId = setInterval(() => {
-      if (!state.isStreaming || !state.localScreenStream) return;
-      if (hiddenVideo.readyState < 2 || hiddenVideo.videoWidth === 0) return;
-
-      const peersNeedingRelay = [];
-      for (const [peerId, peerObj] of state.peers.entries()) {
-        if (!peerObj.webrtcVideoConfirmed) {
-          peersNeedingRelay.push(peerId);
-        }
-      }
-      if (peersNeedingRelay.length === 0) return;
-
-      const targetW = Math.min(1280, hiddenVideo.videoWidth);
-      const targetH = Math.round((targetW / hiddenVideo.videoWidth) * hiddenVideo.videoHeight);
-      if (canvas.width !== targetW || canvas.height !== targetH) {
-        canvas.width = targetW;
-        canvas.height = targetH;
-      }
-
-      ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
-      const jpgDataUrl = canvas.toDataURL('image/jpeg', 0.62);
-
-      peersNeedingRelay.forEach((peerId) => {
-        socket.emit('webrtc:signal', {
-          to: peerId,
-          data: { relayFrame: jpgDataUrl }
-        });
-      });
-    }, 110);
-  }
-
-  function stopHybridFrameRelayLoop() {
-    if (state.relayIntervalId) {
-      clearInterval(state.relayIntervalId);
-      state.relayIntervalId = null;
-    }
-    if (state.relayCaptureVideo) {
-      state.relayCaptureVideo.srcObject = null;
-      state.relayCaptureVideo = null;
-    }
-    state.relayCaptureCanvas = null;
   }
 
   async function applyVideoSenderParameters(sender) {
     if (!sender || !sender.track || sender.track.kind !== 'video') return;
     try {
       const params = sender.getParameters();
-      if (!params.encodings || params.encodings.length === 0) return;
+      if (!params.encodings) params.encodings = [{}];
+      if (params.encodings.length === 0) params.encodings.push({});
 
       params.encodings[0].maxBitrate = getTargetBitrateKbps() * 1000;
       params.encodings[0].maxFramerate = state.streamSettings.fps;
       params.encodings[0].scaleResolutionDownBy = 1.0;
       params.encodings[0].active = true;
-      params.degradationPreference = state.streamSettings.contentHint === 'detail'
-        ? 'maintain-resolution'
-        : 'balanced';
+      params.encodings[0].priority = 'high';
+      params.encodings[0].networkPriority = 'high';
+      params.degradationPreference = 'maintain-resolution';
 
       await sender.setParameters(params);
     } catch (e) {}
@@ -1836,7 +1835,6 @@
   }
 
   function stopScreenSharing() {
-    stopHybridFrameRelayLoop();
     if (state.streamTimerInterval) {
       clearInterval(state.streamTimerInterval);
       state.streamTimerInterval = null;
@@ -1922,7 +1920,7 @@
       relayImg.alt = 'Stream';
 
       const video = document.createElement('video');
-      video.className = 'stream-webrtc-video';
+      video.className = 'stream-webrtc-video webrtc-has-frames';
       video.autoplay = true;
       video.playsInline = true;
       video.setAttribute('playsinline', '');
@@ -2003,27 +2001,6 @@
 
     updateStageLayout();
     syncMultiStreamAudioBus();
-  }
-
-  function renderRelayFrameOnTile(peerId, user, frameDataUrl) {
-    if (peerId === socket.id) return;
-
-    const tile = ensureStreamTileExists(peerId, user, false);
-    if (!tile) return;
-
-    const videoEl = tile.querySelector('video.stream-webrtc-video');
-    const relayImg = tile.querySelector('img.stream-relay-img');
-
-    if (videoEl && videoEl.videoWidth > 0 && !videoEl.paused) {
-      videoEl.classList.add('webrtc-has-frames');
-      relayImg?.classList.add('hidden');
-      socket.emit('webrtc:signal', { to: peerId, data: { webrtcVideoOk: true } });
-    } else if (relayImg) {
-      relayImg.src = frameDataUrl;
-      relayImg.classList.remove('hidden');
-    }
-
-    updateStageLayout();
   }
 
   function removeStreamTile(peerId) {
@@ -2174,7 +2151,7 @@
     }
   });
 
-  // ================= 7. CONTROLES DA CÁPSULA E PARTICIPANTES (COM CANCELAMENTO DE RUÍDO INDIVIDUAL) =================
+  // ================= 7. CONTROLES DA CÁPSULA E PARTICIPANTES =================
   el.btnToggleMic?.addEventListener('click', () => {
     state.isMicMuted = !state.isMicMuted;
     el.btnToggleMic.classList.toggle('muted', state.isMicMuted);
@@ -2911,7 +2888,7 @@
     reader.readAsDataURL(file);
   }
 
-  // ================= 9. EVENTOS DE SALA (COM SONS DE ENTRADA E SAÍDA) E MONITORAMENTO =================
+  // ================= 9. EVENTOS DE SALA E MONITORAMENTO =================
   socket.on('rooms:update', (rooms) => {
     state.rooms = rooms;
     renderRoomsList();
