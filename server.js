@@ -20,7 +20,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const RELEASE_VERSION = '1.0.0';
 const GITHUB_RELEASE_EXE_URL =
   process.env.AETHER_DOWNLOAD_URL ||
-  'https://github.com/homepython/aether-platform/releases/latest/download/Aether-Setup-1.0.0.exe';
+  'https://github.com/homepython/aether-platform/releases/download/v1.0.0/Aether.Setup.exe';
 
 // ================= ESTADO UNIFICADO (DESKTOP + WEB) =================
 const users = new Map();
