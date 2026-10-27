@@ -73,14 +73,14 @@
   const state = {
     user: null,
     currentRoomId: null,
+    isLoggingIn: false,
     rooms: [],
     roomUsers: [],
     localVoiceStream: null,
     localMicRawStream: null,
     localMicFilterNodes: null,
+    localMicMeterTimer: null,
     localScreenStream: null,
-    localScreenRawStream: null,
-    localScreenAudioGainNode: null,
     lastRemoteVoiceActivityAt: 0,
     audioContext: null,
     voiceGateEnabled: true,
@@ -112,7 +112,6 @@
     nativeNotificationsEnabled: localStorage.getItem('aether_win_notif') !== 'off',
     globalHotkeys: savedHotkeys,
     speakingPeers: new Set(),
-    localFullscreenVideoActive: false,
     suppressedLocalQueue: [],
     serverMode: savedServerMode,
     cloudServerUrl: savedCloudUrl,
@@ -365,13 +364,6 @@
         color: #fecdd3 !important;
         box-shadow: 0 0 16px rgba(244, 63, 94, 0.28);
       }
-      /* Renderização nativa por GPU sem convolução SVG pesada para transmissões 2K (1440p) */
-      video.stream-webrtc-video.native-2k- crisp {
-        filter: contrast(1.03) saturate(1.02) !important;
-        image-rendering: -webkit-optimize-contrast;
-        transform: translateZ(0);
-        backface-visibility: hidden;
-      }
     `;
     document.head.appendChild(style);
   }
@@ -438,8 +430,7 @@
   }
 
   function isLocalFullscreenOrVideoPlaying() {
-    if (document.fullscreenElement || document.webkitFullscreenElement) return true;
-    return false;
+    return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
   }
 
   function dispatchSmartNotification(title, body, icon = '🔔', onClick = null) {
@@ -1063,7 +1054,7 @@
     });
   }
 
-  // ================= EFEITOS SONOROS ELEGANTES DE ENTRADA E SAÍDA DA SALA =================
+  // ================= EFEITOS SONOROS DE ENTRADA E SAÍDA DA SALA =================
   function playRoomSoundEffect(type) {
     if (!state.roomSfxEnabled || state.isDeafened) return;
     try {
@@ -1200,7 +1191,7 @@
     const hasSysAudio = state.localScreenStream.getAudioTracks().length > 0;
     const audioStatusEl = document.getElementById('broadcaster-audio-status');
     if (audioStatusEl) {
-      audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio (Sem Eco)' : '🔇 Somente tela (sem áudio)';
+      audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio' : '🔇 Somente tela (sem áudio)';
     }
 
     const viewersCount = state.myStreamViewers.size;
@@ -1223,7 +1214,7 @@
     const specEl = document.getElementById('broadcaster-quality-spec');
     if (specEl) {
       const resLabel = state.streamSettings.resolution === 1440
-        ? '1440p (2K Ultra)'
+        ? '1440p (2K)'
         : `${state.streamSettings.resolution}p`;
       const qualityLabel = state.streamSettings.contentHint === 'detail' ? 'Nitidez Máxima' : 'Fluidez Ultra';
       specEl.textContent = `${resLabel} • ${state.streamSettings.fps} FPS • ${qualityLabel}`;
@@ -1349,7 +1340,23 @@
   el.selectAudioInput?.addEventListener('change', async () => {
     state.selectedAudioInputId = el.selectAudioInput.value;
     await initLocalVoiceEngine();
-    await ensureLocalVoiceTrackOnAllPeers(true);
+    const newVoiceTrack = state.localVoiceStream?.getAudioTracks()[0];
+    if (newVoiceTrack) {
+      for (const [peerId, peerObj] of state.peers.entries()) {
+        const sender = peerObj.pc.getSenders().find(
+          s => s.track && s.track.kind === 'audio' && (!state.localScreenStream || !state.localScreenStream.getTracks().includes(s.track))
+        );
+        if (sender) {
+          await sender.replaceTrack(newVoiceTrack).catch(() => {});
+        } else {
+          peerObj.suppressAutoNegotiation = true;
+          peerObj.pc.addTrack(newVoiceTrack, state.localVoiceStream);
+          peerObj.suppressAutoNegotiation = false;
+          negotiateWithPeer(peerId, peerObj);
+        }
+        sendStreamIdsMeta(peerId);
+      }
+    }
   });
 
   el.selectAudioOutput?.addEventListener('change', async () => {
@@ -1400,7 +1407,7 @@
     });
   }
 
-  // ================= 1. LOGIN AUTOMÁTICO & PERSISTÊNCIA DE NOME E NICK =================
+  // ================= 1. LOGIN AUTOMÁTICO SEM CONDIÇÃO DE CORRIDA =================
   function validateEntryInputs() {
     const nameValid = el.inputName.value.trim().length >= 2;
     const cleanedNick = el.inputNick.value.replace(/[^a-zA-Z0-9_\s]/g, '');
@@ -1413,6 +1420,9 @@
   el.inputNick.addEventListener('input', validateEntryInputs);
 
   async function performUserLogin(name, nick, existingColor = null) {
+    if (state.isLoggingIn) return;
+    state.isLoggingIn = true;
+
     const palette = ['#5E81F4', '#7C69EF', '#EC4899', '#10B981', '#3B82F6', '#F59E0B'];
     const avatarColor = existingColor || palette[Math.floor(Math.random() * palette.length)];
     const normalizedNick = nick.trim().replace(/\s+/g, '_').toLowerCase();
@@ -1424,9 +1434,6 @@
       avatarColor
     }));
 
-    el.entryScreen.classList.add('hidden');
-    el.appShell.classList.remove('hidden');
-
     await initLocalVoiceEngine();
 
     socket.emit('user:register', {
@@ -1434,6 +1441,7 @@
       nick: normalizedNick,
       avatarColor
     }, (res) => {
+      state.isLoggingIn = false;
       if (!res?.ok) return;
       state.user = res.user;
       state.rooms = res.rooms;
@@ -1448,6 +1456,9 @@
       if (nameInp) nameInp.value = state.user.name;
       if (nickInp) nickInp.value = state.user.nick;
 
+      el.entryScreen.classList.add('hidden');
+      el.appShell.classList.remove('hidden');
+
       ensureBroadcasterHudElement();
       syncStreamButtonsVisualState();
 
@@ -1457,7 +1468,7 @@
       });
 
       renderRoomsList();
-      joinRoom('lobby-principal');
+      joinRoom(state.currentRoomId || 'lobby-principal');
     });
   }
 
@@ -1474,33 +1485,33 @@
       if (savedProfile?.name && savedProfile?.nick && savedProfile.name.trim().length >= 2 && savedProfile.nick.trim().length >= 2) {
         el.inputName.value = savedProfile.name;
         el.inputNick.value = savedProfile.nick;
+        validateEntryInputs();
         performUserLogin(savedProfile.name, savedProfile.nick, savedProfile.avatarColor);
       }
     }
   } catch (e) {}
 
-  // ================= 2. MOTOR DE VOZ COM FILTRO DE RUÍDO REFORÇADO (SEM VOZ ROBÓTICA) =================
+  // ================= 2. MOTOR DE VOZ PURO E ESTÁVEL =================
   function getNoiseFilterFrequencies(level) {
-    // Ajuste moderado e calibrado para eliminar ventiladores (graves constantes <140Hz) e chiado (>7500Hz)
     switch (level) {
       case 'low':
-        return { hpFreq: 95, lpFreq: 11000, gateFloor: 0.25, threshold: 10 };
+        return { hpFreq: 90, lpFreq: 11500, threshold: 10 };
       case 'medium':
-        return { hpFreq: 155, lpFreq: 6800, gateFloor: 0.04, threshold: 14 };
+        return { hpFreq: 140, lpFreq: 7200, threshold: 13 };
       case 'high':
-        return { hpFreq: 195, lpFreq: 5200, gateFloor: 0.0, threshold: 17 };
+        return { hpFreq: 185, lpFreq: 5400, threshold: 16 };
       case 'auto':
       default:
-        return { hpFreq: 140, lpFreq: 7500, gateFloor: 0.06, threshold: 13 };
+        return { hpFreq: 125, lpFreq: 8200, threshold: 11 };
     }
   }
 
   function applyLocalMicNoiseFilterProfile(level) {
-    const rawTrack = state.localMicRawStream?.getAudioTracks()[0] || state.localVoiceStream?.getAudioTracks()[0];
-    if (rawTrack) {
+    const micTrack = state.localVoiceStream?.getAudioTracks()[0];
+    if (micTrack) {
       try {
-        rawTrack.applyConstraints({
-          noiseSuppression: true,
+        micTrack.applyConstraints({
+          noiseSuppression: level !== 'low' ? true : state.noiseSuppressionEnabled,
           echoCancellation: true,
           autoGainControl: true
         }).catch(() => {});
@@ -1522,7 +1533,7 @@
     if (state.isMicMuted) {
       micTrack.enabled = false;
     } else if (state.voiceMode === 'ptt') {
-      micTrack.enabled = state.pttPressed;
+      micTrack.enabled = Boolean(state.pttPressed);
     } else {
       micTrack.enabled = true;
     }
@@ -1545,9 +1556,9 @@
       }
 
       const audioConstraints = {
-        echoCancellation: { ideal: true },
-        noiseSuppression: { ideal: true },
-        autoGainControl: { ideal: true },
+        echoCancellation: true,
+        noiseSuppression: state.noiseSuppressionEnabled,
+        autoGainControl: true,
         channelCount: 1,
         sampleRate: 48000
       };
@@ -1561,52 +1572,33 @@
       });
 
       state.localMicRawStream = rawMicStream;
+      state.localVoiceStream = rawMicStream;
 
-      // Cadeia de filtragem limpa para remover som de ventilador e ruído de fundo antes de enviar aos amigos
+      applyLocalMicNoiseFilterProfile(state.localNoiseLevel);
+      updateLocalMicTrackEnabledState();
+
       const ctx = state.audioContext;
       const source = ctx.createMediaStreamSource(rawMicStream);
-
       const { hpFreq, lpFreq } = getNoiseFilterFrequencies(state.localNoiseLevel);
 
       const hp = ctx.createBiquadFilter();
       hp.type = 'highpass';
       hp.frequency.value = hpFreq;
-      hp.Q.value = 0.707;
 
       const lp = ctx.createBiquadFilter();
       lp.type = 'lowpass';
       lp.frequency.value = lpFreq;
-      lp.Q.value = 0.707;
-
-      const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -24;
-      compressor.knee.value = 18;
-      compressor.ratio.value = 3;
-      compressor.attack.value = 0.005;
-      compressor.release.value = 0.15;
-
-      const gateGain = ctx.createGain();
-      gateGain.gain.value = 1.0;
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.28;
-
-      const destination = ctx.createMediaStreamDestination();
+      analyser.smoothingTimeConstant = 0.3;
 
       source.connect(hp);
       hp.connect(lp);
-      lp.connect(compressor);
-      compressor.connect(analyser);
-      compressor.connect(gateGain);
-      gateGain.connect(destination);
+      lp.connect(analyser);
 
-      state.localMicFilterNodes = { source, hp, lp, compressor, gateGain, destination };
-      state.localVoiceStream = destination.stream.getAudioTracks().length > 0 ? destination.stream : rawMicStream;
-
-      applyLocalMicNoiseFilterProfile(state.localNoiseLevel);
-      updateLocalMicTrackEnabledState();
-      startVoiceMeterLoop(analyser, gateGain);
+      state.localMicFilterNodes = { source, hp, lp, analyser };
+      startVoiceMeterLoop(analyser);
     } catch (err) {
       console.warn('Microfone indisponível, iniciando em modo somente escuta:', err);
       const silentDest = state.audioContext.createMediaStreamDestination();
@@ -1614,19 +1606,26 @@
     }
   }
 
-  function startVoiceMeterLoop(analyser, gateGainNode) {
+  function startVoiceMeterLoop(analyser) {
+    if (state.localMicMeterTimer) {
+      clearInterval(state.localMicMeterTimer);
+    }
     const freqData = new Uint8Array(analyser.frequencyBinCount);
     let lastSpokeTimestamp = 0;
 
-    const checkMeter = () => {
+    state.localMicMeterTimer = setInterval(() => {
       updateLocalMicTrackEnabledState();
+
+      if (state.audioContext && state.audioContext.state === 'suspended') {
+        state.audioContext.resume().catch(() => {});
+      }
 
       analyser.getByteFrequencyData(freqData);
       let sum = 0;
-      for (let i = 3; i < 52; i++) {
+      for (let i = 2; i < 48; i++) {
         sum += freqData[i];
       }
-      const avg = sum / 49;
+      const avg = sum / 46;
 
       const profile = getNoiseFilterFrequencies(state.localNoiseLevel);
       const nowMs = performance.now();
@@ -1639,18 +1638,7 @@
         lastSpokeTimestamp = nowMs;
       }
 
-      // Hold time suave de 240ms para nunca cortar finais de palavras
-      const isTalkingNow = rawTalking || (!state.isMicMuted && state.voiceMode !== 'ptt' && (nowMs - lastSpokeTimestamp) < 240);
-
-      // Soft Noise Gate: reduz suavemente o ruído de fundo (ventilador) quando ninguém está a falar
-      if (gateGainNode && state.audioContext) {
-        const targetGain = state.isMicMuted
-          ? 0.0
-          : (!state.voiceGateEnabled || isTalkingNow)
-            ? 1.0
-            : profile.gateFloor;
-        gateGainNode.gain.setTargetAtTime(targetGain, state.audioContext.currentTime, isTalkingNow ? 0.01 : 0.08);
-      }
+      const isTalkingNow = rawTalking || (!state.isMicMuted && state.voiceMode !== 'ptt' && (nowMs - lastSpokeTimestamp) < 200);
 
       const prevSpeaking = state.isSelfSpeaking;
       state.isSelfSpeaking = isTalkingNow;
@@ -1668,12 +1656,9 @@
           ? 'Microfone Silenciado'
           : isTalkingNow
             ? 'Voz Ativa'
-            : 'Filtro Silencioso Ativo';
+            : 'Pronto';
       }
-
-      requestAnimationFrame(checkMeter);
-    };
-    requestAnimationFrame(checkMeter);
+    }, 50);
   }
 
   el.inputGateThreshold?.addEventListener('input', () => {
@@ -1794,25 +1779,24 @@
     });
   });
 
-  // ================= 4. WEBRTC ENGINE (GARANTIA BIDIRECIONAL DE VOZ + 2K 1440P REAL) =================
+  // ================= 4. WEBRTC ENGINE (SDP SEGURO COM FALLBACK + VOZ E LIVES 100% ESTÁVEIS) =================
   function getTargetBitrateKbps() {
     if (state.streamSettings.bitrateMode !== 'auto') {
       return Number(state.streamSettings.bitrateMode);
     }
-    // Bitrate dedicado de alta definição para que 1440p (2K) apresente nitidez superior a 1080p
     return state.streamSettings.resolution === 1440
-      ? 24000
+      ? 22000
       : state.streamSettings.resolution === 1080
         ? 12000
         : 6500;
   }
 
+  // Otimiza o SDP de vídeo ignorando linhas RTX (apt=) para nunca corromper o parser do Chromium
   function enhanceSdpForHighQualityStream(sdp) {
     if (!sdp) return sdp;
     const targetMax = getTargetBitrateKbps();
-    const is2K = state.streamSettings.resolution === 1440;
-    const startBitrate = is2K ? Math.min(16000, targetMax) : Math.min(10000, targetMax);
-    const minBitrate = is2K ? Math.min(10000, Math.round(targetMax * 0.6)) : Math.min(4500, Math.round(targetMax * 0.5));
+    const startBitrate = state.streamSettings.resolution === 1440 ? Math.min(15000, targetMax) : Math.min(10000, targetMax);
+    const minBitrate = state.streamSettings.resolution === 1440 ? Math.min(9000, targetMax) : Math.min(4500, Math.round(targetMax * 0.5));
 
     const sections = sdp.split('\r\nm=');
     for (let i = 1; i < sections.length; i++) {
@@ -1824,7 +1808,7 @@
           );
         }
         sections[i] = sections[i].replace(
-          /(a=fmtp:\d+ (?!.*x-google-max-bitrate)[^\r\n]+)/g,
+          /(a=fmtp:\d+ (?!.*apt=)(?!.*x-google-max-bitrate)[^\r\n]+)/g,
           `$1;x-google-max-bitrate=${targetMax};x-google-min-bitrate=${minBitrate};x-google-start-bitrate=${startBitrate}`
         );
       }
@@ -1847,61 +1831,6 @@
     };
   }
 
-  // Garante que todos os participantes têm a nossa faixa de microfone anexada como 'sendrecv'
-  function ensurePeerHasLocalVoiceTrack(peerObj) {
-    if (!peerObj || !peerObj.pc || !state.localVoiceStream) return false;
-    const voiceTrack = state.localVoiceStream.getAudioTracks()[0];
-    if (!voiceTrack) return false;
-
-    const pc = peerObj.pc;
-    const screenAudioTrack = state.localScreenStream?.getAudioTracks()[0] || null;
-
-    const existingVoiceSender = pc.getSenders().find(
-      s => s.track && s.track.kind === 'audio' && s.track !== screenAudioTrack
-    );
-
-    if (existingVoiceSender) {
-      if (existingVoiceSender.track !== voiceTrack) {
-        existingVoiceSender.replaceTrack(voiceTrack).catch(() => {});
-      }
-      return false;
-    }
-
-    // Procura transceiver de áudio sem track de envio (ex: criado por oferta remota) para anexar imediatamente
-    const audioTransceiver = pc.getTransceivers().find(
-      t => t.receiver?.track?.kind === 'audio' && (!t.sender?.track)
-    );
-
-    if (audioTransceiver) {
-      try {
-        audioTransceiver.sender.replaceTrack(voiceTrack).catch(() => {});
-        if (audioTransceiver.direction === 'recvonly' || audioTransceiver.direction === 'inactive') {
-          audioTransceiver.direction = 'sendrecv';
-        }
-        return true;
-      } catch (e) {}
-    }
-
-    try {
-      pc.addTrack(voiceTrack, state.localVoiceStream);
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  async function ensureLocalVoiceTrackOnAllPeers(renegotiateIfNeeded = false) {
-    for (const [peerId, peerObj] of state.peers.entries()) {
-      peerObj.suppressAutoNegotiation = true;
-      const added = ensurePeerHasLocalVoiceTrack(peerObj);
-      peerObj.suppressAutoNegotiation = false;
-      sendStreamIdsMeta(peerId);
-      if (added || renegotiateIfNeeded) {
-        negotiateWithPeer(peerId, peerObj);
-      }
-    }
-  }
-
   function applyRemoteStreamMeta(peerId, peerObj, meta) {
     if (!meta || !peerObj) return;
     if (meta.voiceStreamId) peerObj.voiceStreamId = meta.voiceStreamId;
@@ -1909,22 +1838,16 @@
     if (meta.screenStreamId !== undefined) peerObj.screenStreamId = meta.screenStreamId;
     if (meta.screenVideoTrackId !== undefined) peerObj.screenVideoTrackId = meta.screenVideoTrackId;
     if (meta.screenAudioTrackId !== undefined) peerObj.screenAudioTrackId = meta.screenAudioTrackId;
+    if (typeof meta.isStreaming === 'boolean') peerObj.user.isStreaming = meta.isStreaming;
     if (meta.streamConfig) peerObj.user.streamConfig = meta.streamConfig;
 
-    if (
-      peerObj.attachedVoiceTrackId &&
-      peerObj.screenAudioTrackId &&
-      peerObj.attachedVoiceTrackId === peerObj.screenAudioTrackId
-    ) {
-      detachVoicePipeline(peerObj);
-    }
-
-    if (peerObj.screenStream && peerObj.attachedVoiceTrackId) {
-      peerObj.screenStream.getAudioTracks().forEach((t) => {
-        if (t.id === peerObj.attachedVoiceTrackId) {
-          peerObj.screenStream.removeTrack(t);
-        }
-      });
+    if (meta.isStreaming === false) {
+      peerObj.screenStream = null;
+      removeStreamTile(peerId);
+    } else if (meta.isStreaming === true && peerObj.screenStream && peerObj.screenStream.getVideoTracks().length > 0) {
+      if (!state.stoppedWatchingPeers.has(peerId)) {
+        renderOrUpdateStreamTile(peerId, peerObj.user, peerObj.screenStream, false, false);
+      }
     }
   }
 
@@ -1963,19 +1886,18 @@
       peerObj.makingOffer = true;
       peerObj.needsAnotherNegotiation = false;
 
-      peerObj.suppressAutoNegotiation = true;
-      ensurePeerHasLocalVoiceTrack(peerObj);
-      peerObj.suppressAutoNegotiation = false;
-
       const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
       if (pc.signalingState !== 'stable') return;
 
-      const enhancedOffer = {
-        type: offer.type,
-        sdp: enhanceSdpForHighQualityStream(offer.sdp)
-      };
+      try {
+        await pc.setLocalDescription({
+          type: offer.type,
+          sdp: enhanceSdpForHighQualityStream(offer.sdp)
+        });
+      } catch (_sdpErr) {
+        await pc.setLocalDescription(offer);
+      }
 
-      await pc.setLocalDescription(enhancedOffer);
       socket.emit('webrtc:signal', {
         to: peerId,
         data: {
@@ -2025,7 +1947,12 @@
 
     sendStreamIdsMeta(peerId);
 
-    ensurePeerHasLocalVoiceTrack(peerObj);
+    if (state.localVoiceStream) {
+      state.localVoiceStream.getTracks().forEach((track) => {
+        const alreadySent = pc.getSenders().some(s => s.track === track);
+        if (!alreadySent) pc.addTrack(track, state.localVoiceStream);
+      });
+    }
 
     if (state.localScreenStream) {
       state.localScreenStream.getTracks().forEach((track) => {
@@ -2044,6 +1971,9 @@
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected') {
+        if (peerObj.voiceAudioEl && peerObj.voiceAudioEl.paused) {
+          peerObj.voiceAudioEl.play().catch(() => {});
+        }
         if (state.isStreaming) {
           setTimeout(() => enforceHighQualityForAllViewers(), 250);
         }
@@ -2068,7 +1998,11 @@
       const incomingTrack = event.track;
       const incomingStream = event.streams[0];
 
+      // 1. Trilha de VÍDEO (Partilha de Ecrã / Live)
       if (incomingTrack.kind === 'video') {
+        peerObj.user.isStreaming = true;
+        peerObj.screenVideoTrackId = incomingTrack.id;
+
         if (!peerObj.screenStream) {
           peerObj.screenStream = new MediaStream();
         }
@@ -2091,10 +2025,9 @@
           });
         }
 
-        if (!state.stoppedWatchingPeers.has(peerId)) {
-          renderOrUpdateStreamTile(peerId, peerObj.user, peerObj.screenStream, false, true);
-          socket.emit('webrtc:signal', { to: peerId, data: { viewerStatus: 'watching' } });
-        }
+        state.stoppedWatchingPeers.delete(peerId);
+        renderOrUpdateStreamTile(peerId, peerObj.user, peerObj.screenStream, false, true);
+        socket.emit('webrtc:signal', { to: peerId, data: { viewerStatus: 'watching' } });
 
         incomingTrack.onunmute = () => {
           const tile = document.getElementById(`stream-tile-${peerId}`);
@@ -2109,6 +2042,7 @@
         return;
       }
 
+      // 2. Trilha de ÁUDIO (Separação Limpa entre Voz do Microfone e Áudio da Live)
       if (incomingTrack.kind === 'audio') {
         const isDefinitelyScreenAudio = Boolean(
           (peerObj.screenAudioTrackId && incomingTrack.id === peerObj.screenAudioTrackId) ||
@@ -2118,10 +2052,6 @@
 
         if (isDefinitelyScreenAudio) {
           peerObj.screenAudioTrackId = incomingTrack.id;
-
-          if (peerObj.attachedVoiceTrackId === incomingTrack.id) {
-            detachVoicePipeline(peerObj);
-          }
 
           if (!peerObj.screenStream) {
             peerObj.screenStream = new MediaStream();
@@ -2146,6 +2076,12 @@
           peerObj.attachedVoiceTrackId = incomingTrack.id;
           const isolatedVoiceStream = new MediaStream([incomingTrack]);
           setupRemoteVoicePipeline(peerId, isolatedVoiceStream);
+
+          incomingTrack.onunmute = () => {
+            if (peerObj.voiceAudioEl && peerObj.voiceAudioEl.paused) {
+              peerObj.voiceAudioEl.play().catch(() => {});
+            }
+          };
         }
       }
     };
@@ -2204,7 +2140,21 @@
 
     detachVoicePipeline(peerObj);
 
-    let playbackStream = isolatedVoiceStream;
+    const audioEl = document.createElement('audio');
+    audioEl.srcObject = isolatedVoiceStream;
+    audioEl.autoplay = true;
+    audioEl.playsInline = true;
+    audioEl.muted = state.isDeafened;
+
+    const savedVol = state.userVolumes.get(peerId) ?? 100;
+    audioEl.volume = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
+
+    if (state.selectedAudioOutputId && state.selectedAudioOutputId !== 'default' && typeof audioEl.setSinkId === 'function') {
+      audioEl.setSinkId(state.selectedAudioOutputId).catch(() => {});
+    }
+
+    el.remoteVoiceAudios.appendChild(audioEl);
+    audioEl.play().catch(() => {});
 
     if (state.audioContext) {
       try {
@@ -2226,16 +2176,9 @@
         const remoteAnalyser = state.audioContext.createAnalyser();
         remoteAnalyser.fftSize = 256;
 
-        const filteredDest = state.audioContext.createMediaStreamDestination();
-
         source.connect(hp);
         hp.connect(lp);
         lp.connect(remoteAnalyser);
-        lp.connect(filteredDest);
-
-        if (filteredDest.stream.getAudioTracks().length > 0) {
-          playbackStream = filteredDest.stream;
-        }
 
         peerObj.voiceSourceNode = source;
         peerObj.voiceHighPassNode = hp;
@@ -2243,22 +2186,6 @@
         peerObj.remoteAnalyser = remoteAnalyser;
       } catch (e) {}
     }
-
-    const audioEl = document.createElement('audio');
-    audioEl.srcObject = playbackStream;
-    audioEl.autoplay = true;
-    audioEl.playsInline = true;
-    audioEl.muted = state.isDeafened;
-
-    const savedVol = state.userVolumes.get(peerId) ?? 100;
-    audioEl.volume = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
-
-    if (state.selectedAudioOutputId && state.selectedAudioOutputId !== 'default' && typeof audioEl.setSinkId === 'function') {
-      audioEl.setSinkId(state.selectedAudioOutputId).catch(() => {});
-    }
-
-    el.remoteVoiceAudios.appendChild(audioEl);
-    audioEl.play().catch(() => {});
 
     peerObj.voiceAudioEl = audioEl;
   }
@@ -2269,6 +2196,20 @@
       peerObj = createPeerConnection(from, user, false);
     }
     if (user) Object.assign(peerObj.user, user);
+
+    if (data.requestStreamOffer) {
+      if (state.isStreaming && state.localScreenStream) {
+        peerObj.suppressAutoNegotiation = true;
+        state.localScreenStream.getTracks().forEach((track) => {
+          const alreadySent = peerObj.pc.getSenders().some(s => s.track === track);
+          if (!alreadySent) peerObj.pc.addTrack(track, state.localScreenStream);
+        });
+        peerObj.suppressAutoNegotiation = false;
+        sendStreamIdsMeta(from);
+        negotiateWithPeer(from, peerObj);
+      }
+      return;
+    }
 
     if (data.viewerStatus) {
       if (data.viewerStatus === 'watching') {
@@ -2315,17 +2256,16 @@
           await flushPendingCandidates(peerObj);
 
           if (desc.type === 'offer') {
-            // Garante que a nossa faixa de microfone está ligada no transceiver antes de gerar a resposta
-            peerObj.suppressAutoNegotiation = true;
-            const addedTrackOnAnswer = ensurePeerHasLocalVoiceTrack(peerObj);
-            peerObj.suppressAutoNegotiation = false;
-
             const answer = await pc.createAnswer();
-            const enhancedAnswer = {
-              type: answer.type,
-              sdp: enhanceSdpForHighQualityStream(answer.sdp)
-            };
-            await pc.setLocalDescription(enhancedAnswer);
+            try {
+              await pc.setLocalDescription({
+                type: answer.type,
+                sdp: enhanceSdpForHighQualityStream(answer.sdp)
+              });
+            } catch (_sdpErr) {
+              await pc.setLocalDescription(answer);
+            }
+
             socket.emit('webrtc:signal', {
               to: from,
               data: {
@@ -2334,7 +2274,7 @@
               }
             });
 
-            if (addedTrackOnAnswer || (state.isStreaming && state.localScreenStream)) {
+            if (state.isStreaming && state.localScreenStream) {
               setTimeout(() => {
                 negotiateWithPeer(from, peerObj);
                 enforceHighQualityForAllViewers();
@@ -2364,7 +2304,7 @@
     });
   });
 
-  // ================= 5. BARRAMENTO DE ÁUDIO DE LIVES & SUPRESSÃO TOTAL DE ECO =================
+  // ================= 5. BARRAMENTO DE ÁUDIO DE LIVES & SUPRESSÃO AUTOMÁTICA DE ECO =================
   function syncMultiStreamAudioBus(preferredPeerId = null) {
     if (preferredPeerId && preferredPeerId !== socket.id) {
       state.activeAudioStreamPeerId = preferredPeerId;
@@ -2477,12 +2417,11 @@
     const fps = state.streamSettings.fps;
 
     try {
-      const rawDisplayStream = await navigator.mediaDevices.getDisplayMedia({
+      const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: dims.width, max: dims.width },
           height: { ideal: dims.height, max: dims.height },
-          frameRate: { ideal: fps, max: fps },
-          resizeMode: 'none'
+          frameRate: { ideal: fps, max: fps }
         },
         audio: {
           echoCancellation: false,
@@ -2498,61 +2437,22 @@
         windowAudio: 'system'
       });
 
-      const videoTrack = rawDisplayStream.getVideoTracks()[0];
+      const videoTrack = stream.getVideoTracks()[0];
       if (!videoTrack) return;
 
       videoTrack.enabled = true;
-      try {
-        await videoTrack.applyConstraints({
-          width: { ideal: dims.width, max: dims.width },
-          height: { ideal: dims.height, max: dims.height },
-          frameRate: { ideal: fps, max: fps }
-        });
-      } catch (e) {}
-
       if ('contentHint' in videoTrack) {
-        videoTrack.contentHint = state.streamSettings.resolution === 1440
-          ? 'detail'
-          : state.streamSettings.contentHint;
+        videoTrack.contentHint = state.streamSettings.contentHint;
       }
 
-      // Cria um barramento controlado por GainNode para o áudio do sistema da live:
-      // corta instantaneamente o loopback quando um espectador fala, eliminando 100% do eco!
-      const outboundStream = new MediaStream([videoTrack]);
-      const rawSysAudioTrack = rawDisplayStream.getAudioTracks()[0];
-
-      if (rawSysAudioTrack) {
-        if (state.audioContext) {
-          try {
-            if (state.audioContext.state === 'suspended') {
-              await state.audioContext.resume().catch(() => {});
-            }
-            const sysSource = state.audioContext.createMediaStreamSource(new MediaStream([rawSysAudioTrack]));
-            const sysGain = state.audioContext.createGain();
-            sysGain.gain.value = 1.0;
-            const sysDest = state.audioContext.createMediaStreamDestination();
-            sysSource.connect(sysGain);
-            sysGain.connect(sysDest);
-
-            state.localScreenAudioGainNode = sysGain;
-            const processedSysTrack = sysDest.stream.getAudioTracks()[0];
-            if (processedSysTrack) {
-              outboundStream.addTrack(processedSysTrack);
-            } else {
-              outboundStream.addTrack(rawSysAudioTrack);
-            }
-          } catch (e) {
-            outboundStream.addTrack(rawSysAudioTrack);
-          }
-        } else {
-          outboundStream.addTrack(rawSysAudioTrack);
-        }
+      const sysAudioTrack = stream.getAudioTracks()[0];
+      if (sysAudioTrack) {
+        sysAudioTrack.enabled = true;
       }
 
       videoTrack.onended = () => stopScreenSharing();
 
-      state.localScreenRawStream = rawDisplayStream;
-      state.localScreenStream = outboundStream;
+      state.localScreenStream = stream;
       state.isStreaming = true;
       state.streamStartedAt = Date.now();
       state.myStreamViewers.clear();
@@ -2568,7 +2468,7 @@
 
       socket.emit('user:state-change', {
         isStreaming: true,
-        screenStreamId: outboundStream.id,
+        screenStreamId: stream.id,
         streamConfig: {
           resolution: state.streamSettings.resolution,
           fps: state.streamSettings.fps
@@ -2579,9 +2479,9 @@
         peerObj.webrtcVideoConfirmed = false;
         peerObj.suppressAutoNegotiation = true;
         sendStreamIdsMeta(peerId);
-        outboundStream.getTracks().forEach((track) => {
+        stream.getTracks().forEach((track) => {
           const alreadySent = peerObj.pc.getSenders().some(s => s.track === track);
-          if (!alreadySent) peerObj.pc.addTrack(track, outboundStream);
+          if (!alreadySent) peerObj.pc.addTrack(track, stream);
         });
         peerObj.suppressAutoNegotiation = false;
         negotiateWithPeer(peerId, peerObj);
@@ -2598,37 +2498,11 @@
     }
   }
 
-  function preferHardwareVideoCodecs(pc) {
-    if (!pc || typeof RTCRtpSender === 'undefined' || typeof RTCRtpSender.getCapabilities !== 'function') return;
-    try {
-      const caps = RTCRtpSender.getCapabilities('video');
-      if (!caps || !caps.codecs) return;
-      // Prioriza H.264 (NVENC/AMF/QuickSync) e VP9 para 1440p (2K) fluido e sem sobrecarregar a CPU
-      const preferred = caps.codecs.slice().sort((a, b) => {
-        const score = (c) => {
-          const mime = (c.mimeType || '').toLowerCase();
-          if (mime.includes('h264')) return 1;
-          if (mime.includes('vp9')) return 2;
-          if (mime.includes('vp8')) return 3;
-          return 4;
-        };
-        return score(a) - score(b);
-      });
-      pc.getTransceivers().forEach((t) => {
-        if (t.sender?.track?.kind === 'video' && typeof t.setCodecPreferences === 'function') {
-          t.setCodecPreferences(preferred);
-        }
-      });
-    } catch (e) {}
-  }
-
-  async function applyVideoSenderParameters(sender, pc) {
+  async function applyVideoSenderParameters(sender) {
     if (!sender || !sender.track || sender.track.kind !== 'video') return;
     try {
-      preferHardwareVideoCodecs(pc);
       const params = sender.getParameters();
-      if (!params.encodings) params.encodings = [{}];
-      if (params.encodings.length === 0) params.encodings.push({});
+      if (!params.encodings || params.encodings.length === 0) return;
 
       params.encodings[0].maxBitrate = getTargetBitrateKbps() * 1000;
       params.encodings[0].maxFramerate = state.streamSettings.fps;
@@ -2649,7 +2523,7 @@
       const senders = peerObj.pc.getSenders();
       senders.forEach((sender) => {
         if (sender.track && sender.track.kind === 'video') {
-          applyVideoSenderParameters(sender, peerObj.pc);
+          applyVideoSenderParameters(sender);
         }
       });
     }
@@ -2663,7 +2537,6 @@
     state.streamStartedAt = null;
     state.myStreamViewers.clear();
     state.isStreaming = false;
-    state.localScreenAudioGainNode = null;
 
     if (state.localScreenStream) {
       const tracksToStop = state.localScreenStream.getTracks();
@@ -2685,11 +2558,6 @@
       state.localScreenStream = null;
     }
 
-    if (state.localScreenRawStream) {
-      state.localScreenRawStream.getTracks().forEach(t => t.stop());
-      state.localScreenRawStream = null;
-    }
-
     syncStreamButtonsVisualState();
     updateBroadcasterControlPanel();
     updateStageLayout();
@@ -2702,24 +2570,7 @@
     });
   }
 
-  // ================= 6. RENDERIZAÇÃO DE VÍDEO DOS ESPECTADORES (OTIMIZADO P/ 2K 1440P) =================
-  function applyOptimalVideoShaderClass(videoEl) {
-    if (!videoEl) return;
-    const is2KStream = videoEl.videoWidth >= 2000 || videoEl.videoHeight >= 1200;
-    if (!state.sharpenEnabled) {
-      videoEl.classList.remove('cas-sharpen-active', 'native-2k-crisp');
-      return;
-    }
-    // Em 1440p (2K), usa nitidez acelerada por GPU sem a matriz SVG que causava peso excessivo
-    if (is2KStream) {
-      videoEl.classList.remove('cas-sharpen-active');
-      videoEl.classList.add('native-2k-crisp');
-    } else {
-      videoEl.classList.remove('native-2k-crisp');
-      videoEl.classList.add('cas-sharpen-active');
-    }
-  }
-
+  // ================= 6. RENDERIZAÇÃO DA GRADE DE TRANSMISSÕES (#streams-grid) =================
   function safePlayVideo(videoEl, isLocal = false, peerId = null) {
     if (!videoEl) return;
     if (isLocal) {
@@ -2766,12 +2617,12 @@
       video.setAttribute('playsinline', '');
       video.muted = true;
       video.volume = 1.0;
+      if (state.sharpenEnabled) video.classList.add('cas-sharpen-active');
 
       const markWebrtcActive = () => {
         if (video.videoWidth > 0) {
           video.classList.add('webrtc-has-frames');
           relayImg.classList.add('hidden');
-          applyOptimalVideoShaderClass(video);
           socket.emit('webrtc:signal', { to: peerId, data: { webrtcVideoOk: true } });
         }
       };
@@ -2841,7 +2692,6 @@
         videoEl.srcObject = null;
         videoEl.srcObject = stream;
       }
-      applyOptimalVideoShaderClass(videoEl);
       safePlayVideo(videoEl, false, peerId);
     }
 
@@ -2929,7 +2779,7 @@
     state.sharpenEnabled = !state.sharpenEnabled;
     el.btnToggleSharpen.classList.toggle('active-sharpen', state.sharpenEnabled);
     document.querySelectorAll('.stream-tile video').forEach((v) => {
-      applyOptimalVideoShaderClass(v);
+      v.classList.toggle('cas-sharpen-active', state.sharpenEnabled);
     });
   });
 
@@ -3034,6 +2884,11 @@
       const currentVol = state.userVolumes.get(u.socketId) ?? 100;
       const currentNr = state.userNoiseLevels.get(u.socketId) || 'auto';
 
+      const peerObj = state.peers.get(u.socketId);
+      if (peerObj) {
+        Object.assign(peerObj.user, u);
+      }
+
       const card = document.createElement('div');
       card.id = `participant-card-${u.socketId}`;
       card.className = 'participant-card';
@@ -3080,11 +2935,15 @@
           if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
           if (u.isStreaming) {
             state.stoppedWatchingPeers.delete(u.socketId);
-            const peerObj = state.peers.get(u.socketId);
-            if (peerObj?.screenStream) {
-              renderOrUpdateStreamTile(u.socketId, u, peerObj.screenStream, false, true);
+            const pObj = state.peers.get(u.socketId);
+            if (pObj?.screenStream && pObj.screenStream.getVideoTracks().length > 0) {
+              renderOrUpdateStreamTile(u.socketId, u, pObj.screenStream, false, true);
               focusStreamTile(u.socketId);
               socket.emit('webrtc:signal', { to: u.socketId, data: { viewerStatus: 'watching' } });
+              return;
+            } else {
+              socket.emit('webrtc:signal', { to: u.socketId, data: { requestStreamOffer: true } });
+              showToast('A abrir transmissão...', `A conectar à live de ${u.name}...`, '🖥️');
               return;
             }
           }
@@ -3099,10 +2958,10 @@
           const val = Number(slider.value);
           state.userVolumes.set(u.socketId, val);
           label.textContent = `${val}%`;
-          const peerObj = state.peers.get(u.socketId);
-          if (peerObj?.voiceAudioEl) {
-            peerObj.voiceAudioEl.muted = state.isDeafened || val === 0;
-            peerObj.voiceAudioEl.volume = state.isDeafened ? 0 : Math.min(1, val / 100);
+          const pObj = state.peers.get(u.socketId);
+          if (pObj?.voiceAudioEl) {
+            pObj.voiceAudioEl.muted = state.isDeafened || val === 0;
+            pObj.voiceAudioEl.volume = state.isDeafened ? 0 : Math.min(1, val / 100);
           }
         });
 
@@ -3745,7 +3604,7 @@
     reader.readAsDataURL(file);
   }
 
-  // ================= 9. EVENTOS DE SALA, ANTI-ECO EM TEMPO REAL E MONITORAMENTO =================
+  // ================= 9. EVENTOS DE SALA E MONITORAMENTO =================
   socket.on('rooms:update', (rooms) => {
     state.rooms = rooms;
     renderRoomsList();
@@ -3776,7 +3635,7 @@
 
   socket.on('peer:state-updated', ({ socketId, patch }) => {
     const peerObj = state.peers.get(socketId);
-    if (peerObj) {
+    if (peerObj && patch) {
       Object.assign(peerObj.user, patch);
       if (patch.voiceStreamId) peerObj.voiceStreamId = patch.voiceStreamId;
       if (patch.screenStreamId !== undefined) peerObj.screenStreamId = patch.screenStreamId;
@@ -3784,7 +3643,13 @@
         peerObj.webrtcVideoConfirmed = false;
         peerObj.screenAudioTrackId = null;
         peerObj.screenVideoTrackId = null;
+        peerObj.screenStream = null;
         removeStreamTile(socketId);
+      } else if (patch.isStreaming === true) {
+        state.stoppedWatchingPeers.delete(socketId);
+        if (peerObj.screenStream && peerObj.screenStream.getVideoTracks().length > 0) {
+          renderOrUpdateStreamTile(socketId, peerObj.user, peerObj.screenStream, false, true);
+        }
       }
     }
     const uInRoom = state.roomUsers.find(u => u.socketId === socketId);
@@ -3815,14 +3680,13 @@
   socket.on('connect', () => {
     el.netStatusDot.className = 'dot-indicator online';
     el.netStatusText.textContent = state.serverMode === 'cloud' && state.cloudServerUrl ? 'Cloud 24/7' : 'Ligado';
-    if (state.user && state.currentRoomId) {
+    if (state.user && state.currentRoomId && !state.isLoggingIn) {
       socket.emit('user:register', state.user, () => {
         joinRoom(state.currentRoomId);
       });
     }
   });
 
-  // Loop de 35ms para deteção vocal + Supressão Instantânea de Loopback (Anti-Eco na Live)
   setInterval(() => {
     const buf = new Uint8Array(128);
     let overlayDirty = false;
@@ -3841,8 +3705,7 @@
       peerObj.remoteAnalyser.getByteFrequencyData(buf);
       let s = 0;
       for (let i = 4; i < 40; i++) s += buf[i];
-      const avgEnergy = s / 36;
-      const isTalking = avgEnergy > 11;
+      const isTalking = (s / 36) > 13;
       card.classList.toggle('speaking', isTalking);
 
       if (isTalking) {
@@ -3860,28 +3723,20 @@
       }
     }
 
-    // Se estivermos a transmitir ecrã com áudio do sistema, corta o ganho do loopback no exato
-    // instante em que qualquer amigo fala na sala, impedindo que a voz dele volte na live!
+    // Evita eco na transmissão cortando momentaneamente o loopback quando um espectador fala
     if (state.isStreaming && state.localScreenStream) {
-      const withinHoldWindow = anyRemoteSpeakingNow || (performance.now() - state.lastRemoteVoiceActivityAt) < 180;
-      if (state.localScreenAudioGainNode && state.audioContext) {
-        const targetSysGain = withinHoldWindow ? 0.0 : 1.0;
-        state.localScreenAudioGainNode.gain.setTargetAtTime(
-          targetSysGain,
-          state.audioContext.currentTime,
-          withinHoldWindow ? 0.005 : 0.06
-        );
-      }
       const sysTrack = state.localScreenStream.getAudioTracks()[0];
-      if (sysTrack && !state.localScreenAudioGainNode) {
-        sysTrack.enabled = !withinHoldWindow;
+      if (sysTrack) {
+        const withinHoldWindow = anyRemoteSpeakingNow || (performance.now() - state.lastRemoteVoiceActivityAt) < 180;
+        const anyRemoteLivePlaying = Array.from(el.streamsGrid.querySelectorAll('video.stream-webrtc-video')).some(v => !v.muted);
+        sysTrack.enabled = !withinHoldWindow && !anyRemoteLivePlaying;
       }
     }
 
     if (overlayDirty) {
       syncDesktopOverlayState();
     }
-  }, 35);
+  }, 60);
 
   setInterval(async () => {
     let bestRtt = null;
@@ -3900,7 +3755,6 @@
       }
       if (v.videoWidth > 0) {
         v.classList.add('webrtc-has-frames');
-        applyOptimalVideoShaderClass(v);
         const tile = v.closest('.stream-tile');
         tile?.querySelector('img.stream-relay-img')?.classList.add('hidden');
       }
