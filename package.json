@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "electron": "electron .",
-    "build:exe": "electron-builder --win --x64"
+    "build:exe": "node main.js --generate-icon && electron-builder --win --x64"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -33,15 +33,22 @@
     ],
     "win": {
       "target": [
-        "nsis",
-        "portable"
-      ]
+        "nsis"
+      ],
+      "icon": "public/icon.ico"
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "shortcutName": "Aether",
+      "installerIcon": "public/icon.ico",
+      "uninstallerIcon": "public/icon.ico",
+      "installerHeaderIcon": "public/icon.ico",
+      "runAfterFinish": true
     }
   }
 }

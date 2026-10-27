@@ -1,5 +1,6 @@
 (() => {
   const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
+  const isDesktopInstalledApp = Boolean(window.aetherDesktop && window.aetherDesktop.isDesktop);
 
   // ================= CONFIGURAÇÃO DO SERVIDOR CLOUD 24/7 OU LOCAL =================
   const savedServerMode = localStorage.getItem('aether_server_mode') || 'auto';
@@ -27,8 +28,6 @@
         transports: ['websocket', 'polling']
       });
 
-  // Inclui servidores STUN + TURN (UDP/TCP/TLS) para garantir ligação de voz direta
-  // entre todos os amigos na sala mesmo atrás de CGNAT ou firewalls de operadoras
   const RTC_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -50,6 +49,21 @@
     rtcpMuxPolicy: 'require'
   };
 
+  const defaultHotkeys = {
+    toggleMic: 'CommandOrControl+Shift+M',
+    muteMic: 'CommandOrControl+Shift+Down',
+    unmuteMic: 'CommandOrControl+Shift+Up',
+    pushToTalk: 'CommandOrControl+Shift+Space',
+    toggleOverlay: 'CommandOrControl+Shift+O',
+    toggleDeafen: 'CommandOrControl+Shift+D'
+  };
+
+  let savedHotkeys = defaultHotkeys;
+  try {
+    const rawHk = localStorage.getItem('aether_global_hotkeys');
+    if (rawHk) savedHotkeys = { ...defaultHotkeys, ...JSON.parse(rawHk) };
+  } catch (e) {}
+
   const state = {
     user: null,
     currentRoomId: null,
@@ -67,6 +81,7 @@
     isSelfSpeaking: false,
     voiceMode: 'vad',
     pttPressed: false,
+    globalPttHoldTimeout: null,
     isMicMuted: false,
     isDeafened: false,
     isStreaming: false,
@@ -75,6 +90,13 @@
     myStreamViewers: new Set(),
     sharpenEnabled: true,
     roomSfxEnabled: localStorage.getItem('aether_room_sfx') !== 'off',
+    overlayEnabled: localStorage.getItem('aether_overlay_enabled') !== 'off',
+    overlayPosition: localStorage.getItem('aether_overlay_pos') || 'top-left',
+    nativeNotificationsEnabled: localStorage.getItem('aether_win_notif') !== 'off',
+    globalHotkeys: savedHotkeys,
+    speakingPeers: new Set(),
+    localFullscreenVideoActive: false,
+    suppressedLocalQueue: [],
     serverMode: savedServerMode,
     cloudServerUrl: savedCloudUrl,
     selectedAudioInputId: 'default',
@@ -301,10 +323,120 @@
         font-size: 11.5px; cursor: pointer; display: flex; align-items: center; gap: 6px;
       }
       .entry-cloud-toggle:hover { color: var(--text-primary); }
+      .hotkey-recorder-btn {
+        min-width: 195px;
+        text-align: center;
+        background: var(--surface-input);
+        border: 1px solid var(--border-specular);
+        color: var(--text-primary);
+        padding: 7px 12px;
+        border-radius: 10px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 150ms ease;
+      }
+      .hotkey-recorder-btn.recording {
+        background: rgba(244, 63, 94, 0.2);
+        border-color: #f43f5e;
+        color: #fecdd3;
+        box-shadow: 0 0 12px rgba(244, 63, 94, 0.35);
+      }
     `;
     document.head.appendChild(style);
   }
   injectAuxiliaryStyles();
+
+  // ================= SINCRONIZAÇÃO DO OVERLAY DENTRO DE JOGOS =================
+  function syncDesktopOverlayState() {
+    if (!isDesktopInstalledApp || !window.aetherDesktop?.updateOverlayState) return;
+    const roomObj = state.rooms.find(r => r.id === state.currentRoomId);
+    const usersPayload = (state.roomUsers || []).map((u) => {
+      const isMe = u.socketId === socket.id;
+      const isSpeaking = isMe ? state.isSelfSpeaking : state.speakingPeers.has(u.socketId);
+      return {
+        socketId: u.socketId,
+        name: u.name,
+        nick: u.nick,
+        avatarColor: u.avatarColor || '#5E81F4',
+        isMuted: isMe ? state.isMicMuted : Boolean(u.isMuted),
+        isDeafened: isMe ? state.isDeafened : Boolean(u.isDeafened),
+        isSpeaking: Boolean(isSpeaking && !(isMe ? state.isMicMuted : u.isMuted))
+      };
+    });
+
+    window.aetherDesktop.updateOverlayState({
+      roomName: roomObj ? roomObj.name : (el.currentRoomTitle?.textContent || 'Aether'),
+      users: usersPayload
+    });
+  }
+
+  // ================= NOTIFICAÇÕES NATIVAS DO WINDOWS & COMPORTAMENTO EM ECRÃ CHEIO =================
+  function isLocalFullscreenOrVideoPlaying() {
+    if (document.fullscreenElement || document.webkitFullscreenElement) return true;
+    const videos = Array.from(document.querySelectorAll('video'));
+    for (const v of videos) {
+      if (!v.paused && v.videoWidth > 0 && (document.fullscreenElement || state.focusedPeerId)) {
+        if (document.fullscreenElement) return true;
+      }
+    }
+    return false;
+  }
+
+  function dispatchSmartNotification(title, body, icon = '🔔', onClick = null) {
+    const fullscreenNow = isLocalFullscreenOrVideoPlaying();
+
+    // Na versão instalada, envia para o sistema nativo do Windows (que suprime e guarda em fila se houver jogo em ecrã cheio)
+    if (isDesktopInstalledApp && state.nativeNotificationsEnabled && window.aetherDesktop?.notify) {
+      if (fullscreenNow) {
+        state.suppressedLocalQueue.push({ title, body });
+        return;
+      }
+      window.aetherDesktop.notify({ title, body });
+      if (!document.hidden) {
+        showToast(title, body, icon, onClick);
+      }
+      return;
+    }
+
+    // Se estiver em ecrã cheio local, não exibe popups por cima do conteúdo
+    if (fullscreenNow) {
+      state.suppressedLocalQueue.push({ title, body });
+      return;
+    }
+
+    showToast(title, body, icon, onClick);
+  }
+
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && state.suppressedLocalQueue.length > 0) {
+      const count = state.suppressedLocalQueue.length;
+      const last = state.suppressedLocalQueue[count - 1];
+      state.suppressedLocalQueue = [];
+      showToast(
+        `${count} ${count === 1 ? 'notificação recebida' : 'notificações recebidas'} durante ecrã cheio`,
+        `${last.title}: ${last.body}`,
+        '🔔'
+      );
+    }
+  });
+
+  function formatAcceleratorFromKeyEvent(e) {
+    const mods = [];
+    if (e.ctrlKey || e.metaKey) mods.push('CommandOrControl');
+    if (e.altKey) mods.push('Alt');
+    if (e.shiftKey) mods.push('Shift');
+
+    const ignoredKeys = ['Control', 'Shift', 'Alt', 'Meta'];
+    if (ignoredKeys.includes(e.key)) return null;
+
+    let keyName = e.key;
+    if (keyName === ' ') keyName = 'Space';
+    else if (keyName.startsWith('Arrow')) keyName = keyName.replace('Arrow', '');
+    else if (keyName.length === 1) keyName = keyName.toUpperCase();
+
+    return [...mods, keyName].join('+');
+  }
 
   function injectAdvancedSettingsAndCloudUI() {
     const tabAudio = document.getElementById('tab-audio');
@@ -360,6 +492,134 @@
     }
 
     const tabInterface = document.getElementById('tab-interface');
+    if (tabInterface && !document.getElementById('desktop-overlay-hotkeys-card')) {
+      const desktopCard = document.createElement('div');
+      desktopCard.id = 'desktop-overlay-hotkeys-card';
+      desktopCard.className = 'settings-group-card';
+      desktopCard.innerHTML = `
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Overlay Dentro de Jogos (Mostrar Sala e Quem Está a Falar)</strong>
+            <small>Exibe avatares discretos, atividade de voz e estado de mute sobre jogos em ecrã cheio ou janela.</small>
+          </div>
+          <label class="apple-switch">
+            <input type="checkbox" id="toggle-game-overlay" ${state.overlayEnabled ? 'checked' : ''} />
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Posição do Overlay no Ecrã</strong>
+            <small>Escolha o canto onde os avatares da sala aparecem durante o jogo.</small>
+          </div>
+          <select id="select-overlay-position" class="apple-select">
+            <option value="top-left" ${state.overlayPosition === 'top-left' ? 'selected' : ''}>Superior Esquerdo</option>
+            <option value="top-right" ${state.overlayPosition === 'top-right' ? 'selected' : ''}>Superior Direito</option>
+            <option value="bottom-left" ${state.overlayPosition === 'bottom-left' ? 'selected' : ''}>Inferior Esquerdo</option>
+            <option value="bottom-right" ${state.overlayPosition === 'bottom-right' ? 'selected' : ''}>Inferior Direito</option>
+          </select>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Notificações Nativas do Windows (Com Supressão em Ecrã Cheio)</strong>
+            <small>Usa notificações nativas do Windows e silencia automaticamente durante jogos ou vídeos em ecrã cheio.</small>
+          </div>
+          <label class="apple-switch">
+            <input type="checkbox" id="toggle-win-notifications" ${state.nativeNotificationsEnabled ? 'checked' : ''} />
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-info" style="margin-bottom:8px;">
+          <strong>Hotkeys Globais (Funcionam Minimizado e Dentro de Jogos)</strong>
+          <small>Clique em qualquer botão abaixo e pressione a combinação de teclas desejada.</small>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info"><strong>Alternar Microfone (Mute / Unmute)</strong></div>
+          <button type="button" class="hotkey-recorder-btn mono" data-hk="toggleMic">${escapeHtml(state.globalHotkeys.toggleMic)}</button>
+        </div>
+        <div class="setting-row" style="margin-top:6px;">
+          <div class="setting-info"><strong>Mutar Microfone</strong></div>
+          <button type="button" class="hotkey-recorder-btn mono" data-hk="muteMic">${escapeHtml(state.globalHotkeys.muteMic)}</button>
+        </div>
+        <div class="setting-row" style="margin-top:6px;">
+          <div class="setting-info"><strong>Desmutar Microfone</strong></div>
+          <button type="button" class="hotkey-recorder-btn mono" data-hk="unmuteMic">${escapeHtml(state.globalHotkeys.unmuteMic)}</button>
+        </div>
+        <div class="setting-row" style="margin-top:6px;">
+          <div class="setting-info"><strong>Push-To-Talk Global</strong></div>
+          <button type="button" class="hotkey-recorder-btn mono" data-hk="pushToTalk">${escapeHtml(state.globalHotkeys.pushToTalk)}</button>
+        </div>
+        <div class="setting-row" style="margin-top:6px;">
+          <div class="setting-info"><strong>Abrir / Ocultar Overlay em Jogo</strong></div>
+          <button type="button" class="hotkey-recorder-btn mono" data-hk="toggleOverlay">${escapeHtml(state.globalHotkeys.toggleOverlay)}</button>
+        </div>
+        <div class="setting-row" style="margin-top:6px;">
+          <div class="setting-info"><strong>Alternar Áudio da Sala (Deafen)</strong></div>
+          <button type="button" class="hotkey-recorder-btn mono" data-hk="toggleDeafen">${escapeHtml(state.globalHotkeys.toggleDeafen)}</button>
+        </div>
+      `;
+      tabInterface.appendChild(desktopCard);
+
+      const overlayToggle = document.getElementById('toggle-game-overlay');
+      const overlayPosSelect = document.getElementById('select-overlay-position');
+      const winNotifToggle = document.getElementById('toggle-win-notifications');
+
+      overlayToggle?.addEventListener('change', () => {
+        state.overlayEnabled = overlayToggle.checked;
+        localStorage.setItem('aether_overlay_enabled', state.overlayEnabled ? 'on' : 'off');
+        window.aetherDesktop?.setOverlayConfig({ enabled: state.overlayEnabled, position: state.overlayPosition });
+        syncDesktopOverlayState();
+      });
+
+      overlayPosSelect?.addEventListener('change', () => {
+        state.overlayPosition = overlayPosSelect.value;
+        localStorage.setItem('aether_overlay_pos', state.overlayPosition);
+        window.aetherDesktop?.setOverlayConfig({ enabled: state.overlayEnabled, position: state.overlayPosition });
+      });
+
+      winNotifToggle?.addEventListener('change', () => {
+        state.nativeNotificationsEnabled = winNotifToggle.checked;
+        localStorage.setItem('aether_win_notif', state.nativeNotificationsEnabled ? 'on' : 'off');
+      });
+
+      desktopCard.querySelectorAll('.hotkey-recorder-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const hkKey = btn.dataset.hk;
+          btn.classList.add('recording');
+          btn.textContent = 'Pressione as teclas...';
+
+          const onKeyDown = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (ev.key === 'Escape') {
+              btn.classList.remove('recording');
+              btn.textContent = state.globalHotkeys[hkKey];
+              window.removeEventListener('keydown', onKeyDown, true);
+              return;
+            }
+            const accel = formatAcceleratorFromKeyEvent(ev);
+            if (!accel) return;
+
+            state.globalHotkeys[hkKey] = accel;
+            localStorage.setItem('aether_global_hotkeys', JSON.stringify(state.globalHotkeys));
+            btn.classList.remove('recording');
+            btn.textContent = accel;
+            window.removeEventListener('keydown', onKeyDown, true);
+
+            if (window.aetherDesktop?.updateHotkeys) {
+              window.aetherDesktop.updateHotkeys(state.globalHotkeys);
+            }
+            showToast('Atalho Global Guardado', `Novo atalho definido: ${accel}`, '⌨️');
+          };
+
+          window.addEventListener('keydown', onKeyDown, true);
+        });
+      });
+    }
+
     if (tabInterface && !document.getElementById('cloud-server-settings-card')) {
       const cloudCard = document.createElement('div');
       cloudCard.id = 'cloud-server-settings-card';
@@ -461,6 +721,54 @@
     }
   }
   injectAdvancedSettingsAndCloudUI();
+
+  // Inicializa a ponte com o aplicativo Desktop instalado (Overlay, Hotkeys e Notificações)
+  if (isDesktopInstalledApp) {
+    window.aetherDesktop.setOverlayConfig({
+      enabled: state.overlayEnabled,
+      position: state.overlayPosition
+    });
+    window.aetherDesktop.updateHotkeys(state.globalHotkeys);
+
+    window.aetherDesktop.onHotkeyCommand((cmd) => {
+      if (!cmd || !cmd.action) return;
+      if (cmd.action === 'toggle-mic') {
+        el.btnToggleMic?.click();
+      } else if (cmd.action === 'mute-mic') {
+        if (!state.isMicMuted) el.btnToggleMic?.click();
+      } else if (cmd.action === 'unmute-mic') {
+        if (state.isMicMuted) el.btnToggleMic?.click();
+      } else if (cmd.action === 'toggle-deafen') {
+        el.btnToggleDeafen?.click();
+      } else if (cmd.action === 'ptt-trigger') {
+        state.pttPressed = true;
+        updateLocalMicTrackEnabledState();
+        if (state.globalPttHoldTimeout) clearTimeout(state.globalPttHoldTimeout);
+        state.globalPttHoldTimeout = setTimeout(() => {
+          state.pttPressed = false;
+          updateLocalMicTrackEnabledState();
+        }, 1200);
+      }
+    });
+
+    window.aetherDesktop.onOverlayToggled((enabled) => {
+      state.overlayEnabled = Boolean(enabled);
+      localStorage.setItem('aether_overlay_enabled', state.overlayEnabled ? 'on' : 'off');
+      const toggleEl = document.getElementById('toggle-game-overlay');
+      if (toggleEl) toggleEl.checked = state.overlayEnabled;
+      syncDesktopOverlayState();
+    });
+
+    window.aetherDesktop.onFlushedNotifications((list) => {
+      if (!Array.isArray(list) || list.length === 0) return;
+      const last = list[list.length - 1];
+      showToast(
+        `${list.length} ${list.length === 1 ? 'notificação recebida' : 'notificações recebidas'} durante o jogo`,
+        `${last.title}: ${last.body}`,
+        '🎮'
+      );
+    });
+  }
 
   // ================= EFEITOS SONOROS ELEGANTES DE ENTRADA E SAÍDA DA SALA =================
   function playRoomSoundEffect(type) {
@@ -686,7 +994,7 @@
   const tabTitles = {
     'tab-audio': 'Áudio & Processamento Vocal',
     'tab-stream': 'Qualidade de Transmissão',
-    'tab-interface': 'Aparência & Servidor Cloud 24/7'
+    'tab-interface': 'Aparência, Overlay & Hotkeys'
   };
 
   document.querySelectorAll('.settings-nav-item').forEach((item) => {
@@ -970,9 +1278,14 @@
         state.voiceMode === 'ptt' ? state.pttPressed : avg > minThreshold
       );
 
+      const prevSpeaking = state.isSelfSpeaking;
       state.isSelfSpeaking = isTalkingNow;
       const selfCard = document.getElementById(`participant-card-${socket.id}`);
       if (selfCard) selfCard.classList.toggle('speaking', isTalkingNow);
+
+      if (prevSpeaking !== isTalkingNow) {
+        syncDesktopOverlayState();
+      }
 
       const pct = isTalkingNow ? Math.min(100, Math.round((avg / 75) * 100)) : 0;
       if (el.localMicLevel) el.localMicLevel.style.width = `${pct}%`;
@@ -1079,6 +1392,7 @@
       renderRoomsList();
       renderParticipantsList(res.room.users);
       updateStageLayout();
+      syncDesktopOverlayState();
     });
   }
 
@@ -1117,7 +1431,6 @@
         : 6500;
   }
 
-  // Injeta parâmetros de bitrate alto diretamente no SDP de vídeo para impedir compressão excessiva na nuvem
   function enhanceSdpForHighQualityStream(sdp) {
     if (!sdp) return sdp;
     const targetMax = getTargetBitrateKbps();
@@ -1276,8 +1589,6 @@
 
     sendStreamIdsMeta(peerId);
 
-    // Suprime onnegotiationneeded durante a adição inicial das faixas para evitar que
-    // ambos os utilizadores enviem ofertas ao mesmo tempo (Glare) quando conectados via Render!
     if (state.localVoiceStream) {
       state.localVoiceStream.getTracks().forEach((track) => {
         const alreadySent = pc.getSenders().some(s => s.track === track);
@@ -1308,7 +1619,6 @@
       }
     };
 
-    // Recuperação automática de ICE caso a ligação direta entre dois amigos oscile
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'failed') {
         const polite = socket.id < peerId;
@@ -1327,7 +1637,6 @@
       const incomingTrack = event.track;
       const incomingStream = event.streams[0];
 
-      // 1. Trilha de VÍDEO da Live
       if (incomingTrack.kind === 'video') {
         if (!peerObj.screenStream) {
           peerObj.screenStream = new MediaStream();
@@ -1369,7 +1678,6 @@
         return;
       }
 
-      // 2. Trilha de ÁUDIO (Determinístico: nunca desvia voz de microfone para stream de vídeo)
       if (incomingTrack.kind === 'audio') {
         const isDefinitelyScreenAudio = Boolean(
           (peerObj.screenAudioTrackId && incomingTrack.id === peerObj.screenAudioTrackId) ||
@@ -1578,8 +1886,6 @@
               }
             });
 
-            // Se estivermos a transmitir ecrã quando um novo utilizador nos envia uma oferta de entrada,
-            // garante a negociação imediata das nossas faixas de vídeo/áudio da live para ele
             if (state.isStreaming && state.localScreenStream) {
               setTimeout(() => {
                 negotiateWithPeer(from, peerObj);
@@ -2158,6 +2464,7 @@
     document.getElementById('icon-mic').textContent = state.isMicMuted ? '🔇' : '🎙️';
     updateLocalMicTrackEnabledState();
     socket.emit('user:state-change', { isMuted: state.isMicMuted });
+    syncDesktopOverlayState();
   });
 
   el.btnToggleDeafen?.addEventListener('click', () => {
@@ -2174,6 +2481,7 @@
     }
     syncMultiStreamAudioBus();
     socket.emit('user:state-change', { isDeafened: state.isDeafened });
+    syncDesktopOverlayState();
   });
 
   function renderParticipantsList(users) {
@@ -2277,6 +2585,8 @@
 
       el.participantsList.appendChild(card);
     });
+
+    syncDesktopOverlayState();
   }
 
   // ================= 8. CHAT PREMIUM =================
@@ -2488,16 +2798,22 @@
     el.chatMessages.appendChild(div);
     el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
 
-    if (isRealtime && mentionedMe && !isMyMessage) {
-      playMentionChime();
-      showToast(
-        `@${msg.senderNick} mencionou-o`,
-        msg.text.slice(0, 70),
-        '🔔',
-        () => {
-          div.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      );
+    if (isRealtime && !isMyMessage) {
+      if (mentionedMe) {
+        playMentionChime();
+        dispatchSmartNotification(
+          `@${msg.senderNick} mencionou-o`,
+          (msg.text || 'Anexo enviado').slice(0, 80),
+          '🔔',
+          () => div.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        );
+      } else if (document.hidden && isDesktopInstalledApp) {
+        dispatchSmartNotification(
+          `Nova mensagem de ${msg.senderName}`,
+          (msg.text || msg.file?.name || 'Enviou um ficheiro').slice(0, 80),
+          '💬'
+        );
+      }
     }
   }
 
@@ -2663,6 +2979,7 @@
   }
 
   function showToast(title, subtitle, icon = '🔔', onClick = null) {
+    if (isLocalFullscreenOrVideoPlaying()) return;
     const toast = document.createElement('div');
     toast.className = 'toast-item';
     toast.innerHTML = `
@@ -2899,13 +3216,22 @@
   socket.on('peer:joined', ({ user }) => {
     playRoomSoundEffect('peer-join');
     createPeerConnection(user.socketId, user, false);
+    if (user && user.socketId !== socket.id) {
+      dispatchSmartNotification(
+        `${user.name} entrou na sala`,
+        `@${user.nick} juntou-se ao canal de voz.`,
+        '👋'
+      );
+    }
   });
 
   socket.on('peer:left', ({ socketId }) => {
     playRoomSoundEffect('peer-leave');
     state.myStreamViewers.delete(socketId);
+    state.speakingPeers.delete(socketId);
     updateBroadcasterControlPanel();
     cleanupSinglePeer(socketId);
+    syncDesktopOverlayState();
   });
 
   socket.on('peer:state-updated', ({ socketId, patch }) => {
@@ -2921,9 +3247,19 @@
         removeStreamTile(socketId);
       }
     }
+    syncDesktopOverlayState();
   });
 
   socket.on('chat:new-message', (msg) => appendChatMessage(msg, true));
+
+  socket.on('room:invite', (invite) => {
+    if (!invite) return;
+    dispatchSmartNotification(
+      `Convite de @${invite.fromNick || 'utilizador'}`,
+      `Convidou-o para a sala "${invite.roomName || 'Sala'}"`,
+      '📩'
+    );
+  });
 
   socket.on('disconnect', () => {
     el.netStatusDot.className = 'dot-indicator reconnecting';
@@ -2942,10 +3278,16 @@
 
   setInterval(() => {
     const buf = new Uint8Array(128);
+    let overlayDirty = false;
+
     for (const [peerId, peerObj] of state.peers.entries()) {
       const card = document.getElementById(`participant-card-${peerId}`);
       if (!card || !peerObj.remoteAnalyser || peerObj.user?.isMuted) {
         if (card) card.classList.remove('speaking');
+        if (state.speakingPeers.has(peerId)) {
+          state.speakingPeers.delete(peerId);
+          overlayDirty = true;
+        }
         continue;
       }
       peerObj.remoteAnalyser.getByteFrequencyData(buf);
@@ -2953,6 +3295,19 @@
       for (let i = 4; i < 40; i++) s += buf[i];
       const isTalking = (s / 36) > 14;
       card.classList.toggle('speaking', isTalking);
+
+      const hadSpeaking = state.speakingPeers.has(peerId);
+      if (isTalking && !hadSpeaking) {
+        state.speakingPeers.add(peerId);
+        overlayDirty = true;
+      } else if (!isTalking && hadSpeaking) {
+        state.speakingPeers.delete(peerId);
+        overlayDirty = true;
+      }
+    }
+
+    if (overlayDirty) {
+      syncDesktopOverlayState();
     }
   }, 100);
 
@@ -3005,6 +3360,7 @@
 
   function cleanupSinglePeer(peerId) {
     state.myStreamViewers.delete(peerId);
+    state.speakingPeers.delete(peerId);
     updateBroadcasterControlPanel();
     const peerObj = state.peers.get(peerId);
     if (!peerObj) return;
@@ -3012,6 +3368,7 @@
     detachVoicePipeline(peerObj);
     removeStreamTile(peerId);
     state.peers.delete(peerId);
+    syncDesktopOverlayState();
   }
 
   function cleanupAllPeers() {
