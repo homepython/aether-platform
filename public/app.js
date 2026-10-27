@@ -81,8 +81,11 @@
     localVoiceStream: null,
     localMicRawStream: null,
     localMicFilterNodes: null,
+    localMicRelayProcessor: null,
     localMicMeterTimer: null,
     localScreenStream: null,
+    localScreenRawStream: null,
+    localScreenDspNodes: null,
     lastRemoteVoiceActivityAt: 0,
     lastVideoBytesReceived: new Map(),
     audioContext: null,
@@ -367,7 +370,6 @@
         color: #fecdd3 !important;
         box-shadow: 0 0 16px rgba(244, 63, 94, 0.28);
       }
-      /* Nitidez nativa 1:1 em GPU para transmissões 2K (1440p) sem distorção de sub-píxeis */
       video.stream-webrtc-video.native-2k-crisp {
         filter: contrast(1.03) saturate(1.03) !important;
         image-rendering: -webkit-optimize-contrast;
@@ -1201,7 +1203,9 @@
     const hasSysAudio = state.localScreenStream.getAudioTracks().length > 0;
     const audioStatusEl = document.getElementById('broadcaster-audio-status');
     if (audioStatusEl) {
-      audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio' : '🔇 Somente tela (sem áudio)';
+      audioStatusEl.textContent = hasSysAudio
+        ? '🔊 Áudio Mid-Side + Lookahead 25ms Ativo (Zero Eco / Volume 100%)'
+        : '🔇 Somente tela (sem áudio)';
     }
 
     const viewersCount = state.myStreamViewers.size;
@@ -1433,7 +1437,7 @@
     });
   }
 
-  // ================= 1. LOGIN AUTOMÁTICO SEM CONDIÇÃO DE CORRIDA =================
+  // ================= 1. LOGIN AUTOMÁTICO (CONCLUI initLocalVoiceEngine ANTES DE room:join) =================
   function validateEntryInputs() {
     const nameValid = el.inputName.value.trim().length >= 2;
     const cleanedNick = el.inputNick.value.replace(/[^a-zA-Z0-9_\s]/g, '');
@@ -1460,6 +1464,7 @@
       avatarColor
     }));
 
+    // Conclui initLocalVoiceEngine() obrigatoriamente antes de entrar na sala
     await initLocalVoiceEngine();
 
     socket.emit('user:register', {
@@ -1517,7 +1522,7 @@
     }
   } catch (e) {}
 
-  // ================= 2. MOTOR DE VOZ COM AUTO-RECUPERAÇÃO E TAXA DE AMOSTRAGEM NATIVA =================
+  // ================= 2. MOTOR DE VOZ + RELAY AUTOMÁTICO CGNAT (voice:relay) =================
   function getNoiseFilterFrequencies(level) {
     switch (level) {
       case 'low':
@@ -1576,6 +1581,55 @@
     } finally {
       state.isReinitializingMic = false;
     }
+  }
+
+  function setupVoiceRelayFallbackProcessor(filteredVoiceNode) {
+    if (!state.audioContext || !filteredVoiceNode) return;
+    try {
+      if (state.localMicRelayProcessor) {
+        try { state.localMicRelayProcessor.disconnect(); } catch (e) {}
+        state.localMicRelayProcessor = null;
+      }
+
+      const processor = state.audioContext.createScriptProcessor(2048, 1, 1);
+      const zeroGain = state.audioContext.createGain();
+      zeroGain.gain.value = 0;
+
+      filteredVoiceNode.connect(processor);
+      processor.connect(zeroGain);
+      zeroGain.connect(state.audioContext.destination);
+
+      processor.onaudioprocess = (e) => {
+        if (state.isMicMuted || !state.isSelfSpeaking || !state.currentRoomId) return;
+
+        // Envia pacotes voice:relay apenas para pares cujo fluxo P2P direto ainda não confirmou p2pVoiceOk
+        const relayTargets = [];
+        const now = Date.now();
+        for (const [peerId, peerObj] of state.peers.entries()) {
+          if (!peerObj.p2pVoiceOk && (now - (peerObj.createdAt || 0)) > 2000) {
+            relayTargets.push(peerId);
+          }
+        }
+        if (relayTargets.length === 0) return;
+
+        const input = e.inputBuffer.getChannelData(0);
+        const step = 3; // Downsample ~48kHz -> ~16kHz Int16
+        const outLen = Math.floor(input.length / step);
+        const pcm16 = new Int16Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const s = Math.max(-1, Math.min(1, input[i * step]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+
+        socket.volatile.emit('voice:relay', {
+          targets: relayTargets,
+          pcm: pcm16.buffer,
+          sampleRate: Math.round(state.audioContext.sampleRate / step)
+        });
+      };
+
+      state.localMicRelayProcessor = processor;
+    } catch (e) {}
   }
 
   async function initLocalVoiceEngine() {
@@ -1658,6 +1712,7 @@
       lp.connect(analyser);
 
       state.localMicFilterNodes = { source, hp, lp, analyser };
+      setupVoiceRelayFallbackProcessor(lp);
       startVoiceMeterLoop(analyser);
     } catch (err) {
       console.warn('Microfone indisponível, iniciando em modo somente escuta:', err);
@@ -1718,8 +1773,72 @@
             ? 'Voz Ativa'
             : 'Pronto';
       }
-    }, 50);
+    }, 40);
   }
+
+  // Recebe pacotes de voz via Relay caso CGNAT estrito bloqueie P2P direto entre Usuário A e Usuário B
+  socket.on('voice:relay', ({ from, pcm, sampleRate }) => {
+    if (state.isDeafened || !pcm || !state.audioContext) return;
+    const peerObj = state.peers.get(from);
+    if (peerObj && peerObj.p2pVoiceOk) return;
+
+    try {
+      if (state.audioContext.state === 'suspended') {
+        state.audioContext.resume().catch(() => {});
+      }
+      const int16 = new Int16Array(pcm);
+      if (int16.length === 0) return;
+
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768.0;
+      }
+
+      const ctx = state.audioContext;
+      const sr = sampleRate || 16000;
+      const audioBuffer = ctx.createBuffer(1, float32.length, sr);
+      audioBuffer.getChannelData(0).set(float32);
+
+      const src = ctx.createBufferSource();
+      src.buffer = audioBuffer;
+
+      // Aplica filtro Mono estrito (185 Hz - 3700 Hz) e Lookahead de 25ms quando estiver transmitindo
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 185;
+
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 3700;
+
+      const delayNode = ctx.createDelay(0.1);
+      delayNode.delayTime.value = state.isStreaming ? 0.025 : 0.0;
+
+      const gainNode = ctx.createGain();
+      const userVol = state.userVolumes.get(from) ?? 100;
+      gainNode.gain.value = state.isDeafened ? 0 : Math.min(1, userVol / 100);
+
+      // Força saída 100% Mono idêntica nos canais L e R (L = R) para cancelamento Mid-Side perfeito
+      const monoMerger = ctx.createChannelMerger(2);
+
+      src.connect(hp);
+      hp.connect(lp);
+      lp.connect(delayNode);
+      delayNode.connect(gainNode);
+      gainNode.connect(monoMerger, 0, 0);
+      gainNode.connect(monoMerger, 0, 1);
+      monoMerger.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      const nextTime = Math.max(now, peerObj?.relayNextPlayTime || now);
+      src.start(nextTime);
+      if (peerObj) {
+        peerObj.relayNextPlayTime = nextTime + audioBuffer.duration;
+        peerObj.lastRelayVoiceAt = performance.now();
+      }
+      state.lastRemoteVoiceActivityAt = performance.now();
+    } catch (e) {}
+  });
 
   el.inputGateThreshold?.addEventListener('input', () => {
     state.voiceGateThreshold = Number(el.inputGateThreshold.value);
@@ -1774,7 +1893,7 @@
     });
   }
 
-  function joinRoom(roomId, password = '') {
+  async function joinRoom(roomId, password = '') {
     const hadPreviousRoom = Boolean(state.currentRoomId && state.currentRoomId !== roomId);
     if (hadPreviousRoom) {
       playRoomSoundEffect('self-leave');
@@ -1784,16 +1903,17 @@
     const currentSession = state.roomSessionToken;
     cleanupAllPeers();
 
-    socket.emit('room:join', { roomId, password }, async (res) => {
+    // Garante que initLocalVoiceEngine() é concluído ANTES de socket.emit('room:join')
+    const currentMicTrack = state.localVoiceStream?.getAudioTracks()[0];
+    if (!currentMicTrack || currentMicTrack.readyState === 'ended') {
+      await initLocalVoiceEngine();
+    }
+
+    socket.emit('room:join', { roomId, password }, (res) => {
       if (currentSession !== state.roomSessionToken) return;
       if (!res?.ok) {
         showToast('Acesso Negado', res?.error || 'Não foi possível entrar no espaço.', '⚠️');
         return;
-      }
-
-      const currentMicTrack = state.localVoiceStream?.getAudioTracks()[0];
-      if (!currentMicTrack || currentMicTrack.readyState === 'ended') {
-        await initLocalVoiceEngine();
       }
 
       state.currentRoomId = res.room.id;
@@ -1847,7 +1967,7 @@
     });
   });
 
-  // ================= 4. WEBRTC ENGINE (MALHA DE VOZ DETERMINÍSTICA + 1440P 2K 32 MBPS) =================
+  // ================= 4. WEBRTC ENGINE (HANDSHAKE BLINDADO + ROLLBACK 3.5S + LOOKAHEAD 25MS) =================
   function getTargetBitrateKbps() {
     if (state.streamSettings.bitrateMode !== 'auto') {
       const manualVal = Number(state.streamSettings.bitrateMode);
@@ -2040,6 +2160,28 @@
     }
   }
 
+  // Se qualquer conexão demorar mais de 3,5 segundos presa em negociação, sofre rollback e reconecta automaticamente
+  function armNegotiationWatchdogTimer(peerId, peerObj) {
+    if (peerObj.negotiationWatchdogTimer) {
+      clearTimeout(peerObj.negotiationWatchdogTimer);
+    }
+    peerObj.negotiationWatchdogTimer = setTimeout(async () => {
+      if (!state.peers.has(peerId)) return;
+      const pc = peerObj.pc;
+      if (pc.signalingState !== 'stable') {
+        try {
+          await pc.setLocalDescription({ type: 'rollback' });
+        } catch (e) {}
+        peerObj.makingOffer = false;
+        peerObj.initialHandshakeDone = true;
+        const polite = socket.id < peerId;
+        if (!polite) {
+          negotiateWithPeer(peerId, peerObj, true);
+        }
+      }
+    }, 3500);
+  }
+
   async function negotiateWithPeer(peerId, peerObj, iceRestart = false) {
     const pc = peerObj.pc;
     if (peerObj.makingOffer) {
@@ -2048,12 +2190,14 @@
     }
     if (pc.signalingState !== 'stable') {
       peerObj.needsAnotherNegotiation = true;
+      armNegotiationWatchdogTimer(peerId, peerObj);
       return;
     }
 
     try {
       peerObj.makingOffer = true;
       peerObj.needsAnotherNegotiation = false;
+      armNegotiationWatchdogTimer(peerId, peerObj);
 
       peerObj.suppressAutoNegotiation = true;
       ensureLocalAudioSenderOnPeer(peerObj);
@@ -2095,6 +2239,7 @@
     const pc = new RTCPeerConnection(RTC_CONFIG);
     const peerObj = {
       pc,
+      createdAt: Date.now(),
       user: peerUser || {},
       voiceStreamId: peerUser?.voiceStreamId || null,
       voiceTrackId: null,
@@ -2107,13 +2252,21 @@
       voiceSourceNode: null,
       voiceHighPassNode: null,
       voiceLowPassNode: null,
+      voiceDelayNode: null,
+      voiceGainNode: null,
+      voiceMonoMerger: null,
       voiceAudioEl: null,
       remoteAnalyser: null,
       screenStream: null,
       webrtcVideoConfirmed: false,
+      p2pVoiceOk: false,
+      relayNextPlayTime: 0,
+      lastRelayVoiceAt: 0,
       makingOffer: false,
       needsAnotherNegotiation: false,
       ignoreOffer: false,
+      initialHandshakeDone: false,
+      negotiationWatchdogTimer: null,
       suppressAutoNegotiation: true
     };
     state.peers.set(peerId, peerObj);
@@ -2137,8 +2290,21 @@
       }
     };
 
+    pc.onsignalingstatechange = () => {
+      if (pc.signalingState === 'stable') {
+        peerObj.initialHandshakeDone = true;
+        if (peerObj.negotiationWatchdogTimer) {
+          clearTimeout(peerObj.negotiationWatchdogTimer);
+          peerObj.negotiationWatchdogTimer = null;
+        }
+      } else {
+        armNegotiationWatchdogTimer(peerId, peerObj);
+      }
+    };
+
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected') {
+        peerObj.initialHandshakeDone = true;
         if (peerObj.voiceAudioEl && peerObj.voiceAudioEl.paused) {
           peerObj.voiceAudioEl.play().catch(() => {});
         }
@@ -2151,6 +2317,7 @@
 
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        peerObj.p2pVoiceOk = false;
         const polite = socket.id < peerId;
         if (!polite && pc.signalingState === 'stable') {
           negotiateWithPeer(peerId, peerObj, true);
@@ -2158,8 +2325,9 @@
       }
     };
 
+    // onnegotiationneeded fica bloqueado até o fim do handshake inicial para eliminar colisões entre Usuário A e B
     pc.onnegotiationneeded = () => {
-      if (peerObj.suppressAutoNegotiation) return;
+      if (peerObj.suppressAutoNegotiation || !peerObj.initialHandshakeDone) return;
       negotiateWithPeer(peerId, peerObj);
     };
 
@@ -2214,7 +2382,7 @@
         return;
       }
 
-      // 2. Trilha de ÁUDIO (Classificação Determinística: Voz da Sala vs Áudio da Live)
+      // 2. Trilha de ÁUDIO (Voz da Sala vs Áudio da Live)
       if (incomingTrack.kind === 'audio') {
         const isKnownVoiceTrack = Boolean(peerObj.voiceTrackId && incomingTrack.id === peerObj.voiceTrackId);
         const isDefinitelyScreenAudio = !isKnownVoiceTrack && Boolean(
@@ -2247,10 +2415,15 @@
         } else {
           peerObj.voiceTrackId = incomingTrack.id;
           peerObj.attachedVoiceTrackId = incomingTrack.id;
+          peerObj.p2pVoiceOk = true;
+          socket.emit('webrtc:signal', { to: peerId, data: { p2pVoiceOk: true } });
+
           const isolatedVoiceStream = new MediaStream([incomingTrack]);
           setupRemoteVoicePipeline(peerId, isolatedVoiceStream);
 
           incomingTrack.onunmute = () => {
+            peerObj.p2pVoiceOk = true;
+            socket.emit('webrtc:signal', { to: peerId, data: { p2pVoiceOk: true } });
             if (peerObj.voiceAudioEl && peerObj.voiceAudioEl.paused) {
               peerObj.voiceAudioEl.play().catch(() => {});
             }
@@ -2280,6 +2453,18 @@
       try { peerObj.voiceLowPassNode.disconnect(); } catch (e) {}
       peerObj.voiceLowPassNode = null;
     }
+    if (peerObj.voiceDelayNode) {
+      try { peerObj.voiceDelayNode.disconnect(); } catch (e) {}
+      peerObj.voiceDelayNode = null;
+    }
+    if (peerObj.voiceGainNode) {
+      try { peerObj.voiceGainNode.disconnect(); } catch (e) {}
+      peerObj.voiceGainNode = null;
+    }
+    if (peerObj.voiceMonoMerger) {
+      try { peerObj.voiceMonoMerger.disconnect(); } catch (e) {}
+      peerObj.voiceMonoMerger = null;
+    }
     if (peerObj.remoteAnalyser) {
       try { peerObj.remoteAnalyser.disconnect(); } catch (e) {}
       peerObj.remoteAnalyser = null;
@@ -2293,34 +2478,106 @@
     peerObj.attachedVoiceTrackId = null;
   }
 
-  function applyRemotePeerNoiseProfile(peerId, level) {
-    state.userNoiseLevels.set(peerId, level);
-    const peerObj = state.peers.get(peerId);
-    if (!peerObj) return;
+  // Atualiza dinamicamente o atraso de Lookahead de 25ms e o filtro Mono (185 Hz - 3700 Hz) nas vozes recebidas
+  function syncRemoteVoicesLookaheadState() {
+    if (!state.audioContext) return;
+    const now = state.audioContext.currentTime;
+    for (const [peerId, peerObj] of state.peers.entries()) {
+      const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
+      const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
 
-    const { hpFreq, lpFreq } = getNoiseFilterFrequencies(level);
-    if (peerObj.voiceHighPassNode && state.audioContext) {
-      peerObj.voiceHighPassNode.frequency.setTargetAtTime(hpFreq, state.audioContext.currentTime, 0.03);
-    }
-    if (peerObj.voiceLowPassNode && state.audioContext) {
-      peerObj.voiceLowPassNode.frequency.setTargetAtTime(lpFreq, state.audioContext.currentTime, 0.03);
+      if (peerObj.voiceHighPassNode) {
+        const targetHp = state.isStreaming ? Math.max(185, hpFreq) : hpFreq;
+        peerObj.voiceHighPassNode.frequency.setTargetAtTime(targetHp, now, 0.02);
+      }
+      if (peerObj.voiceLowPassNode) {
+        const targetLp = state.isStreaming ? Math.min(3700, lpFreq) : lpFreq;
+        peerObj.voiceLowPassNode.frequency.setTargetAtTime(targetLp, now, 0.02);
+      }
+      if (peerObj.voiceDelayNode) {
+        peerObj.voiceDelayNode.delayTime.setTargetAtTime(state.isStreaming ? 0.025 : 0.0, now, 0.015);
+      }
     }
   }
 
+  function applyRemotePeerNoiseProfile(peerId, level) {
+    state.userNoiseLevels.set(peerId, level);
+    syncRemoteVoicesLookaheadState();
+  }
+
+  // Pipeline de Voz Remota com Lookahead de 25ms e Saída 100% Mono (L = R) quando em transmissão
   function setupRemoteVoicePipeline(peerId, isolatedVoiceStream) {
     const peerObj = state.peers.get(peerId);
     if (!peerObj) return;
 
     detachVoicePipeline(peerObj);
 
+    const savedVol = state.userVolumes.get(peerId) ?? 100;
     const audioEl = document.createElement('audio');
     audioEl.srcObject = isolatedVoiceStream;
     audioEl.autoplay = true;
     audioEl.playsInline = true;
-    audioEl.muted = state.isDeafened;
 
-    const savedVol = state.userVolumes.get(peerId) ?? 100;
-    audioEl.volume = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
+    let webAudioRoutingActive = false;
+
+    if (state.audioContext) {
+      try {
+        if (state.audioContext.state === 'suspended') {
+          state.audioContext.resume().catch(() => {});
+        }
+        const ctx = state.audioContext;
+        const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
+        const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
+
+        const source = ctx.createMediaStreamSource(isolatedVoiceStream);
+
+        // O analisador lê a voz ANTES do DelayNode de 25ms (Lookahead de 25ms!)
+        const remoteAnalyser = ctx.createAnalyser();
+        remoteAnalyser.fftSize = 256;
+        remoteAnalyser.smoothingTimeConstant = 0.2;
+        source.connect(remoteAnalyser);
+
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = state.isStreaming ? Math.max(185, hpFreq) : hpFreq;
+
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = state.isStreaming ? Math.min(3700, lpFreq) : lpFreq;
+
+        const delayNode = ctx.createDelay(0.1);
+        delayNode.delayTime.value = state.isStreaming ? 0.025 : 0.0;
+
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
+
+        // Garante que a voz recebida no PC é 100% Mono simétrica (L = R) para que no canal Side (L - R) ela se cancele para 0,0%
+        const monoMerger = ctx.createChannelMerger(2);
+
+        source.connect(hp);
+        hp.connect(lp);
+        lp.connect(delayNode);
+        delayNode.connect(gainNode);
+        gainNode.connect(monoMerger, 0, 0);
+        gainNode.connect(monoMerger, 0, 1);
+        monoMerger.connect(ctx.destination);
+
+        peerObj.voiceSourceNode = source;
+        peerObj.voiceHighPassNode = hp;
+        peerObj.voiceLowPassNode = lp;
+        peerObj.voiceDelayNode = delayNode;
+        peerObj.voiceGainNode = gainNode;
+        peerObj.voiceMonoMerger = monoMerger;
+        peerObj.remoteAnalyser = remoteAnalyser;
+        webAudioRoutingActive = true;
+      } catch (e) {
+        webAudioRoutingActive = false;
+      }
+    }
+
+    // Mantém o elemento <audio> ligado ao stream para o Chromium puxar os pacotes da rede sem duplicar som
+    audioEl.muted = webAudioRoutingActive ? true : state.isDeafened;
+    audioEl.volume = webAudioRoutingActive ? 0 : (state.isDeafened ? 0 : Math.min(1, savedVol / 100));
 
     if (state.selectedAudioOutputId && state.selectedAudioOutputId !== 'default' && typeof audioEl.setSinkId === 'function') {
       audioEl.setSinkId(state.selectedAudioOutputId).catch(() => {});
@@ -2329,51 +2586,28 @@
     el.remoteVoiceAudios.appendChild(audioEl);
     audioEl.play().catch(() => {});
 
-    if (state.audioContext) {
-      try {
-        if (state.audioContext.state === 'suspended') {
-          state.audioContext.resume().catch(() => {});
-        }
-        const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
-        const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
-
-        const source = state.audioContext.createMediaStreamSource(isolatedVoiceStream);
-        const hp = state.audioContext.createBiquadFilter();
-        hp.type = 'highpass';
-        hp.frequency.value = hpFreq;
-
-        const lp = state.audioContext.createBiquadFilter();
-        lp.type = 'lowpass';
-        lp.frequency.value = lpFreq;
-
-        const remoteAnalyser = state.audioContext.createAnalyser();
-        remoteAnalyser.fftSize = 256;
-
-        source.connect(hp);
-        hp.connect(lp);
-        lp.connect(remoteAnalyser);
-
-        peerObj.voiceSourceNode = source;
-        peerObj.voiceHighPassNode = hp;
-        peerObj.voiceLowPassNode = lp;
-        peerObj.remoteAnalyser = remoteAnalyser;
-      } catch (e) {}
-    }
-
     peerObj.voiceAudioEl = audioEl;
   }
 
+  // webrtc:signal NUNCA descarta pacotes precoces
   socket.on('webrtc:signal', ({ from, user, data }) => {
-    if (!state.currentRoomId) return;
-
-    const isPeerInCurrentRoom = state.roomUsers.some(u => u.socketId === from);
-    if (!isPeerInCurrentRoom && !state.peers.has(from) && !user) return;
+    if (!from || !data) return;
 
     let peerObj = state.peers.get(from);
     if (!peerObj) {
       peerObj = createPeerConnection(from, user, false);
     }
-    if (user) Object.assign(peerObj.user, user);
+    if (user) {
+      Object.assign(peerObj.user, user);
+      if (!state.roomUsers.some(u => u.socketId === from)) {
+        state.roomUsers.push(peerObj.user);
+      }
+    }
+
+    if (data.p2pVoiceOk) {
+      peerObj.p2pVoiceOk = true;
+      return;
+    }
 
     if (data.requestStreamOffer) {
       if (state.isStreaming && state.localScreenStream) {
@@ -2448,6 +2682,8 @@
               await pc.setLocalDescription(answer);
             }
 
+            peerObj.initialHandshakeDone = true;
+
             socket.emit('webrtc:signal', {
               to: from,
               data: {
@@ -2467,6 +2703,7 @@
               setTimeout(() => enforceHighQualityForAllViewers(), 250);
             }
           } else if (desc.type === 'answer') {
+            peerObj.initialHandshakeDone = true;
             reconcilePeerMediaTracks(from, peerObj);
             if (peerObj.needsAnotherNegotiation && pc.signalingState === 'stable') {
               peerObj.needsAnotherNegotiation = false;
@@ -2489,7 +2726,115 @@
     });
   });
 
-  // ================= 5. BARRAMENTO DE ÁUDIO DE LIVES (VOLUME 100% CONSTANTE SEM DUCKING) =================
+  // ================= 5. MATRIZ MID-SIDE (M = (L+R)/2, S = (L-R)/2) + BAND-SPLIT (150Hz - 4100Hz) =================
+  function createMidSideBandSplitMatrix(rawSysAudioTrack) {
+    if (!state.audioContext || !rawSysAudioTrack) return null;
+    try {
+      const ctx = state.audioContext;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
+      const sysSource = ctx.createMediaStreamSource(new MediaStream([rawSysAudioTrack]));
+      const splitter = ctx.createChannelSplitter(2);
+      sysSource.connect(splitter);
+
+      // Canal Mid: M = (L + R) / 2
+      const midGainL = ctx.createGain();
+      midGainL.gain.value = 0.5;
+      const midGainR = ctx.createGain();
+      midGainR.gain.value = 0.5;
+      const midSum = ctx.createGain();
+      midSum.gain.value = 1.0;
+
+      splitter.connect(midGainL, 0);
+      splitter.connect(midGainR, 1);
+      midGainL.connect(midSum);
+      midGainR.connect(midSum);
+
+      // Canal Side (Estéreo Lateral): S = (L - R) / 2 -> A voz Mono dos amigos (L = R) cancela-se para 0,0% (V - V = 0)!
+      const sideGainL = ctx.createGain();
+      sideGainL.gain.value = 0.5;
+      const sideGainRInv = ctx.createGain();
+      sideGainRInv.gain.value = -0.5;
+      const sideSum = ctx.createGain();
+      sideSum.gain.value = 1.0;
+
+      splitter.connect(sideGainL, 0);
+      splitter.connect(sideGainRInv, 1);
+      sideGainL.connect(sideSum);
+      sideGainRInv.connect(sideSum);
+
+      // Band-Split no Canal Mid (M):
+      // 1) Graves (< 150 Hz): 100% preservados sempre
+      const midLowPass = ctx.createBiquadFilter();
+      midLowPass.type = 'lowpass';
+      midLowPass.frequency.value = 150;
+      midLowPass.Q.value = 0.707;
+
+      // 2) Agudos (> 4100 Hz): 100% preservados sempre
+      const midHighPass = ctx.createBiquadFilter();
+      midHighPass.type = 'highpass';
+      midHighPass.frequency.value = 4100;
+      midHighPass.Q.value = 0.707;
+
+      // 3) Faixa Vocal Central Mono (150 Hz - 4100 Hz): silenciada apenas no instante em que um espectador fala
+      const vocalBandHP = ctx.createBiquadFilter();
+      vocalBandHP.type = 'highpass';
+      vocalBandHP.frequency.value = 150;
+      vocalBandHP.Q.value = 0.707;
+
+      const vocalBandLP = ctx.createBiquadFilter();
+      vocalBandLP.type = 'lowpass';
+      vocalBandLP.frequency.value = 4100;
+      vocalBandLP.Q.value = 0.707;
+
+      const midVocalGateGain = ctx.createGain();
+      midVocalGateGain.gain.value = 1.0;
+
+      midSum.connect(midLowPass);
+      midSum.connect(midHighPass);
+      midSum.connect(vocalBandHP);
+      vocalBandHP.connect(vocalBandLP);
+      vocalBandLP.connect(midVocalGateGain);
+
+      const midRecombined = ctx.createGain();
+      midRecombined.gain.value = 1.0;
+      midLowPass.connect(midRecombined);
+      midHighPass.connect(midRecombined);
+      midVocalGateGain.connect(midRecombined);
+
+      // Ganho de compensação automática no canal Estéreo Lateral (S) quando a banda vocal central é atenuada
+      const sideCompensatedGain = ctx.createGain();
+      sideCompensatedGain.gain.value = 1.0;
+      sideSum.connect(sideCompensatedGain);
+
+      // Reconstrução Estéreo: L_out = M_out + S, R_out = M_out - S
+      const sideRightInvert = ctx.createGain();
+      sideRightInvert.gain.value = -1.0;
+      sideCompensatedGain.connect(sideRightInvert);
+
+      const merger = ctx.createChannelMerger(2);
+      midRecombined.connect(merger, 0, 0);
+      sideCompensatedGain.connect(merger, 0, 0);
+
+      midRecombined.connect(merger, 0, 1);
+      sideRightInvert.connect(merger, 0, 1);
+
+      const destination = ctx.createMediaStreamDestination();
+      merger.connect(destination);
+
+      return {
+        sysSource,
+        midVocalGateGain,
+        sideCompensatedGain,
+        outputTrack: destination.stream.getAudioTracks()[0] || null
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
   function syncMultiStreamAudioBus(preferredPeerId = null) {
     if (preferredPeerId && preferredPeerId !== socket.id) {
       state.activeAudioStreamPeerId = preferredPeerId;
@@ -2541,7 +2886,6 @@
       }
     });
 
-    // Mantém o áudio da transmissão sempre ativo e no mesmo volume, sem reduzir quando alguém fala!
     if (localSysAudioTrack) {
       localSysAudioTrack.enabled = !anyRemoteLiveAudioPlayingOnOurSpeakers;
     }
@@ -2622,7 +2966,7 @@
     const fps = state.streamSettings.fps;
 
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
+      const rawDisplayStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: dims.width, max: dims.width },
           height: { ideal: dims.height, max: dims.height },
@@ -2643,7 +2987,7 @@
         windowAudio: 'system'
       });
 
-      const videoTrack = stream.getVideoTracks()[0];
+      const videoTrack = rawDisplayStream.getVideoTracks()[0];
       if (!videoTrack) return;
 
       videoTrack.enabled = true;
@@ -2655,27 +2999,41 @@
           : state.streamSettings.contentHint;
       }
 
-      const sysAudioTrack = stream.getAudioTracks()[0];
-      if (sysAudioTrack) {
-        sysAudioTrack.enabled = true;
-        // Desativa explicitamente qualquer AutoGain / Ducking / Supressão na faixa de áudio da live
-        if (typeof sysAudioTrack.applyConstraints === 'function') {
+      const outboundStream = new MediaStream([videoTrack]);
+      const rawSysAudioTrack = rawDisplayStream.getAudioTracks()[0];
+
+      if (rawSysAudioTrack) {
+        rawSysAudioTrack.enabled = true;
+        if (typeof rawSysAudioTrack.applyConstraints === 'function') {
           try {
-            await sysAudioTrack.applyConstraints({
+            await rawSysAudioTrack.applyConstraints({
               echoCancellation: false,
               noiseSuppression: false,
               autoGainControl: false
             });
           } catch (_audErr) {}
         }
+
+        // Conecta a Matriz Mid-Side + Band-Split com Lookahead de 25ms
+        const dspMatrix = createMidSideBandSplitMatrix(rawSysAudioTrack);
+        if (dspMatrix && dspMatrix.outputTrack) {
+          state.localScreenDspNodes = dspMatrix;
+          outboundStream.addTrack(dspMatrix.outputTrack);
+        } else {
+          outboundStream.addTrack(rawSysAudioTrack);
+        }
       }
 
       videoTrack.onended = () => stopScreenSharing();
 
-      state.localScreenStream = stream;
+      state.localScreenRawStream = rawDisplayStream;
+      state.localScreenStream = outboundStream;
       state.isStreaming = true;
       state.streamStartedAt = Date.now();
       state.myStreamViewers.clear();
+
+      // Ativa o atraso de Lookahead de 25ms e o filtro Mono (185 Hz - 3700 Hz) nas vozes recebidas
+      syncRemoteVoicesLookaheadState();
 
       if (state.streamTimerInterval) clearInterval(state.streamTimerInterval);
       state.streamTimerInterval = setInterval(updateBroadcasterControlPanel, 1000);
@@ -2688,7 +3046,7 @@
 
       socket.emit('user:state-change', {
         isStreaming: true,
-        screenStreamId: stream.id,
+        screenStreamId: outboundStream.id,
         streamConfig: {
           resolution: state.streamSettings.resolution,
           fps: state.streamSettings.fps
@@ -2699,9 +3057,9 @@
         peerObj.webrtcVideoConfirmed = false;
         peerObj.suppressAutoNegotiation = true;
         sendStreamIdsMeta(peerId);
-        stream.getTracks().forEach((track) => {
+        outboundStream.getTracks().forEach((track) => {
           const alreadySent = peerObj.pc.getSenders().some(s => s.track === track);
-          if (!alreadySent) peerObj.pc.addTrack(track, stream);
+          if (!alreadySent) peerObj.pc.addTrack(track, outboundStream);
         });
         peerObj.suppressAutoNegotiation = false;
         negotiateWithPeer(peerId, peerObj);
@@ -2714,6 +3072,7 @@
       setTimeout(() => enforceHighQualityForAllViewers(), 1000);
     } catch (err) {
       state.isStreaming = false;
+      syncRemoteVoicesLookaheadState();
       syncStreamButtonsVisualState();
       console.log('Partilha de ecrã cancelada:', err);
     }
@@ -2770,6 +3129,14 @@
     state.myStreamViewers.clear();
     state.isStreaming = false;
 
+    if (state.localScreenDspNodes) {
+      try { state.localScreenDspNodes.sysSource.disconnect(); } catch (e) {}
+      state.localScreenDspNodes = null;
+    }
+
+    // Desativa o atraso de Lookahead de 25ms voltando para latência zero quando não está transmitindo
+    syncRemoteVoicesLookaheadState();
+
     if (state.localScreenStream) {
       const tracksToStop = state.localScreenStream.getTracks();
 
@@ -2789,6 +3156,11 @@
 
       tracksToStop.forEach(t => t.stop());
       state.localScreenStream = null;
+    }
+
+    if (state.localScreenRawStream) {
+      state.localScreenRawStream.getTracks().forEach(t => t.stop());
+      state.localScreenRawStream = null;
     }
 
     syncStreamButtonsVisualState();
@@ -3113,8 +3485,14 @@
     document.getElementById('icon-deafen').textContent = state.isDeafened ? '🔈' : '🎧';
 
     for (const [peerId, peerObj] of state.peers.entries()) {
-      if (peerObj.voiceAudioEl) {
-        const vol = state.userVolumes.get(peerId) ?? 100;
+      const vol = state.userVolumes.get(peerId) ?? 100;
+      if (peerObj.voiceGainNode && state.audioContext) {
+        peerObj.voiceGainNode.gain.setTargetAtTime(
+          state.isDeafened ? 0 : Math.min(1, vol / 100),
+          state.audioContext.currentTime,
+          0.015
+        );
+      } else if (peerObj.voiceAudioEl) {
         peerObj.voiceAudioEl.muted = state.isDeafened;
         peerObj.voiceAudioEl.volume = state.isDeafened ? 0 : Math.min(1, vol / 100);
       }
@@ -3209,7 +3587,13 @@
           state.userVolumes.set(u.socketId, val);
           label.textContent = `${val}%`;
           const pObj = state.peers.get(u.socketId);
-          if (pObj?.voiceAudioEl) {
+          if (pObj?.voiceGainNode && state.audioContext) {
+            pObj.voiceGainNode.gain.setTargetAtTime(
+              state.isDeafened ? 0 : Math.min(1, val / 100),
+              state.audioContext.currentTime,
+              0.015
+            );
+          } else if (pObj?.voiceAudioEl) {
             pObj.voiceAudioEl.muted = state.isDeafened || val === 0;
             pObj.voiceAudioEl.volume = state.isDeafened ? 0 : Math.min(1, val / 100);
           }
@@ -3854,7 +4238,7 @@
     reader.readAsDataURL(file);
   }
 
-  // ================= 9. EVENTOS DE SALA E AUDITOR CONTÍNUO DE MALHA E VOZ =================
+  // ================= 9. EVENTOS DE SALA + CONTROLO MID-SIDE COM LOOKAHEAD DE 25MS =================
   socket.on('rooms:update', (rooms) => {
     state.rooms = rooms;
     renderRoomsList();
@@ -3942,14 +4326,16 @@
     }
   });
 
-  // Loop de 50ms: Apenas Deteção Visual de Voz (Zero interferência ou ducking no áudio da live)
+  // Loop de 20ms: Deteta voz 25ms antes de sair no fone (Lookahead) e atua apenas na banda vocal Mono (150Hz-4100Hz)
   setInterval(() => {
     const buf = new Uint8Array(128);
     let overlayDirty = false;
+    let anyRemoteSpeakingNow = false;
+    const nowPerf = performance.now();
 
     for (const [peerId, peerObj] of state.peers.entries()) {
       const card = document.getElementById(`participant-card-${peerId}`);
-      if (!card || !peerObj.remoteAnalyser || peerObj.user?.isMuted) {
+      if (peerObj.user?.isMuted) {
         if (card) card.classList.remove('speaking');
         if (state.speakingPeers.has(peerId)) {
           state.speakingPeers.delete(peerId);
@@ -3957,14 +4343,31 @@
         }
         continue;
       }
-      peerObj.remoteAnalyser.getByteFrequencyData(buf);
-      let s = 0;
-      for (let i = 4; i < 40; i++) s += buf[i];
-      const isTalking = (s / 36) > 12;
-      card.classList.toggle('speaking', isTalking);
+
+      let isTalking = false;
+      if (peerObj.remoteAnalyser) {
+        peerObj.remoteAnalyser.getByteFrequencyData(buf);
+        let s = 0;
+        for (let i = 4; i < 40; i++) s += buf[i];
+        const avg = s / 36;
+        if (avg > 11) {
+          isTalking = true;
+          if (!peerObj.p2pVoiceOk) {
+            peerObj.p2pVoiceOk = true;
+            socket.emit('webrtc:signal', { to: peerId, data: { p2pVoiceOk: true } });
+          }
+        }
+      }
+
+      if (!isTalking && peerObj.lastRelayVoiceAt && (nowPerf - peerObj.lastRelayVoiceAt) < 180) {
+        isTalking = true;
+      }
+
+      if (card) card.classList.toggle('speaking', isTalking);
 
       if (isTalking) {
-        state.lastRemoteVoiceActivityAt = performance.now();
+        anyRemoteSpeakingNow = true;
+        state.lastRemoteVoiceActivityAt = nowPerf;
       }
 
       const hadSpeaking = state.speakingPeers.has(peerId);
@@ -3977,10 +4380,32 @@
       }
     }
 
+    // Atuação da Matriz Mid-Side + Band-Split durante a transmissão:
+    // - Quando ninguém fala: 100% do áudio original (M + S) passa intacto (midVocalGateGain = 1.0, sideCompensatedGain = 1.0).
+    // - No instante em que alguém fala (25ms antes de sair no fone): silencia APENAS a faixa vocal Mono central (150Hz-4100Hz),
+    //   mantendo 100% do canal Estéreo Lateral (L-R), 100% dos Graves (<150Hz) e 100% dos Agudos (>4100Hz) com compensação de ganho!
+    if (state.isStreaming && state.localScreenDspNodes && state.audioContext) {
+      const withinHoldWindow = anyRemoteSpeakingNow || (nowPerf - state.lastRemoteVoiceActivityAt) < 220;
+      const nowAudio = state.audioContext.currentTime;
+      const targetVocalMidGain = withinHoldWindow ? 0.0 : 1.0;
+      const targetSideBoostGain = withinHoldWindow ? 1.35 : 1.0;
+
+      state.localScreenDspNodes.midVocalGateGain.gain.setTargetAtTime(
+        targetVocalMidGain,
+        nowAudio,
+        withinHoldWindow ? 0.004 : 0.05
+      );
+      state.localScreenDspNodes.sideCompensatedGain.gain.setTargetAtTime(
+        targetSideBoostGain,
+        nowAudio,
+        withinHoldWindow ? 0.006 : 0.05
+      );
+    }
+
     if (overlayDirty) {
       syncDesktopOverlayState();
     }
-  }, 50);
+  }, 20);
 
   // Auditor Contínuo de Saúde da Malha de Voz, Transmissões e Telemetria (a cada 1.8s)
   setInterval(async () => {
@@ -4051,6 +4476,11 @@
           totalLost += report.packetsLost || 0;
           totalPackets += (report.packetsReceived || 0) + (report.packetsLost || 0);
 
+          if (report.kind === 'audio' && (report.bytesReceived || 0) > 256 && !peerObj.p2pVoiceOk) {
+            peerObj.p2pVoiceOk = true;
+            socket.emit('webrtc:signal', { to: peerId, data: { p2pVoiceOk: true } });
+          }
+
           if (report.kind === 'video' && state.focusedPeerId === peerId) {
             const fps = report.framesPerSecond || state.streamSettings.fps;
             const width = report.frameWidth || 1280;
@@ -4085,6 +4515,9 @@
     updateBroadcasterControlPanel();
     const peerObj = state.peers.get(peerId);
     if (!peerObj) return;
+    if (peerObj.negotiationWatchdogTimer) {
+      clearTimeout(peerObj.negotiationWatchdogTimer);
+    }
     peerObj.pc.close();
     detachVoicePipeline(peerObj);
     removeStreamTile(peerId);

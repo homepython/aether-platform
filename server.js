@@ -88,20 +88,18 @@ app.get('/api/status', (_req, res) => {
 });
 
 app.get('/download/windows', (_req, res) => {
-  const localInstaller = path.join(PUBLIC_DIR, 'downloads', 'Aether-Setup.exe');
+  const localInstaller = path.join(PUBLIC_DIR, 'downloads', 'Aether.Setup.exe');
   if (fs.existsSync(localInstaller)) {
-    res.download(localInstaller, `Aether-Setup-${RELEASE_VERSION}.exe`);
+    res.download(localInstaller, 'Aether.Setup.exe');
     return;
   }
   res.redirect(302, GITHUB_RELEASE_EXE_URL);
 });
 
-// Rota da Versão Web (Abre o aplicativo diretamente no navegador)
 app.get('/app', (_req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
-// Rota explícita do Site Oficial
 app.get('/site', (_req, res) => {
   const landingPath = path.join(PUBLIC_DIR, 'landing.html');
   if (fs.existsSync(landingPath)) {
@@ -111,9 +109,6 @@ app.get('/site', (_req, res) => {
   }
 });
 
-// Rota Principal Inteligente:
-// - Se for o Aplicativo Desktop (Electron) ou tiver ?app=1, abre o aplicativo direto.
-// - Se for um visitante no navegador, exibe o Site Oficial + Página de Download.
 app.get('/', (req, res) => {
   const ua = String(req.headers['user-agent'] || '');
   const isElectronDesktop = ua.includes('Electron');
@@ -127,10 +122,9 @@ app.get('/', (req, res) => {
   res.sendFile(landingPath);
 });
 
-// Serve os recursos estáticos (CSS, JS, ícones) sem sobrescrever a rota '/'
 app.use(express.static(PUBLIC_DIR, { index: false }));
 
-// ================= MOTOR SOCKET.IO (PARTILHADO ENTRE DESKTOP E WEB) =================
+// ================= MOTOR SOCKET.IO + RELAY DE VOZ HÍBRIDO =================
 io.on('connection', (socket) => {
   socket.on('user:register', (payload, cb) => {
     const cleanName = String(payload?.name || 'Utilizador').trim().slice(0, 28) || 'Utilizador';
@@ -275,6 +269,31 @@ io.on('connection', (socket) => {
       user: sender || null,
       data
     });
+  });
+
+  // Relay Automático de Voz para pares bloqueados por CGNAT estrito (até p2pVoiceOk = true)
+  socket.on('voice:relay', (payload) => {
+    const sender = users.get(socket.id);
+    if (!sender || !sender.roomId || sender.isMuted || !payload?.pcm) return;
+
+    const targets = Array.isArray(payload.targets) ? payload.targets : [];
+    if (targets.length > 0) {
+      targets.forEach((targetId) => {
+        if (targetId && targetId !== socket.id) {
+          io.to(targetId).volatile.emit('voice:relay', {
+            from: socket.id,
+            pcm: payload.pcm,
+            sampleRate: payload.sampleRate || 16000
+          });
+        }
+      });
+    } else {
+      socket.to(sender.roomId).volatile.emit('voice:relay', {
+        from: socket.id,
+        pcm: payload.pcm,
+        sampleRate: payload.sampleRate || 16000
+      });
+    }
   });
 
   socket.on('chat:message', (payload) => {
