@@ -1201,7 +1201,7 @@
     const hasSysAudio = state.localScreenStream.getAudioTracks().length > 0;
     const audioStatusEl = document.getElementById('broadcaster-audio-status');
     if (audioStatusEl) {
-      audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio (Sem Eco)' : '🔇 Somente tela (sem áudio)';
+      audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio' : '🔇 Somente tela (sem áudio)';
     }
 
     const viewersCount = state.myStreamViewers.size;
@@ -1901,7 +1901,6 @@
     };
   }
 
-  // Garante que a faixa de voz local está sempre anexada num sender ativo e bidirecional ('sendrecv')
   function ensureLocalAudioSenderOnPeer(peerObj) {
     if (!peerObj || !peerObj.pc || !state.localVoiceStream) return false;
     const voiceTrack = state.localVoiceStream.getAudioTracks()[0];
@@ -1951,7 +1950,6 @@
     }
   }
 
-  // Reconcilia imediatamente faixas de voz e vídeo recebidas caso os metadados cheguem antes ou depois do ontrack
   function reconcilePeerMediaTracks(peerId, peerObj) {
     if (!peerObj || !peerObj.pc) return;
     const receivers = peerObj.pc.getReceivers();
@@ -1979,7 +1977,6 @@
             }
           }
         } else if (peerObj.attachedVoiceTrackId !== track.id || !peerObj.voiceAudioEl) {
-          // Só substitui a faixa de voz se não houver outra faixa de voz ativa já confirmada
           if (!peerObj.voiceTrackId || peerObj.voiceTrackId === track.id || !peerObj.voiceAudioEl) {
             peerObj.voiceTrackId = track.id;
             peerObj.attachedVoiceTrackId = track.id;
@@ -2369,7 +2366,6 @@
   socket.on('webrtc:signal', ({ from, user, data }) => {
     if (!state.currentRoomId) return;
 
-    // Ignora sinais atrasados de utilizadores que já não pertencem à sala atual
     const isPeerInCurrentRoom = state.roomUsers.some(u => u.socketId === from);
     if (!isPeerInCurrentRoom && !state.peers.has(from) && !user) return;
 
@@ -2418,7 +2414,6 @@
     peerObj.signalingChain = peerObj.signalingChain.then(async () => {
       const pc = peerObj.pc;
       try {
-        // Aplica metadados ANTES do setRemoteDescription para que o ontrack saiba os IDs exatos
         if (data.streamMeta) {
           applyRemoteStreamMeta(from, peerObj, data.streamMeta);
         }
@@ -2494,7 +2489,7 @@
     });
   });
 
-  // ================= 5. BARRAMENTO DE ÁUDIO DE LIVES & SUPRESSÃO AUTOMÁTICA DE ECO =================
+  // ================= 5. BARRAMENTO DE ÁUDIO DE LIVES (VOLUME 100% CONSTANTE SEM DUCKING) =================
   function syncMultiStreamAudioBus(preferredPeerId = null) {
     if (preferredPeerId && preferredPeerId !== socket.id) {
       state.activeAudioStreamPeerId = preferredPeerId;
@@ -2546,9 +2541,9 @@
       }
     });
 
+    // Mantém o áudio da transmissão sempre ativo e no mesmo volume, sem reduzir quando alguém fala!
     if (localSysAudioTrack) {
-      const noPeerSpeakingRecently = (performance.now() - state.lastRemoteVoiceActivityAt) > 180;
-      localSysAudioTrack.enabled = !anyRemoteLiveAudioPlayingOnOurSpeakers && noPeerSpeakingRecently;
+      localSysAudioTrack.enabled = !anyRemoteLiveAudioPlayingOnOurSpeakers;
     }
 
     if (state.focusedPeerId && el.btnMuteFocusedStream) {
@@ -2663,6 +2658,16 @@
       const sysAudioTrack = stream.getAudioTracks()[0];
       if (sysAudioTrack) {
         sysAudioTrack.enabled = true;
+        // Desativa explicitamente qualquer AutoGain / Ducking / Supressão na faixa de áudio da live
+        if (typeof sysAudioTrack.applyConstraints === 'function') {
+          try {
+            await sysAudioTrack.applyConstraints({
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false
+            });
+          } catch (_audErr) {}
+        }
       }
 
       videoTrack.onended = () => stopScreenSharing();
@@ -3937,11 +3942,10 @@
     }
   });
 
-  // Loop de 50ms: Deteção de Voz Remota + Anti-Eco Instantâneo durante Transmissões
+  // Loop de 50ms: Apenas Deteção Visual de Voz (Zero interferência ou ducking no áudio da live)
   setInterval(() => {
     const buf = new Uint8Array(128);
     let overlayDirty = false;
-    let anyRemoteSpeakingNow = false;
 
     for (const [peerId, peerObj] of state.peers.entries()) {
       const card = document.getElementById(`participant-card-${peerId}`);
@@ -3960,7 +3964,6 @@
       card.classList.toggle('speaking', isTalking);
 
       if (isTalking) {
-        anyRemoteSpeakingNow = true;
         state.lastRemoteVoiceActivityAt = performance.now();
       }
 
@@ -3971,15 +3974,6 @@
       } else if (!isTalking && hadSpeaking) {
         state.speakingPeers.delete(peerId);
         overlayDirty = true;
-      }
-    }
-
-    if (state.isStreaming && state.localScreenStream) {
-      const sysTrack = state.localScreenStream.getAudioTracks()[0];
-      if (sysTrack) {
-        const withinHoldWindow = anyRemoteSpeakingNow || (performance.now() - state.lastRemoteVoiceActivityAt) < 180;
-        const anyRemoteLivePlaying = Array.from(el.streamsGrid.querySelectorAll('video.stream-webrtc-video')).some(v => !v.muted);
-        sysTrack.enabled = !withinHoldWindow && !anyRemoteLivePlaying;
       }
     }
 
@@ -3994,7 +3988,6 @@
     let totalLost = 0;
     let totalPackets = 0;
 
-    // 1. Verifica se o microfone local continua vivo; se caiu, recupera automaticamente
     const localMicTrack = state.localVoiceStream?.getAudioTracks()[0];
     if (state.user && (!localMicTrack || localMicTrack.readyState === 'ended')) {
       await recoverMicrophoneAutomatically();
@@ -4002,7 +3995,6 @@
       updateLocalMicTrackEnabledState();
     }
 
-    // 2. Garante que todos os utilizadores na sala têm uma PeerConnection criada
     if (state.currentRoomId && Array.isArray(state.roomUsers)) {
       state.roomUsers.forEach((u) => {
         if (u.socketId && u.socketId !== socket.id && !state.peers.has(u.socketId)) {
@@ -4012,7 +4004,6 @@
       });
     }
 
-    // 3. Desbloqueia qualquer <audio> ou <video> pausado acidentalmente pelo navegador
     document.querySelectorAll('#remote-voice-audios audio').forEach((a) => {
       if (a.srcObject && a.paused) {
         a.play().catch(() => {});
@@ -4035,7 +4026,6 @@
       enforceHighQualityForAllViewers();
     }
 
-    // 4. Audita cada ligação P2P ativa (envio/receção de voz, lives e telemetria)
     for (const [peerId, peerObj] of state.peers.entries()) {
       if (peerObj.pc.signalingState === 'stable') {
         peerObj.suppressAutoNegotiation = true;
