@@ -2,6 +2,7 @@
   "name": "aether-realtime-platform",
   "version": "1.0.0",
   "description": "Aether — Plataforma de Comunicação e Streaming em Tempo Real",
+  "author": "Leo Oliveira",
   "main": "main.js",
   "scripts": {
     "start": "node server.js",

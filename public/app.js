@@ -64,6 +64,12 @@
     if (rawHk) savedHotkeys = { ...defaultHotkeys, ...JSON.parse(rawHk) };
   } catch (e) {}
 
+  let savedCustomXY = { x: null, y: null };
+  try {
+    const rawXY = localStorage.getItem('aether_overlay_custom_xy');
+    if (rawXY) savedCustomXY = JSON.parse(rawXY);
+  } catch (e) {}
+
   const state = {
     user: null,
     currentRoomId: null,
@@ -91,7 +97,15 @@
     sharpenEnabled: true,
     roomSfxEnabled: localStorage.getItem('aether_room_sfx') !== 'off',
     overlayEnabled: localStorage.getItem('aether_overlay_enabled') !== 'off',
+    overlayFullscreenOnly: localStorage.getItem('aether_overlay_fullscreen_only') !== 'off',
+    overlayShowRoomTitle: localStorage.getItem('aether_overlay_show_title') !== 'off',
+    overlaySize: localStorage.getItem('aether_overlay_size') || 'medium',
+    overlayScale: Number(localStorage.getItem('aether_overlay_scale') || 100),
+    overlayOpacity: Number(localStorage.getItem('aether_overlay_opacity') || 90),
     overlayPosition: localStorage.getItem('aether_overlay_pos') || 'top-left',
+    overlayCustomX: typeof savedCustomXY?.x === 'number' ? savedCustomXY.x : null,
+    overlayCustomY: typeof savedCustomXY?.y === 'number' ? savedCustomXY.y : null,
+    overlayUnlocked: false,
     nativeNotificationsEnabled: localStorage.getItem('aether_win_notif') !== 'off',
     globalHotkeys: savedHotkeys,
     speakingPeers: new Set(),
@@ -342,12 +356,54 @@
         color: #fecdd3;
         box-shadow: 0 0 12px rgba(244, 63, 94, 0.35);
       }
+      #btn-quick-stream-header.streaming-active-btn {
+        background: rgba(244, 63, 94, 0.22) !important;
+        border-color: rgba(244, 63, 94, 0.65) !important;
+        color: #fecdd3 !important;
+        box-shadow: 0 0 16px rgba(244, 63, 94, 0.28);
+      }
     `;
     document.head.appendChild(style);
   }
   injectAuxiliaryStyles();
 
+  // ================= SINCRONIZAÇÃO VISUAL DOS BOTÕES DE TRANSMISSÃO ("Partilhar Ecrã") =================
+  function syncStreamButtonsVisualState() {
+    if (el.btnStartStream) {
+      el.btnStartStream.classList.toggle('streaming-now', state.isStreaming);
+    }
+    if (el.labelStreamBtn) {
+      el.labelStreamBtn.textContent = state.isStreaming ? 'Parar Live' : 'Transmitir';
+    }
+    if (el.btnQuickStreamHeader) {
+      el.btnQuickStreamHeader.classList.toggle('streaming-active-btn', state.isStreaming);
+      el.btnQuickStreamHeader.innerHTML = state.isStreaming
+        ? '<span>🔴</span> <span>Encerrar Transmissão</span>'
+        : '<span>🖥️</span> <span>Partilhar Ecrã</span>';
+    }
+  }
+
   // ================= SINCRONIZAÇÃO DO OVERLAY DENTRO DE JOGOS =================
+  function buildOverlayConfigObject() {
+    return {
+      enabled: state.overlayEnabled,
+      fullscreenOnly: state.overlayFullscreenOnly,
+      showRoomTitle: state.overlayShowRoomTitle,
+      size: state.overlaySize,
+      scale: state.overlayScale,
+      opacity: state.overlayOpacity,
+      position: state.overlayPosition,
+      customX: state.overlayCustomX,
+      customY: state.overlayCustomY,
+      unlocked: state.overlayUnlocked
+    };
+  }
+
+  function pushOverlayConfigToDesktop() {
+    if (!isDesktopInstalledApp || !window.aetherDesktop?.setOverlayConfig) return;
+    window.aetherDesktop.setOverlayConfig(buildOverlayConfigObject());
+  }
+
   function syncDesktopOverlayState() {
     if (!isDesktopInstalledApp || !window.aetherDesktop?.updateOverlayState) return;
     const roomObj = state.rooms.find(r => r.id === state.currentRoomId);
@@ -367,6 +423,8 @@
 
     window.aetherDesktop.updateOverlayState({
       roomName: roomObj ? roomObj.name : (el.currentRoomTitle?.textContent || 'Aether'),
+      isSelfStreaming: Boolean(state.isStreaming),
+      viewersCount: state.myStreamViewers.size,
       users: usersPayload
     });
   }
@@ -374,19 +432,12 @@
   // ================= NOTIFICAÇÕES NATIVAS DO WINDOWS & COMPORTAMENTO EM ECRÃ CHEIO =================
   function isLocalFullscreenOrVideoPlaying() {
     if (document.fullscreenElement || document.webkitFullscreenElement) return true;
-    const videos = Array.from(document.querySelectorAll('video'));
-    for (const v of videos) {
-      if (!v.paused && v.videoWidth > 0 && (document.fullscreenElement || state.focusedPeerId)) {
-        if (document.fullscreenElement) return true;
-      }
-    }
     return false;
   }
 
   function dispatchSmartNotification(title, body, icon = '🔔', onClick = null) {
     const fullscreenNow = isLocalFullscreenOrVideoPlaying();
 
-    // Na versão instalada, envia para o sistema nativo do Windows (que suprime e guarda em fila se houver jogo em ecrã cheio)
     if (isDesktopInstalledApp && state.nativeNotificationsEnabled && window.aetherDesktop?.notify) {
       if (fullscreenNow) {
         state.suppressedLocalQueue.push({ title, body });
@@ -399,7 +450,6 @@
       return;
     }
 
-    // Se estiver em ecrã cheio local, não exibe popups por cima do conteúdo
     if (fullscreenNow) {
       state.suppressedLocalQueue.push({ title, body });
       return;
@@ -492,6 +542,74 @@
     }
 
     const tabInterface = document.getElementById('tab-interface');
+
+    // 1. Cartão de Edição de Perfil (Alterar Nome e Nickname dentro do App)
+    if (tabInterface && !document.getElementById('user-profile-settings-card')) {
+      const profileCard = document.createElement('div');
+      profileCard.id = 'user-profile-settings-card';
+      profileCard.className = 'settings-group-card';
+      profileCard.innerHTML = `
+        <div class="setting-info">
+          <strong>Perfil do Utilizador (Salvo Automaticamente)</strong>
+          <small>Altere o seu Nome de exibição e Nickname quando quiser sem precisar reiniciar o aplicativo.</small>
+          <div class="cloud-server-input-row" style="margin-top:10px;">
+            <input type="text" id="settings-input-user-name" placeholder="Seu Nome" maxlength="28" value="${escapeHtml(state.user?.name || '')}" />
+            <input type="text" id="settings-input-user-nick" placeholder="seu_nick" maxlength="20" value="${escapeHtml(state.user?.nick || '')}" />
+            <button type="button" id="btn-save-user-profile" class="btn-chip primary">Salvar Perfil</button>
+          </div>
+        </div>
+      `;
+      tabInterface.prepend(profileCard);
+
+      const nameInp = document.getElementById('settings-input-user-name');
+      const nickInp = document.getElementById('settings-input-user-nick');
+      const saveProfileBtn = document.getElementById('btn-save-user-profile');
+
+      nickInp?.addEventListener('input', () => {
+        nickInp.value = nickInp.value.replace(/[^a-zA-Z0-9_\s]/g, '');
+      });
+
+      saveProfileBtn?.addEventListener('click', () => {
+        const newName = (nameInp?.value || '').trim();
+        const newNick = (nickInp?.value || '').trim().replace(/\s+/g, '_').toLowerCase();
+        if (newName.length < 2 || newNick.length < 2) {
+          showToast('Dados Inválidos', 'Nome e Nickname devem ter pelo menos 2 caracteres.', '⚠️');
+          return;
+        }
+        const avatarColor = state.user?.avatarColor || '#5E81F4';
+        localStorage.setItem('aether_user_profile', JSON.stringify({
+          name: newName,
+          nick: newNick,
+          avatarColor
+        }));
+
+        if (state.user) {
+          state.user.name = newName;
+          state.user.nick = newNick;
+          el.selfAvatar.textContent = newName.charAt(0).toUpperCase();
+          el.selfName.textContent = newName;
+          el.selfNick.textContent = '@' + newNick;
+
+          const meInRoom = state.roomUsers.find(u => u.socketId === socket.id);
+          if (meInRoom) {
+            meInRoom.name = newName;
+            meInRoom.nick = newNick;
+            renderParticipantsList(state.roomUsers);
+          }
+
+          socket.emit('user:state-change', { name: newName, nick: newNick });
+          syncDesktopOverlayState();
+        }
+        showToast('Perfil Atualizado', `Agora você é ${newName} (@${newNick}).`, '✅');
+      });
+    } else if (state.user) {
+      const nameInp = document.getElementById('settings-input-user-name');
+      const nickInp = document.getElementById('settings-input-user-nick');
+      if (nameInp && !nameInp.value) nameInp.value = state.user.name;
+      if (nickInp && !nickInp.value) nickInp.value = state.user.nick;
+    }
+
+    // 2. Cartão Completo de Personalização do Overlay e Hotkeys Globais
     if (tabInterface && !document.getElementById('desktop-overlay-hotkeys-card')) {
       const desktopCard = document.createElement('div');
       desktopCard.id = 'desktop-overlay-hotkeys-card';
@@ -499,8 +617,8 @@
       desktopCard.innerHTML = `
         <div class="setting-row">
           <div class="setting-info">
-            <strong>Overlay Dentro de Jogos (Mostrar Sala e Quem Está a Falar)</strong>
-            <small>Exibe avatares discretos, atividade de voz e estado de mute sobre jogos em ecrã cheio ou janela.</small>
+            <strong>Ativar Overlay Dentro de Jogos</strong>
+            <small>Exibe avatares discretos, quem está falando, status AO VIVO e estado de mute.</small>
           </div>
           <label class="apple-switch">
             <input type="checkbox" id="toggle-game-overlay" ${state.overlayEnabled ? 'checked' : ''} />
@@ -510,15 +628,79 @@
         <div class="setting-divider"></div>
         <div class="setting-row">
           <div class="setting-info">
-            <strong>Posição do Overlay no Ecrã</strong>
-            <small>Escolha o canto onde os avatares da sala aparecem durante o jogo.</small>
+            <strong>Mostrar Overlay Apenas Durante Aplicações em Tela Cheia</strong>
+            <small>Oculta o overlay no uso normal do Windows e só exibe em jogos ou vídeos em tela cheia.</small>
           </div>
-          <select id="select-overlay-position" class="apple-select">
-            <option value="top-left" ${state.overlayPosition === 'top-left' ? 'selected' : ''}>Superior Esquerdo</option>
-            <option value="top-right" ${state.overlayPosition === 'top-right' ? 'selected' : ''}>Superior Direito</option>
-            <option value="bottom-left" ${state.overlayPosition === 'bottom-left' ? 'selected' : ''}>Inferior Esquerdo</option>
-            <option value="bottom-right" ${state.overlayPosition === 'bottom-right' ? 'selected' : ''}>Inferior Direito</option>
+          <label class="apple-switch">
+            <input type="checkbox" id="toggle-overlay-fullscreen-only" ${state.overlayFullscreenOnly ? 'checked' : ''} />
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Mostrar Título da Sala no Overlay</strong>
+            <small>Permite exibir ou ocultar o nome da sala atual no topo do overlay.</small>
+          </div>
+          <label class="apple-switch">
+            <input type="checkbox" id="toggle-overlay-room-title" ${state.overlayShowRoomTitle ? 'checked' : ''} />
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Posição do Overlay & Arrastar Livremente</strong>
+            <small>Escolha um canto ou destrave para arrastar o overlay livremente para qualquer lugar da tela.</small>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <select id="select-overlay-position" class="apple-select">
+              <option value="top-left" ${state.overlayPosition === 'top-left' ? 'selected' : ''}>Superior Esquerdo</option>
+              <option value="top-right" ${state.overlayPosition === 'top-right' ? 'selected' : ''}>Superior Direito</option>
+              <option value="bottom-left" ${state.overlayPosition === 'bottom-left' ? 'selected' : ''}>Inferior Esquerdo</option>
+              <option value="bottom-right" ${state.overlayPosition === 'bottom-right' ? 'selected' : ''}>Inferior Direito</option>
+              <option value="custom" ${state.overlayPosition === 'custom' ? 'selected' : ''}>Posição Livre Personalizada</option>
+            </select>
+            <button type="button" id="btn-unlock-drag-overlay" class="btn-chip primary">
+              ${state.overlayUnlocked ? '🔒 Fixar Posição' : '🔓 Destravar p/ Arrastar'}
+            </button>
+          </div>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Tamanho dos Elementos do Overlay</strong>
+            <small>Ajusta o tamanho dos avatares e indicadores no overlay.</small>
+          </div>
+          <select id="select-overlay-size" class="apple-select">
+            <option value="small" ${state.overlaySize === 'small' ? 'selected' : ''}>Compacto (Pequeno)</option>
+            <option value="medium" ${state.overlaySize === 'medium' ? 'selected' : ''}>Padrão (Médio)</option>
+            <option value="large" ${state.overlaySize === 'large' ? 'selected' : ''}>Expandido (Grande)</option>
           </select>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Escala do Overlay (<span id="label-overlay-scale">${state.overlayScale}%</span>)</strong>
+            <small>Controle proporcional de escala do overlay na tela.</small>
+          </div>
+          <input type="range" id="input-overlay-scale" min="70" max="150" step="5" value="${state.overlayScale}" style="width:160px;" />
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Opacidade do Overlay (<span id="label-overlay-opacity">${state.overlayOpacity}%</span>)</strong>
+            <small>Ajusta a transparência do overlay durante as partidas.</small>
+          </div>
+          <input type="range" id="input-overlay-opacity" min="25" max="100" step="5" value="${state.overlayOpacity}" style="width:160px;" />
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Restaurar Configuração Padrão do Overlay</strong>
+            <small>Redefine posição, tamanho, escala e opacidade para os valores originais.</small>
+          </div>
+          <button type="button" id="btn-reset-overlay-defaults" class="btn-chip">Restaurar Padrão</button>
         </div>
         <div class="setting-divider"></div>
         <div class="setting-row">
@@ -564,20 +746,110 @@
       tabInterface.appendChild(desktopCard);
 
       const overlayToggle = document.getElementById('toggle-game-overlay');
+      const fullscreenOnlyToggle = document.getElementById('toggle-overlay-fullscreen-only');
+      const roomTitleToggle = document.getElementById('toggle-overlay-room-title');
       const overlayPosSelect = document.getElementById('select-overlay-position');
+      const btnUnlockDrag = document.getElementById('btn-unlock-drag-overlay');
+      const overlaySizeSelect = document.getElementById('select-overlay-size');
+      const overlayScaleInput = document.getElementById('input-overlay-scale');
+      const overlayScaleLabel = document.getElementById('label-overlay-scale');
+      const overlayOpacityInput = document.getElementById('input-overlay-opacity');
+      const overlayOpacityLabel = document.getElementById('label-overlay-opacity');
+      const btnResetOverlay = document.getElementById('btn-reset-overlay-defaults');
       const winNotifToggle = document.getElementById('toggle-win-notifications');
 
       overlayToggle?.addEventListener('change', () => {
         state.overlayEnabled = overlayToggle.checked;
         localStorage.setItem('aether_overlay_enabled', state.overlayEnabled ? 'on' : 'off');
-        window.aetherDesktop?.setOverlayConfig({ enabled: state.overlayEnabled, position: state.overlayPosition });
+        pushOverlayConfigToDesktop();
         syncDesktopOverlayState();
+      });
+
+      fullscreenOnlyToggle?.addEventListener('change', () => {
+        state.overlayFullscreenOnly = fullscreenOnlyToggle.checked;
+        localStorage.setItem('aether_overlay_fullscreen_only', state.overlayFullscreenOnly ? 'on' : 'off');
+        pushOverlayConfigToDesktop();
+      });
+
+      roomTitleToggle?.addEventListener('change', () => {
+        state.overlayShowRoomTitle = roomTitleToggle.checked;
+        localStorage.setItem('aether_overlay_show_title', state.overlayShowRoomTitle ? 'on' : 'off');
+        pushOverlayConfigToDesktop();
       });
 
       overlayPosSelect?.addEventListener('change', () => {
         state.overlayPosition = overlayPosSelect.value;
         localStorage.setItem('aether_overlay_pos', state.overlayPosition);
-        window.aetherDesktop?.setOverlayConfig({ enabled: state.overlayEnabled, position: state.overlayPosition });
+        pushOverlayConfigToDesktop();
+      });
+
+      btnUnlockDrag?.addEventListener('click', () => {
+        state.overlayUnlocked = !state.overlayUnlocked;
+        btnUnlockDrag.textContent = state.overlayUnlocked ? '🔒 Fixar Posição' : '🔓 Destravar p/ Arrastar';
+        pushOverlayConfigToDesktop();
+        syncDesktopOverlayState();
+        if (state.overlayUnlocked) {
+          showToast('Overlay Destravado', 'Arraste a caixa do overlay para qualquer área da tela e clique em Fixar.', '✥');
+        } else {
+          showToast('Posição Salva', 'O overlay foi fixado na nova posição.', '📌');
+        }
+      });
+
+      overlaySizeSelect?.addEventListener('change', () => {
+        state.overlaySize = overlaySizeSelect.value;
+        localStorage.setItem('aether_overlay_size', state.overlaySize);
+        pushOverlayConfigToDesktop();
+      });
+
+      overlayScaleInput?.addEventListener('input', () => {
+        state.overlayScale = Number(overlayScaleInput.value);
+        if (overlayScaleLabel) overlayScaleLabel.textContent = `${state.overlayScale}%`;
+        localStorage.setItem('aether_overlay_scale', String(state.overlayScale));
+        pushOverlayConfigToDesktop();
+      });
+
+      overlayOpacityInput?.addEventListener('input', () => {
+        state.overlayOpacity = Number(overlayOpacityInput.value);
+        if (overlayOpacityLabel) overlayOpacityLabel.textContent = `${state.overlayOpacity}%`;
+        localStorage.setItem('aether_overlay_opacity', String(state.overlayOpacity));
+        pushOverlayConfigToDesktop();
+      });
+
+      btnResetOverlay?.addEventListener('click', () => {
+        state.overlayEnabled = true;
+        state.overlayFullscreenOnly = true;
+        state.overlayShowRoomTitle = true;
+        state.overlaySize = 'medium';
+        state.overlayScale = 100;
+        state.overlayOpacity = 90;
+        state.overlayPosition = 'top-left';
+        state.overlayCustomX = null;
+        state.overlayCustomY = null;
+        state.overlayUnlocked = false;
+
+        localStorage.setItem('aether_overlay_enabled', 'on');
+        localStorage.setItem('aether_overlay_fullscreen_only', 'on');
+        localStorage.setItem('aether_overlay_show_title', 'on');
+        localStorage.setItem('aether_overlay_size', 'medium');
+        localStorage.setItem('aether_overlay_scale', '100');
+        localStorage.setItem('aether_overlay_opacity', '90');
+        localStorage.setItem('aether_overlay_pos', 'top-left');
+        localStorage.removeItem('aether_overlay_custom_xy');
+
+        if (overlayToggle) overlayToggle.checked = true;
+        if (fullscreenOnlyToggle) fullscreenOnlyToggle.checked = true;
+        if (roomTitleToggle) roomTitleToggle.checked = true;
+        if (overlayPosSelect) overlayPosSelect.value = 'top-left';
+        if (btnUnlockDrag) btnUnlockDrag.textContent = '🔓 Destravar p/ Arrastar';
+        if (overlaySizeSelect) overlaySizeSelect.value = 'medium';
+        if (overlayScaleInput) overlayScaleInput.value = '100';
+        if (overlayScaleLabel) overlayScaleLabel.textContent = '100%';
+        if (overlayOpacityInput) overlayOpacityInput.value = '90';
+        if (overlayOpacityLabel) overlayOpacityLabel.textContent = '90%';
+
+        pushOverlayConfigToDesktop();
+        syncDesktopOverlayState();
+        showToast('Overlay Restaurado', 'As configurações padrão do overlay foram aplicadas.', '✨');
       });
 
       winNotifToggle?.addEventListener('change', () => {
@@ -722,12 +994,8 @@
   }
   injectAdvancedSettingsAndCloudUI();
 
-  // Inicializa a ponte com o aplicativo Desktop instalado (Overlay, Hotkeys e Notificações)
   if (isDesktopInstalledApp) {
-    window.aetherDesktop.setOverlayConfig({
-      enabled: state.overlayEnabled,
-      position: state.overlayPosition
-    });
+    pushOverlayConfigToDesktop();
     window.aetherDesktop.updateHotkeys(state.globalHotkeys);
 
     window.aetherDesktop.onHotkeyCommand((cmd) => {
@@ -757,6 +1025,26 @@
       const toggleEl = document.getElementById('toggle-game-overlay');
       if (toggleEl) toggleEl.checked = state.overlayEnabled;
       syncDesktopOverlayState();
+    });
+
+    window.aetherDesktop.onOverlayBoundsChanged?.((pos) => {
+      if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return;
+      state.overlayPosition = 'custom';
+      state.overlayCustomX = pos.x;
+      state.overlayCustomY = pos.y;
+      localStorage.setItem('aether_overlay_pos', 'custom');
+      localStorage.setItem('aether_overlay_custom_xy', JSON.stringify({ x: pos.x, y: pos.y }));
+      const posSelect = document.getElementById('select-overlay-position');
+      if (posSelect) posSelect.value = 'custom';
+    });
+
+    window.aetherDesktop.onOverlayLockChanged?.((unlocked) => {
+      state.overlayUnlocked = Boolean(unlocked);
+      const btnUnlockDrag = document.getElementById('btn-unlock-drag-overlay');
+      if (btnUnlockDrag) {
+        btnUnlockDrag.textContent = state.overlayUnlocked ? '🔒 Fixar Posição' : '🔓 Destravar p/ Arrastar';
+      }
+      showToast('Posição Salva', 'O overlay foi fixado na posição escolhida.', '📌');
     });
 
     window.aetherDesktop.onFlushedNotifications((list) => {
@@ -854,8 +1142,8 @@
           </div>
         </div>
         <div class="broadcaster-hud-right">
-          <div class="broadcaster-metric-pill viewers-pill" title="Pessoas assistindo sua transmissão agora">
-            <span id="broadcaster-viewers-count">👁 0 espectadores</span>
+          <div id="broadcaster-viewers-pill" class="broadcaster-metric-pill viewers-pill hidden" title="Pessoas assistindo sua transmissão agora">
+            <span id="broadcaster-viewers-count">👁 1 espectador</span>
           </div>
           <div class="broadcaster-metric-pill mono" title="Tempo de transmissão ao vivo">
             <span>⏱</span>
@@ -894,8 +1182,11 @@
     const hud = ensureBroadcasterHudElement();
     if (!hud) return;
 
+    syncStreamButtonsVisualState();
+
     if (!state.isStreaming || !state.localScreenStream) {
       hud.classList.add('hidden');
+      syncDesktopOverlayState();
       return;
     }
 
@@ -907,10 +1198,17 @@
       audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio' : '🔇 Somente tela (sem áudio)';
     }
 
+    // Contador de espectadores inteligente: só exibe se houver pelo menos 1 espectador
     const viewersCount = state.myStreamViewers.size;
+    const viewersPillEl = document.getElementById('broadcaster-viewers-pill');
     const viewersEl = document.getElementById('broadcaster-viewers-count');
-    if (viewersEl) {
-      viewersEl.textContent = `👁 ${viewersCount} ${viewersCount === 1 ? 'espectador' : 'espectadores'}`;
+    if (viewersPillEl && viewersEl) {
+      if (viewersCount > 0) {
+        viewersPillEl.classList.remove('hidden');
+        viewersEl.textContent = `👁 ${viewersCount} ${viewersCount === 1 ? 'espectador' : 'espectadores'}`;
+      } else {
+        viewersPillEl.classList.add('hidden');
+      }
     }
 
     const timerEl = document.getElementById('broadcaster-live-timer');
@@ -926,6 +1224,8 @@
       const qualityLabel = state.streamSettings.contentHint === 'detail' ? 'Nitidez Máxima' : 'Fluidez Ultra';
       specEl.textContent = `${resLabel} • ${state.streamSettings.fps} FPS • ${qualityLabel}`;
     }
+
+    syncDesktopOverlayState();
   }
 
   const resumeAllAudio = () => {
@@ -994,7 +1294,7 @@
   const tabTitles = {
     'tab-audio': 'Áudio & Processamento Vocal',
     'tab-stream': 'Qualidade de Transmissão',
-    'tab-interface': 'Aparência, Overlay & Hotkeys'
+    'tab-interface': 'Perfil, Overlay & Hotkeys'
   };
 
   document.querySelectorAll('.settings-nav-item').forEach((item) => {
@@ -1116,7 +1416,7 @@
     });
   }
 
-  // ================= 1. TELA INICIAL =================
+  // ================= 1. LOGIN AUTOMÁTICO & PERSISTÊNCIA DE NOME E NICK =================
   function validateEntryInputs() {
     const nameValid = el.inputName.value.trim().length >= 2;
     const cleanedNick = el.inputNick.value.replace(/[^a-zA-Z0-9_\s]/g, '');
@@ -1128,19 +1428,25 @@
   el.inputName.addEventListener('input', validateEntryInputs);
   el.inputNick.addEventListener('input', validateEntryInputs);
 
-  el.entryForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    if (el.btnEnterApp.disabled) return;
-
+  async function performUserLogin(name, nick, existingColor = null) {
     const palette = ['#5E81F4', '#7C69EF', '#EC4899', '#10B981', '#3B82F6', '#F59E0B'];
-    const avatarColor = palette[Math.floor(Math.random() * palette.length)];
+    const avatarColor = existingColor || palette[Math.floor(Math.random() * palette.length)];
+    const normalizedNick = nick.trim().replace(/\s+/g, '_').toLowerCase();
+    const cleanedName = name.trim();
+
+    localStorage.setItem('aether_user_profile', JSON.stringify({
+      name: cleanedName,
+      nick: normalizedNick,
+      avatarColor
+    }));
+
+    el.entryScreen.classList.add('hidden');
+    el.appShell.classList.remove('hidden');
 
     await initLocalVoiceEngine();
 
-    const normalizedNick = el.inputNick.value.trim().replace(/\s+/g, '_').toLowerCase();
-
     socket.emit('user:register', {
-      name: el.inputName.value.trim(),
+      name: cleanedName,
       nick: normalizedNick,
       avatarColor
     }, (res) => {
@@ -1153,10 +1459,13 @@
       el.selfName.textContent = state.user.name;
       el.selfNick.textContent = '@' + state.user.nick;
 
-      el.entryScreen.classList.add('hidden');
-      el.appShell.classList.remove('hidden');
+      const nameInp = document.getElementById('settings-input-user-name');
+      const nickInp = document.getElementById('settings-input-user-nick');
+      if (nameInp) nameInp.value = state.user.name;
+      if (nickInp) nickInp.value = state.user.nick;
 
       ensureBroadcasterHudElement();
+      syncStreamButtonsVisualState();
 
       socket.emit('user:state-change', {
         voiceStreamId: state.localVoiceStream?.id || null,
@@ -1166,7 +1475,26 @@
       renderRoomsList();
       joinRoom('lobby-principal');
     });
+  }
+
+  el.entryForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (el.btnEnterApp.disabled) return;
+    await performUserLogin(el.inputName.value, el.inputNick.value);
   });
+
+  // Verifica se o utilizador já tem Nome e Nickname guardados localmente para fazer login automático
+  try {
+    const savedProfileRaw = localStorage.getItem('aether_user_profile');
+    if (savedProfileRaw) {
+      const savedProfile = JSON.parse(savedProfileRaw);
+      if (savedProfile?.name && savedProfile?.nick && savedProfile.name.trim().length >= 2 && savedProfile.nick.trim().length >= 2) {
+        el.inputName.value = savedProfile.name;
+        el.inputNick.value = savedProfile.nick;
+        performUserLogin(savedProfile.name, savedProfile.nick, savedProfile.avatarColor);
+      }
+    }
+  } catch (e) {}
 
   // ================= 2. MOTOR DE VOZ E PERFIS DE FILTRAGEM DE RUÍDO =================
   function getNoiseFilterFrequencies(level) {
@@ -1392,6 +1720,7 @@
       renderRoomsList();
       renderParticipantsList(res.room.users);
       updateStageLayout();
+      syncStreamButtonsVisualState();
       syncDesktopOverlayState();
     });
   }
@@ -2075,8 +2404,7 @@
         delete t.dataset.userUnmutedManually;
       });
 
-      el.btnStartStream.classList.add('streaming-now');
-      el.labelStreamBtn.textContent = 'Parar Live';
+      syncStreamButtonsVisualState();
 
       socket.emit('user:state-change', {
         isStreaming: true,
@@ -2104,6 +2432,8 @@
       syncMultiStreamAudioBus();
       setTimeout(() => enforceHighQualityForAllViewers(), 350);
     } catch (err) {
+      state.isStreaming = false;
+      syncStreamButtonsVisualState();
       console.log('Partilha de ecrã cancelada:', err);
     }
   }
@@ -2147,33 +2477,29 @@
     }
     state.streamStartedAt = null;
     state.myStreamViewers.clear();
-
-    if (!state.localScreenStream) {
-      updateBroadcasterControlPanel();
-      return;
-    }
-    const tracksToStop = state.localScreenStream.getTracks();
-
-    for (const [peerId, peerObj] of state.peers.entries()) {
-      peerObj.suppressAutoNegotiation = true;
-      const senders = peerObj.pc.getSenders();
-      senders.forEach((sender) => {
-        if (sender.track && tracksToStop.includes(sender.track)) {
-          try { peerObj.pc.removeTrack(sender); } catch (e) {}
-        }
-      });
-      peerObj.suppressAutoNegotiation = false;
-      sendStreamIdsMeta(peerId);
-      negotiateWithPeer(peerId, peerObj);
-    }
-
-    tracksToStop.forEach(t => t.stop());
-    state.localScreenStream = null;
     state.isStreaming = false;
 
-    el.btnStartStream.classList.remove('streaming-now');
-    el.labelStreamBtn.textContent = 'Transmitir';
+    if (state.localScreenStream) {
+      const tracksToStop = state.localScreenStream.getTracks();
 
+      for (const [peerId, peerObj] of state.peers.entries()) {
+        peerObj.suppressAutoNegotiation = true;
+        const senders = peerObj.pc.getSenders();
+        senders.forEach((sender) => {
+          if (sender.track && tracksToStop.includes(sender.track)) {
+            try { peerObj.pc.removeTrack(sender); } catch (e) {}
+          }
+        });
+        peerObj.suppressAutoNegotiation = false;
+        sendStreamIdsMeta(peerId);
+        negotiateWithPeer(peerId, peerObj);
+      }
+
+      tracksToStop.forEach(t => t.stop());
+      state.localScreenStream = null;
+    }
+
+    syncStreamButtonsVisualState();
     updateBroadcasterControlPanel();
     updateStageLayout();
     syncMultiStreamAudioBus();
@@ -3247,7 +3573,13 @@
         removeStreamTile(socketId);
       }
     }
-    syncDesktopOverlayState();
+    const uInRoom = state.roomUsers.find(u => u.socketId === socketId);
+    if (uInRoom && patch) {
+      Object.assign(uInRoom, patch);
+      renderParticipantsList(state.roomUsers);
+    } else {
+      syncDesktopOverlayState();
+    }
   });
 
   socket.on('chat:new-message', (msg) => appendChatMessage(msg, true));

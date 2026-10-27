@@ -1,7 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const { exec } = require('child_process');
+const https = require('https');
+const { exec, execFileSync } = require('child_process');
 
 // ================= 1. GERADOR AUTOMÁTICO DO ÍCONE OFICIAL (.ICO / .PNG) =================
 function ensureAppIcons() {
@@ -125,10 +126,75 @@ function ensureAppIcons() {
   return { pngPath, icoPath };
 }
 
+function downloadFileFollowRedirects(url, destPath) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return resolve(downloadFileFollowRedirects(res.headers.location, destPath));
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const file = fs.createWriteStream(destPath);
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+      file.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+async function ensureWinCodeSignCache() {
+  if (process.platform !== 'win32') return;
+  const localAppData = process.env.LOCALAPPDATA || path.join(require('os').homedir(), 'AppData', 'Local');
+  const cacheDir = path.join(localAppData, 'electron-builder', 'Cache', 'winCodeSign');
+  const targetDir = path.join(cacheDir, 'winCodeSign-2.6.0');
+
+  if (fs.existsSync(path.join(targetDir, 'rcedit-x64.exe'))) {
+    return;
+  }
+
+  fs.mkdirSync(cacheDir, { recursive: true });
+
+  const entries = fs.readdirSync(cacheDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory() && entry.name !== 'winCodeSign-2.6.0') {
+      const candidatePath = path.join(cacheDir, entry.name);
+      if (fs.existsSync(path.join(candidatePath, 'rcedit-x64.exe'))) {
+        try {
+          fs.renameSync(candidatePath, targetDir);
+          console.log('Cache do winCodeSign configurado com sucesso!');
+          return;
+        } catch (e) {}
+      }
+    }
+  }
+
+  const archivePath = path.join(cacheDir, 'winCodeSign-2.6.0.7z');
+  const sevenZipPath = path.join(__dirname, 'node_modules', '7zip-bin', 'win', 'x64', '7za.exe');
+  const url = 'https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-2.6.0/winCodeSign-2.6.0.7z';
+
+  console.log('A preparar ferramentas de empacotamento do Windows (winCodeSign)...');
+  await downloadFileFollowRedirects(url, archivePath);
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  try {
+    execFileSync(sevenZipPath, ['x', '-bd', '-y', '-xr!darwin', archivePath, `-o${targetDir}`], {
+      stdio: 'ignore'
+    });
+  } catch (e) {}
+
+  try {
+    fs.unlinkSync(archivePath);
+  } catch (e) {}
+
+  console.log('Cache do winCodeSign preparado com sucesso (sem erros de symlink)!');
+}
+
 const iconPaths = ensureAppIcons();
 if (process.argv.includes('--generate-icon')) {
   console.log('Ícones oficiais do Aether gerados com sucesso em public/icon.ico e public/icon.png');
-  process.exit(0);
+  ensureWinCodeSignCache().then(() => process.exit(0)).catch(() => process.exit(0));
+  return;
 }
 
 // ================= 2. PROCESSO PRINCIPAL DO ELECTRON =================
@@ -160,12 +226,30 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 let mainWindow = null;
 let overlayWindow = null;
+let runtimePathsGlobal = null;
 let usingLocalMode = false;
-let overlayEnabled = true;
-let overlayPosition = 'top-left';
-let lastOverlayPayload = { roomName: '', users: [] };
 let isExternalFullscreenActive = false;
 let queuedNotifications = [];
+
+let overlayConfig = {
+  enabled: true,
+  fullscreenOnly: true,
+  showRoomTitle: true,
+  size: 'medium',
+  scale: 100,
+  opacity: 90,
+  position: 'top-left',
+  customX: null,
+  customY: null,
+  unlocked: false
+};
+
+let lastOverlayPayload = {
+  roomName: '',
+  isSelfStreaming: false,
+  viewersCount: 0,
+  users: []
+};
 
 let currentHotkeys = {
   toggleMic: 'CommandOrControl+Shift+M',
@@ -176,7 +260,6 @@ let currentHotkeys = {
   toggleDeafen: 'CommandOrControl+Shift+D'
 };
 
-// Cria os ficheiros auxiliares de Preload (Ponte Nativa) e HTML do Overlay em Jogo
 function ensureRuntimeBridgeFiles() {
   const userDataDir = app.getPath('userData');
   const preloadPath = path.join(userDataDir, 'aether-preload.js');
@@ -188,6 +271,7 @@ function ensureRuntimeBridgeFiles() {
       isDesktop: true,
       updateOverlayState: (payload) => ipcRenderer.send('desktop:overlay-state', payload),
       setOverlayConfig: (cfg) => ipcRenderer.send('desktop:overlay-config', cfg),
+      lockOverlayFromHud: () => ipcRenderer.send('desktop:overlay-lock-from-hud'),
       updateHotkeys: (hk) => ipcRenderer.invoke('desktop:update-hotkeys', hk),
       getHotkeys: () => ipcRenderer.invoke('desktop:get-hotkeys'),
       notify: (payload) => ipcRenderer.send('desktop:notify', payload),
@@ -198,6 +282,14 @@ function ensureRuntimeBridgeFiles() {
       onOverlayToggled: (cb) => {
         ipcRenderer.removeAllListeners('desktop:overlay-toggled');
         ipcRenderer.on('desktop:overlay-toggled', (_e, enabled) => cb(enabled));
+      },
+      onOverlayBoundsChanged: (cb) => {
+        ipcRenderer.removeAllListeners('desktop:overlay-bounds-changed');
+        ipcRenderer.on('desktop:overlay-bounds-changed', (_e, pos) => cb(pos));
+      },
+      onOverlayLockChanged: (cb) => {
+        ipcRenderer.removeAllListeners('desktop:overlay-lock-changed');
+        ipcRenderer.on('desktop:overlay-lock-changed', (_e, unlocked) => cb(unlocked));
       },
       onFlushedNotifications: (cb) => {
         ipcRenderer.removeAllListeners('desktop:flushed-notifications');
@@ -228,20 +320,61 @@ function ensureRuntimeBridgeFiles() {
       flex-direction: column;
       gap: 6px;
       padding: 10px;
+      transform-origin: top left;
+      transition: opacity 150ms ease;
+    }
+    .overlay-root.unlocked-mode {
+      background: rgba(15, 20, 32, 0.55);
+      border: 1.5px dashed rgba(94, 129, 244, 0.85);
+      border-radius: 16px;
+    }
+    .overlay-drag-bar {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: rgba(94, 129, 244, 0.28);
+      border: 1px solid rgba(94, 129, 244, 0.65);
+      color: #fff;
+      padding: 5px 10px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 700;
+      -webkit-app-region: drag;
+      cursor: move;
+    }
+    .overlay-root.unlocked-mode .overlay-drag-bar {
+      display: flex;
+    }
+    .overlay-lock-btn {
+      -webkit-app-region: no-drag;
+      background: #10b981;
+      border: none;
+      color: #06281e;
+      font-size: 10px;
+      font-weight: 800;
+      padding: 3px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .overlay-header-row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
     }
     .overlay-room-badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      align-self: flex-start;
-      background: rgba(13, 17, 26, 0.78);
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(13, 17, 26, 0.82);
+      border: 1px solid rgba(255, 255, 255, 0.14);
       border-radius: 99px;
       padding: 4px 10px;
-      color: rgba(240, 244, 255, 0.9);
+      color: rgba(240, 244, 255, 0.92);
       font-size: 10.5px;
       font-weight: 700;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.03em;
       backdrop-filter: blur(10px);
       box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
     }
@@ -251,6 +384,34 @@ function ensureRuntimeBridgeFiles() {
       border-radius: 50%;
       background: #10b981;
       box-shadow: 0 0 8px #10b981;
+    }
+    .overlay-live-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(244, 63, 94, 0.26);
+      border: 1px solid rgba(244, 63, 94, 0.65);
+      border-radius: 99px;
+      padding: 4px 10px;
+      color: #ffe4e6;
+      font-size: 10.5px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 4px 14px rgba(244, 63, 94, 0.25);
+    }
+    .overlay-viewers-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(94, 129, 244, 0.28);
+      border: 1px solid rgba(94, 129, 244, 0.55);
+      border-radius: 99px;
+      padding: 4px 9px;
+      color: #e0e7ff;
+      font-size: 10.5px;
+      font-weight: 700;
+      backdrop-filter: blur(10px);
     }
     .overlay-users-list {
       display: flex;
@@ -262,19 +423,27 @@ function ensureRuntimeBridgeFiles() {
       align-items: center;
       gap: 8px;
       align-self: flex-start;
-      background: rgba(15, 19, 29, 0.72);
-      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(15, 19, 29, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.11);
       border-radius: 999px;
       padding: 4px 11px 4px 4px;
-      color: rgba(235, 240, 255, 0.85);
+      color: rgba(235, 240, 255, 0.88);
       transition: all 140ms ease;
       backdrop-filter: blur(8px);
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
     }
+    .overlay-root.size-small .overlay-user-pill {
+      padding: 3px 9px 3px 3px;
+      gap: 6px;
+    }
+    .overlay-root.size-large .overlay-user-pill {
+      padding: 6px 14px 6px 6px;
+      gap: 10px;
+    }
     .overlay-user-pill.speaking {
-      background: rgba(20, 28, 46, 0.92);
+      background: rgba(20, 28, 46, 0.95);
       border-color: #10b981;
-      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.45), 0 6px 18px rgba(0, 0, 0, 0.6);
+      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.48), 0 6px 18px rgba(0, 0, 0, 0.65);
       transform: translateX(3px);
       color: #ffffff;
     }
@@ -291,6 +460,16 @@ function ensureRuntimeBridgeFiles() {
       position: relative;
       transition: transform 140ms ease, box-shadow 140ms ease;
     }
+    .overlay-root.size-small .overlay-avatar {
+      width: 22px;
+      height: 22px;
+      font-size: 10px;
+    }
+    .overlay-root.size-large .overlay-avatar {
+      width: 32px;
+      height: 32px;
+      font-size: 13.5px;
+    }
     .overlay-user-pill.speaking .overlay-avatar {
       box-shadow: 0 0 12px #10b981;
       transform: scale(1.06);
@@ -298,12 +477,14 @@ function ensureRuntimeBridgeFiles() {
     .overlay-name {
       font-size: 12px;
       font-weight: 600;
-      max-width: 140px;
+      max-width: 145px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
     }
+    .overlay-root.size-small .overlay-name { font-size: 11px; max-width: 120px; }
+    .overlay-root.size-large .overlay-name { font-size: 13.5px; max-width: 175px; }
     .overlay-status-icons {
       display: inline-flex;
       align-items: center;
@@ -335,27 +516,75 @@ function ensureRuntimeBridgeFiles() {
   </style>
 </head>
 <body>
-  <div id="overlay-root" class="overlay-root" style="display:none;">
-    <div class="overlay-room-badge">
-      <span class="overlay-room-dot"></span>
-      <span id="overlay-room-title">Aether</span>
+  <div id="overlay-root" class="overlay-root size-medium" style="display:none;">
+    <div class="overlay-drag-bar">
+      <span>✥ Arraste para mover</span>
+      <button type="button" id="btn-lock-overlay" class="overlay-lock-btn">Fixar</button>
+    </div>
+    <div id="overlay-header-row" class="overlay-header-row">
+      <div id="overlay-room-badge" class="overlay-room-badge">
+        <span class="overlay-room-dot"></span>
+        <span id="overlay-room-title">Aether</span>
+      </div>
+      <div id="overlay-live-badge" class="overlay-live-badge" style="display:none;">
+        <span>🔴 AO VIVO</span>
+      </div>
+      <div id="overlay-viewers-badge" class="overlay-viewers-badge" style="display:none;">
+        <span id="overlay-viewers-text">👁 1 espectador</span>
+      </div>
     </div>
     <div id="overlay-users-list" class="overlay-users-list"></div>
   </div>
   <script>
+    document.getElementById('btn-lock-overlay')?.addEventListener('click', () => {
+      window.aetherDesktop?.lockOverlayFromHud();
+    });
+
     if (window.aetherDesktop && window.aetherDesktop.onOverlayRender) {
-      window.aetherDesktop.onOverlayRender((state) => {
+      window.aetherDesktop.onOverlayRender((payload) => {
         const root = document.getElementById('overlay-root');
+        const headerRow = document.getElementById('overlay-header-row');
+        const roomBadge = document.getElementById('overlay-room-badge');
         const titleEl = document.getElementById('overlay-room-title');
+        const liveBadge = document.getElementById('overlay-live-badge');
+        const viewersBadge = document.getElementById('overlay-viewers-badge');
+        const viewersText = document.getElementById('overlay-viewers-text');
         const listEl = document.getElementById('overlay-users-list');
-        if (!state || !state.users || state.users.length === 0) {
+
+        const cfg = payload?.config || {};
+        const users = payload?.users || [];
+
+        if (users.length === 0 && !cfg.unlocked) {
           root.style.display = 'none';
           return;
         }
+
         root.style.display = 'flex';
-        titleEl.textContent = state.roomName || 'Sala de Voz';
+        root.className = 'overlay-root size-' + (cfg.size || 'medium') + (cfg.unlocked ? ' unlocked-mode' : '');
+        const scaleVal = Math.max(0.6, Math.min(1.6, Number(cfg.scale || 100) / 100));
+        const opacityVal = Math.max(0.2, Math.min(1, Number(cfg.opacity || 90) / 100));
+        root.style.transform = 'scale(' + scaleVal + ')';
+        root.style.opacity = String(opacityVal);
+
+        const showTitle = cfg.showRoomTitle !== false;
+        roomBadge.style.display = showTitle ? 'inline-flex' : 'none';
+        titleEl.textContent = payload.roomName || 'Sala de Voz';
+
+        const isLive = Boolean(payload.isSelfStreaming);
+        liveBadge.style.display = isLive ? 'inline-flex' : 'none';
+
+        const viewersCount = Number(payload.viewersCount || 0);
+        if (isLive && viewersCount > 0) {
+          viewersBadge.style.display = 'inline-flex';
+          viewersText.textContent = '👁 ' + viewersCount + ' ' + (viewersCount === 1 ? 'espectador' : 'espectadores');
+        } else {
+          viewersBadge.style.display = 'none';
+        }
+
+        headerRow.style.display = (showTitle || isLive) ? 'flex' : 'none';
+
         listEl.innerHTML = '';
-        state.users.forEach((u) => {
+        users.forEach((u) => {
           const pill = document.createElement('div');
           pill.className = 'overlay-user-pill' + (u.isSpeaking ? ' speaking' : '');
           const initial = (u.name || 'U').charAt(0).toUpperCase();
@@ -381,7 +610,39 @@ function ensureRuntimeBridgeFiles() {
   return { preloadPath, overlayHtmlPath };
 }
 
-// ================= 3. DETEÇÃO DE APLICAÇÕES / JOGOS EM ECRÃ CHEIO NO WINDOWS =================
+function shouldDisplayOverlayNow() {
+  if (!overlayConfig.enabled) return false;
+  if (overlayConfig.unlocked) return true;
+
+  const hasUsers = lastOverlayPayload.users && lastOverlayPayload.users.length > 0;
+  if (!hasUsers) return false;
+
+  if (overlayConfig.fullscreenOnly) {
+    const mainIsFullscreen = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen());
+    return Boolean(isExternalFullscreenActive || mainIsFullscreen);
+  }
+  return true;
+}
+
+function syncOverlayVisibilityAndContent() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+
+  if (shouldDisplayOverlayNow()) {
+    if (!overlayWindow.isVisible()) {
+      overlayWindow.showInactive();
+    }
+    overlayWindow.setAlwaysOnTop(true, 'screen-saver');
+    overlayWindow.webContents.send('overlay:render', {
+      ...lastOverlayPayload,
+      config: overlayConfig
+    });
+  } else {
+    if (overlayWindow.isVisible()) {
+      overlayWindow.hide();
+    }
+  }
+}
+
 function checkWindowsFullscreenState() {
   if (process.platform !== 'win32') return;
 
@@ -420,18 +681,29 @@ Write-Output "$state|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)"
         (right - left) >= primaryBounds.width &&
         (bottom - top) >= primaryBounds.height;
 
-      // Estados 2 (D3D Fullscreen), 3 (Presentation) ou 4 (Active Fullscreen App)
+      const mainFocusedNotFullscreen =
+        mainWindow &&
+        !mainWindow.isDestroyed() &&
+        mainWindow.isFocused() &&
+        !mainWindow.isFullScreen();
+
       const isAppFullScreen =
-        (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen()) ||
-        notifState === 2 ||
-        notifState === 3 ||
-        notifState === 4 ||
-        (coversPrimaryScreen && (!mainWindow || !mainWindow.isFocused()));
+        !mainFocusedNotFullscreen &&
+        (
+          (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen()) ||
+          notifState === 2 ||
+          notifState === 3 ||
+          notifState === 4 ||
+          coversPrimaryScreen
+        );
 
       const wasFullscreen = isExternalFullscreenActive;
       isExternalFullscreenActive = Boolean(isAppFullScreen);
 
-      // Se o utilizador acabou de sair do jogo/vídeo em ecrã cheio, liberta notificações guardadas
+      if (wasFullscreen !== isExternalFullscreenActive) {
+        syncOverlayVisibilityAndContent();
+      }
+
       if (wasFullscreen && !isExternalFullscreenActive && queuedNotifications.length > 0) {
         const pending = queuedNotifications.splice(0, queuedNotifications.length);
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -442,25 +714,40 @@ Write-Output "$state|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)"
   );
 }
 
-// ================= 4. CRIAÇÃO E POSICIONAMENTO DO OVERLAY DENTRO DE JOGOS =================
 function applyOverlayWindowBounds() {
   if (!overlayWindow || overlayWindow.isDestroyed()) return;
   const display = screen.getPrimaryDisplay();
   const { x, y, width, height } = display.bounds;
-  const winWidth = 260;
-  const winHeight = 380;
+
+  const scaleFactor = Math.max(0.7, Math.min(1.6, Number(overlayConfig.scale || 100) / 100));
+  const winWidth = Math.round(320 * scaleFactor);
+  const winHeight = Math.round(440 * scaleFactor);
   const margin = 18;
+
+  if (
+    overlayConfig.position === 'custom' &&
+    typeof overlayConfig.customX === 'number' &&
+    typeof overlayConfig.customY === 'number'
+  ) {
+    overlayWindow.setBounds({
+      x: Math.round(overlayConfig.customX),
+      y: Math.round(overlayConfig.customY),
+      width: winWidth,
+      height: winHeight
+    });
+    return;
+  }
 
   let targetX = x + margin;
   let targetY = y + 80;
 
-  if (overlayPosition === 'top-right') {
+  if (overlayConfig.position === 'top-right') {
     targetX = x + width - winWidth - margin;
     targetY = y + 80;
-  } else if (overlayPosition === 'bottom-left') {
+  } else if (overlayConfig.position === 'bottom-left') {
     targetX = x + margin;
     targetY = y + height - winHeight - 60;
-  } else if (overlayPosition === 'bottom-right') {
+  } else if (overlayConfig.position === 'bottom-right') {
     targetX = x + width - winWidth - margin;
     targetY = y + height - winHeight - 60;
   }
@@ -469,21 +756,14 @@ function applyOverlayWindowBounds() {
 }
 
 function createOrUpdateOverlayWindow(runtimePaths) {
-  if (!overlayEnabled) {
-    if (overlayWindow && !overlayWindow.isDestroyed()) {
-      overlayWindow.hide();
-    }
-    return;
-  }
-
   if (!overlayWindow || overlayWindow.isDestroyed()) {
     overlayWindow = new BrowserWindow({
-      width: 260,
-      height: 380,
+      width: 320,
+      height: 440,
       frame: false,
       transparent: true,
       resizable: false,
-      movable: false,
+      movable: true,
       minimizable: false,
       maximizable: false,
       focusable: false,
@@ -500,28 +780,31 @@ function createOrUpdateOverlayWindow(runtimePaths) {
 
     overlayWindow.setAlwaysOnTop(true, 'screen-saver');
     overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+    overlayWindow.setIgnoreMouseEvents(!overlayConfig.unlocked, { forward: true });
     applyOverlayWindowBounds();
 
-    overlayWindow.loadFile(runtimePaths.overlayHtmlPath).then(() => {
-      if (overlayEnabled && lastOverlayPayload.users && lastOverlayPayload.users.length > 0) {
-        overlayWindow.showInactive();
-        overlayWindow.webContents.send('overlay:render', lastOverlayPayload);
+    overlayWindow.on('moved', () => {
+      if (!overlayWindow || overlayWindow.isDestroyed()) return;
+      const b = overlayWindow.getBounds();
+      overlayConfig.position = 'custom';
+      overlayConfig.customX = b.x;
+      overlayConfig.customY = b.y;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('desktop:overlay-bounds-changed', { x: b.x, y: b.y });
       }
+    });
+
+    overlayWindow.loadFile(runtimePaths.overlayHtmlPath).then(() => {
+      syncOverlayVisibilityAndContent();
     }).catch(() => {});
   } else {
+    overlayWindow.setFocusable(Boolean(overlayConfig.unlocked));
+    overlayWindow.setIgnoreMouseEvents(!overlayConfig.unlocked, { forward: true });
     applyOverlayWindowBounds();
-    overlayWindow.setAlwaysOnTop(true, 'screen-saver');
-    if (lastOverlayPayload.users && lastOverlayPayload.users.length > 0) {
-      if (!overlayWindow.isVisible()) overlayWindow.showInactive();
-      overlayWindow.webContents.send('overlay:render', lastOverlayPayload);
-    } else {
-      overlayWindow.hide();
-    }
+    syncOverlayVisibilityAndContent();
   }
 }
 
-// ================= 5. REGISTO DE ATALHOS GLOBAIS PERSONALIZÁVEIS =================
 function registerConfiguredHotkeys(runtimePaths) {
   globalShortcut.unregisterAll();
 
@@ -557,10 +840,10 @@ function registerConfiguredHotkeys(runtimePaths) {
   });
 
   safeRegister(currentHotkeys.toggleOverlay, () => {
-    overlayEnabled = !overlayEnabled;
+    overlayConfig.enabled = !overlayConfig.enabled;
     createOrUpdateOverlayWindow(runtimePaths);
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('desktop:overlay-toggled', overlayEnabled);
+      mainWindow.webContents.send('desktop:overlay-toggled', overlayConfig.enabled);
     }
   });
 
@@ -571,7 +854,6 @@ function registerConfiguredHotkeys(runtimePaths) {
   });
 }
 
-// ================= 6. JANELA PRINCIPAL E HANDLERS IPC =================
 function createMainWindow(runtimePaths) {
   mainWindow = new BrowserWindow({
     width: 1366,
@@ -605,6 +887,21 @@ function createMainWindow(runtimePaths) {
     mainWindow.loadURL(LOCAL_URL);
   });
 
+  mainWindow.on('focus', () => {
+    if (!mainWindow.isFullScreen()) {
+      isExternalFullscreenActive = false;
+      syncOverlayVisibilityAndContent();
+    }
+  });
+
+  mainWindow.on('enter-full-screen', () => {
+    syncOverlayVisibilityAndContent();
+  });
+
+  mainWindow.on('leave-full-screen', () => {
+    syncOverlayVisibilityAndContent();
+  });
+
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.key === 'F5' || (input.control && input.key.toLowerCase() === 'r')) {
       mainWindow.webContents.reloadIgnoringCache();
@@ -627,23 +924,37 @@ function createMainWindow(runtimePaths) {
 }
 
 app.whenReady().then(() => {
-  const runtimePaths = ensureRuntimeBridgeFiles();
+  runtimePathsGlobal = ensureRuntimeBridgeFiles();
 
   ipcMain.on('desktop:overlay-state', (_event, payload) => {
-    lastOverlayPayload = payload || { roomName: '', users: [] };
-    createOrUpdateOverlayWindow(runtimePaths);
+    lastOverlayPayload = {
+      roomName: payload?.roomName || '',
+      isSelfStreaming: Boolean(payload?.isSelfStreaming),
+      viewersCount: Number(payload?.viewersCount || 0),
+      users: Array.isArray(payload?.users) ? payload.users : []
+    };
+    createOrUpdateOverlayWindow(runtimePathsGlobal);
   });
 
   ipcMain.on('desktop:overlay-config', (_event, cfg) => {
-    if (typeof cfg?.enabled === 'boolean') overlayEnabled = cfg.enabled;
-    if (cfg?.position) overlayPosition = cfg.position;
-    createOrUpdateOverlayWindow(runtimePaths);
+    if (cfg && typeof cfg === 'object') {
+      overlayConfig = { ...overlayConfig, ...cfg };
+    }
+    createOrUpdateOverlayWindow(runtimePathsGlobal);
+  });
+
+  ipcMain.on('desktop:overlay-lock-from-hud', () => {
+    overlayConfig.unlocked = false;
+    createOrUpdateOverlayWindow(runtimePathsGlobal);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('desktop:overlay-lock-changed', false);
+    }
   });
 
   ipcMain.handle('desktop:update-hotkeys', (_event, newHotkeys) => {
     if (newHotkeys && typeof newHotkeys === 'object') {
       currentHotkeys = { ...currentHotkeys, ...newHotkeys };
-      registerConfiguredHotkeys(runtimePaths);
+      registerConfiguredHotkeys(runtimePathsGlobal);
     }
     return { ok: true, hotkeys: currentHotkeys };
   });
@@ -681,11 +992,11 @@ app.whenReady().then(() => {
     }
   });
 
-  createMainWindow(runtimePaths);
-  createOrUpdateOverlayWindow(runtimePaths);
-  registerConfiguredHotkeys(runtimePaths);
+  createMainWindow(runtimePathsGlobal);
+  createOrUpdateOverlayWindow(runtimePathsGlobal);
+  registerConfiguredHotkeys(runtimePathsGlobal);
 
-  setInterval(checkWindowsFullscreenState, 2500);
+  setInterval(checkWindowsFullscreenState, 1500);
 });
 
 app.on('window-all-closed', () => {
