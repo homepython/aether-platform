@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const https = require('https');
-const { exec, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 // ================= 1. GERADOR AUTOMÁTICO DO ÍCONE OFICIAL (.ICO / .PNG) =================
 function ensureAppIcons() {
@@ -162,7 +162,6 @@ async function ensureWinCodeSignCache() {
       if (fs.existsSync(path.join(candidatePath, 'rcedit-x64.exe'))) {
         try {
           fs.renameSync(candidatePath, targetDir);
-          console.log('Cache do winCodeSign configurado com sucesso!');
           return;
         } catch (e) {}
       }
@@ -173,7 +172,6 @@ async function ensureWinCodeSignCache() {
   const sevenZipPath = path.join(__dirname, 'node_modules', '7zip-bin', 'win', 'x64', '7za.exe');
   const url = 'https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-2.6.0/winCodeSign-2.6.0.7z';
 
-  console.log('A preparar ferramentas de empacotamento do Windows (winCodeSign)...');
   await downloadFileFollowRedirects(url, archivePath);
   fs.mkdirSync(targetDir, { recursive: true });
 
@@ -186,18 +184,15 @@ async function ensureWinCodeSignCache() {
   try {
     fs.unlinkSync(archivePath);
   } catch (e) {}
-
-  console.log('Cache do winCodeSign preparado com sucesso (sem erros de symlink)!');
 }
 
 const iconPaths = ensureAppIcons();
 if (process.argv.includes('--generate-icon')) {
-  console.log('Ícones oficiais do Aether gerados com sucesso em public/icon.ico e public/icon.png');
   ensureWinCodeSignCache().then(() => process.exit(0)).catch(() => process.exit(0));
   return;
 }
 
-// ================= 2. PROCESSO PRINCIPAL DO ELECTRON =================
+// ================= 2. PROCESSO PRINCIPAL DO ELECTRON (SEM ROUBO DE FOCO) =================
 const {
   app,
   BrowserWindow,
@@ -218,6 +213,7 @@ if (CLOUD_URL === LOCAL_URL) {
 
 app.setAppUserModelId('com.aether.realtime');
 app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-background-timer-throttling');
@@ -228,7 +224,7 @@ let mainWindow = null;
 let overlayWindow = null;
 let runtimePathsGlobal = null;
 let usingLocalMode = false;
-let isExternalFullscreenActive = false;
+let isMainWindowFocused = true;
 let queuedNotifications = [];
 
 let overlayConfig = {
@@ -617,101 +613,37 @@ function shouldDisplayOverlayNow() {
   const hasUsers = lastOverlayPayload.users && lastOverlayPayload.users.length > 0;
   if (!hasUsers) return false;
 
+  const mainIsFullscreen = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen());
+
+  // Nunca mostra o overlay por cima da própria janela normal do Aether quando ela está em foco
+  if (isMainWindowFocused && !mainIsFullscreen) {
+    return false;
+  }
+
   if (overlayConfig.fullscreenOnly) {
-    const mainIsFullscreen = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen());
-    return Boolean(isExternalFullscreenActive || mainIsFullscreen);
+    return Boolean(!isMainWindowFocused || mainIsFullscreen);
   }
   return true;
 }
 
+// Atualiza apenas o conteúdo interno do overlay via IPC sem invocar funções Win32 que roubam foco
 function syncOverlayVisibilityAndContent() {
   if (!overlayWindow || overlayWindow.isDestroyed()) return;
 
-  if (shouldDisplayOverlayNow()) {
-    if (!overlayWindow.isVisible()) {
+  const shouldShow = shouldDisplayOverlayNow();
+  const isCurrentlyVisible = overlayWindow.isVisible();
+
+  if (shouldShow) {
+    if (!isCurrentlyVisible) {
       overlayWindow.showInactive();
     }
-    overlayWindow.setAlwaysOnTop(true, 'screen-saver');
     overlayWindow.webContents.send('overlay:render', {
       ...lastOverlayPayload,
       config: overlayConfig
     });
-  } else {
-    if (overlayWindow.isVisible()) {
-      overlayWindow.hide();
-    }
+  } else if (isCurrentlyVisible) {
+    overlayWindow.hide();
   }
-}
-
-function checkWindowsFullscreenState() {
-  if (process.platform !== 'win32') return;
-
-  const psScript = `
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class WinFg {
-  [StructLayout(LayoutKind.Sequential)]
-  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-  [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state);
-}
-"@
-$state = 0
-[WinFg]::SHQueryUserNotificationState([ref]$state) | Out-Null
-$hwnd = [WinFg]::GetForegroundWindow()
-$rect = New-Object WinFg+RECT
-[WinFg]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-Write-Output "$state|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)"
-  `.trim();
-
-  exec(
-    `powershell -NoProfile -WindowStyle Hidden -Command "${psScript.replace(/\r?\n/g, '; ').replace(/"/g, '\\"')}"`,
-    { timeout: 1400, windowsHide: true },
-    (err, stdout) => {
-      if (err || !stdout) return;
-      const parts = stdout.trim().split('|').map(Number);
-      if (parts.length < 5) return;
-      const [notifState, left, top, right, bottom] = parts;
-      const primaryBounds = screen.getPrimaryDisplay().bounds;
-      const coversPrimaryScreen =
-        left <= primaryBounds.x &&
-        top <= primaryBounds.y &&
-        (right - left) >= primaryBounds.width &&
-        (bottom - top) >= primaryBounds.height;
-
-      const mainFocusedNotFullscreen =
-        mainWindow &&
-        !mainWindow.isDestroyed() &&
-        mainWindow.isFocused() &&
-        !mainWindow.isFullScreen();
-
-      const isAppFullScreen =
-        !mainFocusedNotFullscreen &&
-        (
-          (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen()) ||
-          notifState === 2 ||
-          notifState === 3 ||
-          notifState === 4 ||
-          coversPrimaryScreen
-        );
-
-      const wasFullscreen = isExternalFullscreenActive;
-      isExternalFullscreenActive = Boolean(isAppFullScreen);
-
-      if (wasFullscreen !== isExternalFullscreenActive) {
-        syncOverlayVisibilityAndContent();
-      }
-
-      if (wasFullscreen && !isExternalFullscreenActive && queuedNotifications.length > 0) {
-        const pending = queuedNotifications.splice(0, queuedNotifications.length);
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('desktop:flushed-notifications', pending);
-        }
-      }
-    }
-  );
 }
 
 function applyOverlayWindowBounds() {
@@ -755,54 +687,66 @@ function applyOverlayWindowBounds() {
   overlayWindow.setBounds({ x: targetX, y: targetY, width: winWidth, height: winHeight });
 }
 
-function createOrUpdateOverlayWindow(runtimePaths) {
-  if (!overlayWindow || overlayWindow.isDestroyed()) {
-    overlayWindow = new BrowserWindow({
-      width: 320,
-      height: 440,
-      frame: false,
-      transparent: true,
-      resizable: false,
-      movable: true,
-      minimizable: false,
-      maximizable: false,
-      focusable: false,
-      skipTaskbar: true,
-      hasShadow: false,
-      show: false,
-      webPreferences: {
-        preload: runtimePaths.preloadPath,
-        nodeIntegration: false,
-        contextIsolation: true,
-        backgroundThrottling: false
-      }
-    });
+function ensureOverlayWindowCreated(runtimePaths) {
+  if (overlayWindow && !overlayWindow.isDestroyed()) return;
 
-    overlayWindow.setAlwaysOnTop(true, 'screen-saver');
-    overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    overlayWindow.setIgnoreMouseEvents(!overlayConfig.unlocked, { forward: true });
-    applyOverlayWindowBounds();
+  overlayWindow = new BrowserWindow({
+    width: 320,
+    height: 440,
+    frame: false,
+    transparent: true,
+    type: 'toolbar',
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    focusable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    show: false,
+    webPreferences: {
+      preload: runtimePaths.preloadPath,
+      nodeIntegration: false,
+      contextIsolation: true,
+      backgroundThrottling: false
+    }
+  });
 
-    overlayWindow.on('moved', () => {
-      if (!overlayWindow || overlayWindow.isDestroyed()) return;
-      const b = overlayWindow.getBounds();
-      overlayConfig.position = 'custom';
-      overlayConfig.customX = b.x;
-      overlayConfig.customY = b.y;
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('desktop:overlay-bounds-changed', { x: b.x, y: b.y });
-      }
-    });
+  overlayWindow.setAlwaysOnTop(true, 'screen-saver');
+  overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+  applyOverlayWindowBounds();
 
-    overlayWindow.loadFile(runtimePaths.overlayHtmlPath).then(() => {
-      syncOverlayVisibilityAndContent();
-    }).catch(() => {});
-  } else {
+  overlayWindow.on('moved', () => {
+    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+    const b = overlayWindow.getBounds();
+    overlayConfig.position = 'custom';
+    overlayConfig.customX = b.x;
+    overlayConfig.customY = b.y;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('desktop:overlay-bounds-changed', { x: b.x, y: b.y });
+    }
+  });
+
+  overlayWindow.loadFile(runtimePaths.overlayHtmlPath).then(() => {
+    syncOverlayVisibilityAndContent();
+  }).catch(() => {});
+}
+
+function updateOverlayWindowConfiguration(runtimePaths, prevUnlocked) {
+  ensureOverlayWindowCreated(runtimePaths);
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+
+  if (prevUnlocked !== overlayConfig.unlocked) {
     overlayWindow.setFocusable(Boolean(overlayConfig.unlocked));
     overlayWindow.setIgnoreMouseEvents(!overlayConfig.unlocked, { forward: true });
-    applyOverlayWindowBounds();
-    syncOverlayVisibilityAndContent();
+    if (overlayConfig.unlocked) {
+      overlayWindow.show();
+    }
   }
+
+  applyOverlayWindowBounds();
+  syncOverlayVisibilityAndContent();
 }
 
 function registerConfiguredHotkeys(runtimePaths) {
@@ -841,7 +785,7 @@ function registerConfiguredHotkeys(runtimePaths) {
 
   safeRegister(currentHotkeys.toggleOverlay, () => {
     overlayConfig.enabled = !overlayConfig.enabled;
-    createOrUpdateOverlayWindow(runtimePaths);
+    syncOverlayVisibilityAndContent();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('desktop:overlay-toggled', overlayConfig.enabled);
     }
@@ -888,10 +832,17 @@ function createMainWindow(runtimePaths) {
   });
 
   mainWindow.on('focus', () => {
-    if (!mainWindow.isFullScreen()) {
-      isExternalFullscreenActive = false;
-      syncOverlayVisibilityAndContent();
+    isMainWindowFocused = true;
+    syncOverlayVisibilityAndContent();
+    if (queuedNotifications.length > 0 && !mainWindow.isFullScreen()) {
+      const pending = queuedNotifications.splice(0, queuedNotifications.length);
+      mainWindow.webContents.send('desktop:flushed-notifications', pending);
     }
+  });
+
+  mainWindow.on('blur', () => {
+    isMainWindowFocused = false;
+    syncOverlayVisibilityAndContent();
   });
 
   mainWindow.on('enter-full-screen', () => {
@@ -926,6 +877,7 @@ function createMainWindow(runtimePaths) {
 app.whenReady().then(() => {
   runtimePathsGlobal = ensureRuntimeBridgeFiles();
 
+  // Atualização rápida de estado (quem está a falar): NUNCA altera foco nem bounds da janela
   ipcMain.on('desktop:overlay-state', (_event, payload) => {
     lastOverlayPayload = {
       roomName: payload?.roomName || '',
@@ -933,19 +885,22 @@ app.whenReady().then(() => {
       viewersCount: Number(payload?.viewersCount || 0),
       users: Array.isArray(payload?.users) ? payload.users : []
     };
-    createOrUpdateOverlayWindow(runtimePathsGlobal);
+    ensureOverlayWindowCreated(runtimePathsGlobal);
+    syncOverlayVisibilityAndContent();
   });
 
   ipcMain.on('desktop:overlay-config', (_event, cfg) => {
+    const prevUnlocked = overlayConfig.unlocked;
     if (cfg && typeof cfg === 'object') {
       overlayConfig = { ...overlayConfig, ...cfg };
     }
-    createOrUpdateOverlayWindow(runtimePathsGlobal);
+    updateOverlayWindowConfiguration(runtimePathsGlobal, prevUnlocked);
   });
 
   ipcMain.on('desktop:overlay-lock-from-hud', () => {
+    const prevUnlocked = overlayConfig.unlocked;
     overlayConfig.unlocked = false;
-    createOrUpdateOverlayWindow(runtimePathsGlobal);
+    updateOverlayWindowConfiguration(runtimePathsGlobal, prevUnlocked);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('desktop:overlay-lock-changed', false);
     }
@@ -965,7 +920,7 @@ app.whenReady().then(() => {
     if (!payload || !payload.title) return;
 
     const selfFullscreen = mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen();
-    if (isExternalFullscreenActive || selfFullscreen) {
+    if (!isMainWindowFocused || selfFullscreen) {
       queuedNotifications.push({
         title: payload.title,
         body: payload.body || '',
@@ -980,7 +935,7 @@ app.whenReady().then(() => {
         title: payload.title,
         body: payload.body || '',
         icon: iconPaths.pngPath,
-        silent: false
+        silent: true
       });
       notif.on('click', () => {
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -993,10 +948,8 @@ app.whenReady().then(() => {
   });
 
   createMainWindow(runtimePathsGlobal);
-  createOrUpdateOverlayWindow(runtimePathsGlobal);
+  ensureOverlayWindowCreated(runtimePathsGlobal);
   registerConfiguredHotkeys(runtimePathsGlobal);
-
-  setInterval(checkWindowsFullscreenState, 1500);
 });
 
 app.on('window-all-closed', () => {

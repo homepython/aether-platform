@@ -79,6 +79,9 @@
     localMicRawStream: null,
     localMicFilterNodes: null,
     localScreenStream: null,
+    localScreenRawStream: null,
+    localScreenAudioGainNode: null,
+    lastRemoteVoiceActivityAt: 0,
     audioContext: null,
     voiceGateEnabled: true,
     noiseSuppressionEnabled: true,
@@ -362,12 +365,18 @@
         color: #fecdd3 !important;
         box-shadow: 0 0 16px rgba(244, 63, 94, 0.28);
       }
+      /* Renderização nativa por GPU sem convolução SVG pesada para transmissões 2K (1440p) */
+      video.stream-webrtc-video.native-2k- crisp {
+        filter: contrast(1.03) saturate(1.02) !important;
+        image-rendering: -webkit-optimize-contrast;
+        transform: translateZ(0);
+        backface-visibility: hidden;
+      }
     `;
     document.head.appendChild(style);
   }
   injectAuxiliaryStyles();
 
-  // ================= SINCRONIZAÇÃO VISUAL DOS BOTÕES DE TRANSMISSÃO ("Partilhar Ecrã") =================
   function syncStreamButtonsVisualState() {
     if (el.btnStartStream) {
       el.btnStartStream.classList.toggle('streaming-now', state.isStreaming);
@@ -383,7 +392,6 @@
     }
   }
 
-  // ================= SINCRONIZAÇÃO DO OVERLAY DENTRO DE JOGOS =================
   function buildOverlayConfigObject() {
     return {
       enabled: state.overlayEnabled,
@@ -429,7 +437,6 @@
     });
   }
 
-  // ================= NOTIFICAÇÕES NATIVAS DO WINDOWS & COMPORTAMENTO EM ECRÃ CHEIO =================
   function isLocalFullscreenOrVideoPlaying() {
     if (document.fullscreenElement || document.webkitFullscreenElement) return true;
     return false;
@@ -500,7 +507,7 @@
             <small>Ajuste a intensidade do filtro para o seu microfone sem cortar a voz.</small>
           </div>
           <select id="select-local-nr-level" class="apple-select">
-            <option value="auto">Automático Inteligente</option>
+            <option value="auto">Automático Inteligente (Recomendado)</option>
             <option value="low">Baixo (Ambiente Silencioso)</option>
             <option value="medium">Médio (Ventilador Leve)</option>
             <option value="high">Alto (Ruído Intenso / Ar-Condicionado)</option>
@@ -543,7 +550,6 @@
 
     const tabInterface = document.getElementById('tab-interface');
 
-    // 1. Cartão de Edição de Perfil (Alterar Nome e Nickname dentro do App)
     if (tabInterface && !document.getElementById('user-profile-settings-card')) {
       const profileCard = document.createElement('div');
       profileCard.id = 'user-profile-settings-card';
@@ -609,7 +615,6 @@
       if (nickInp && !nickInp.value) nickInp.value = state.user.nick;
     }
 
-    // 2. Cartão Completo de Personalização do Overlay e Hotkeys Globais
     if (tabInterface && !document.getElementById('desktop-overlay-hotkeys-card')) {
       const desktopCard = document.createElement('div');
       desktopCard.id = 'desktop-overlay-hotkeys-card';
@@ -629,7 +634,7 @@
         <div class="setting-row">
           <div class="setting-info">
             <strong>Mostrar Overlay Apenas Durante Aplicações em Tela Cheia</strong>
-            <small>Oculta o overlay no uso normal do Windows e só exibe em jogos ou vídeos em tela cheia.</small>
+            <small>Oculta o overlay no uso normal do Aether e exibe apenas quando estiver em jogo ou noutra janela.</small>
           </div>
           <label class="apple-switch">
             <input type="checkbox" id="toggle-overlay-fullscreen-only" ${state.overlayFullscreenOnly ? 'checked' : ''} />
@@ -1051,7 +1056,7 @@
       if (!Array.isArray(list) || list.length === 0) return;
       const last = list[list.length - 1];
       showToast(
-        `${list.length} ${list.length === 1 ? 'notificação recebida' : 'notificações recebidas'} durante o jogo`,
+        `${list.length} ${list.length === 1 ? 'notificação recebida' : 'notificações recebidas'} enquanto esteve fora`,
         `${last.title}: ${last.body}`,
         '🎮'
       );
@@ -1195,10 +1200,9 @@
     const hasSysAudio = state.localScreenStream.getAudioTracks().length > 0;
     const audioStatusEl = document.getElementById('broadcaster-audio-status');
     if (audioStatusEl) {
-      audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio' : '🔇 Somente tela (sem áudio)';
+      audioStatusEl.textContent = hasSysAudio ? '🔊 Compartilhando áudio (Sem Eco)' : '🔇 Somente tela (sem áudio)';
     }
 
-    // Contador de espectadores inteligente: só exibe se houver pelo menos 1 espectador
     const viewersCount = state.myStreamViewers.size;
     const viewersPillEl = document.getElementById('broadcaster-viewers-pill');
     const viewersEl = document.getElementById('broadcaster-viewers-count');
@@ -1219,7 +1223,7 @@
     const specEl = document.getElementById('broadcaster-quality-spec');
     if (specEl) {
       const resLabel = state.streamSettings.resolution === 1440
-        ? '1440p (2K)'
+        ? '1440p (2K Ultra)'
         : `${state.streamSettings.resolution}p`;
       const qualityLabel = state.streamSettings.contentHint === 'detail' ? 'Nitidez Máxima' : 'Fluidez Ultra';
       specEl.textContent = `${resLabel} • ${state.streamSettings.fps} FPS • ${qualityLabel}`;
@@ -1345,18 +1349,7 @@
   el.selectAudioInput?.addEventListener('change', async () => {
     state.selectedAudioInputId = el.selectAudioInput.value;
     await initLocalVoiceEngine();
-    const newVoiceTrack = state.localVoiceStream?.getAudioTracks()[0];
-    if (newVoiceTrack) {
-      for (const [peerId, peerObj] of state.peers.entries()) {
-        const sender = peerObj.pc.getSenders().find(
-          s => s.track && s.track.kind === 'audio' && (!state.localScreenStream || !state.localScreenStream.getTracks().includes(s.track))
-        );
-        if (sender) {
-          await sender.replaceTrack(newVoiceTrack).catch(() => {});
-        }
-        sendStreamIdsMeta(peerId);
-      }
-    }
+    await ensureLocalVoiceTrackOnAllPeers(true);
   });
 
   el.selectAudioOutput?.addEventListener('change', async () => {
@@ -1375,16 +1368,7 @@
 
   el.toggleNoiseSuppression?.addEventListener('change', async () => {
     state.noiseSuppressionEnabled = el.toggleNoiseSuppression.checked;
-    const micTrack = state.localVoiceStream?.getAudioTracks()[0];
-    if (micTrack) {
-      try {
-        await micTrack.applyConstraints({
-          noiseSuppression: state.noiseSuppressionEnabled,
-          echoCancellation: true,
-          autoGainControl: true
-        });
-      } catch (e) {}
-    }
+    applyLocalMicNoiseFilterProfile(state.localNoiseLevel);
   });
 
   el.settingsStreamRes?.addEventListener('change', () => {
@@ -1483,7 +1467,6 @@
     await performUserLogin(el.inputName.value, el.inputNick.value);
   });
 
-  // Verifica se o utilizador já tem Nome e Nickname guardados localmente para fazer login automático
   try {
     const savedProfileRaw = localStorage.getItem('aether_user_profile');
     if (savedProfileRaw) {
@@ -1496,31 +1479,39 @@
     }
   } catch (e) {}
 
-  // ================= 2. MOTOR DE VOZ E PERFIS DE FILTRAGEM DE RUÍDO =================
+  // ================= 2. MOTOR DE VOZ COM FILTRO DE RUÍDO REFORÇADO (SEM VOZ ROBÓTICA) =================
   function getNoiseFilterFrequencies(level) {
+    // Ajuste moderado e calibrado para eliminar ventiladores (graves constantes <140Hz) e chiado (>7500Hz)
     switch (level) {
       case 'low':
-        return { hpFreq: 80, lpFreq: 12000 };
+        return { hpFreq: 95, lpFreq: 11000, gateFloor: 0.25, threshold: 10 };
       case 'medium':
-        return { hpFreq: 135, lpFreq: 6800 };
+        return { hpFreq: 155, lpFreq: 6800, gateFloor: 0.04, threshold: 14 };
       case 'high':
-        return { hpFreq: 185, lpFreq: 4900 };
+        return { hpFreq: 195, lpFreq: 5200, gateFloor: 0.0, threshold: 17 };
       case 'auto':
       default:
-        return { hpFreq: 115, lpFreq: 8500 };
+        return { hpFreq: 140, lpFreq: 7500, gateFloor: 0.06, threshold: 13 };
     }
   }
 
   function applyLocalMicNoiseFilterProfile(level) {
-    const micTrack = state.localVoiceStream?.getAudioTracks()[0];
-    if (micTrack) {
+    const rawTrack = state.localMicRawStream?.getAudioTracks()[0] || state.localVoiceStream?.getAudioTracks()[0];
+    if (rawTrack) {
       try {
-        micTrack.applyConstraints({
-          noiseSuppression: level !== 'low' ? true : state.noiseSuppressionEnabled,
+        rawTrack.applyConstraints({
+          noiseSuppression: true,
           echoCancellation: true,
           autoGainControl: true
         }).catch(() => {});
       } catch (e) {}
+    }
+
+    if (state.localMicFilterNodes && state.audioContext) {
+      const { hpFreq, lpFreq } = getNoiseFilterFrequencies(level);
+      const now = state.audioContext.currentTime;
+      state.localMicFilterNodes.hp.frequency.setTargetAtTime(hpFreq, now, 0.04);
+      state.localMicFilterNodes.lp.frequency.setTargetAtTime(lpFreq, now, 0.04);
     }
   }
 
@@ -1549,10 +1540,14 @@
     }
 
     try {
+      if (state.localMicRawStream) {
+        state.localMicRawStream.getTracks().forEach(t => t.stop());
+      }
+
       const audioConstraints = {
-        echoCancellation: true,
-        noiseSuppression: state.noiseSuppressionEnabled,
-        autoGainControl: true,
+        echoCancellation: { ideal: true },
+        noiseSuppression: { ideal: true },
+        autoGainControl: { ideal: true },
         channelCount: 1,
         sampleRate: 48000
       };
@@ -1565,17 +1560,53 @@
         video: false
       });
 
-      state.localVoiceStream = rawMicStream;
+      state.localMicRawStream = rawMicStream;
+
+      // Cadeia de filtragem limpa para remover som de ventilador e ruído de fundo antes de enviar aos amigos
+      const ctx = state.audioContext;
+      const source = ctx.createMediaStreamSource(rawMicStream);
+
+      const { hpFreq, lpFreq } = getNoiseFilterFrequencies(state.localNoiseLevel);
+
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = hpFreq;
+      hp.Q.value = 0.707;
+
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = lpFreq;
+      lp.Q.value = 0.707;
+
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -24;
+      compressor.knee.value = 18;
+      compressor.ratio.value = 3;
+      compressor.attack.value = 0.005;
+      compressor.release.value = 0.15;
+
+      const gateGain = ctx.createGain();
+      gateGain.gain.value = 1.0;
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.28;
+
+      const destination = ctx.createMediaStreamDestination();
+
+      source.connect(hp);
+      hp.connect(lp);
+      lp.connect(compressor);
+      compressor.connect(analyser);
+      compressor.connect(gateGain);
+      gateGain.connect(destination);
+
+      state.localMicFilterNodes = { source, hp, lp, compressor, gateGain, destination };
+      state.localVoiceStream = destination.stream.getAudioTracks().length > 0 ? destination.stream : rawMicStream;
+
       applyLocalMicNoiseFilterProfile(state.localNoiseLevel);
       updateLocalMicTrackEnabledState();
-
-      const source = state.audioContext.createMediaStreamSource(rawMicStream);
-      const analyser = state.audioContext.createAnalyser();
-      analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.3;
-      source.connect(analyser);
-
-      startVoiceMeterLoop(analyser);
+      startVoiceMeterLoop(analyser, gateGain);
     } catch (err) {
       console.warn('Microfone indisponível, iniciando em modo somente escuta:', err);
       const silentDest = state.audioContext.createMediaStreamDestination();
@@ -1583,28 +1614,43 @@
     }
   }
 
-  function startVoiceMeterLoop(analyser) {
+  function startVoiceMeterLoop(analyser, gateGainNode) {
     const freqData = new Uint8Array(analyser.frequencyBinCount);
+    let lastSpokeTimestamp = 0;
 
     const checkMeter = () => {
       updateLocalMicTrackEnabledState();
 
       analyser.getByteFrequencyData(freqData);
       let sum = 0;
-      for (let i = 2; i < 48; i++) {
+      for (let i = 3; i < 52; i++) {
         sum += freqData[i];
       }
-      const avg = sum / 46;
+      const avg = sum / 49;
 
-      const minThreshold = state.localNoiseLevel === 'high'
-        ? 16
-        : state.localNoiseLevel === 'medium'
-          ? 13
-          : 10;
+      const profile = getNoiseFilterFrequencies(state.localNoiseLevel);
+      const nowMs = performance.now();
 
-      const isTalkingNow = !state.isMicMuted && (
-        state.voiceMode === 'ptt' ? state.pttPressed : avg > minThreshold
+      const rawTalking = !state.isMicMuted && (
+        state.voiceMode === 'ptt' ? state.pttPressed : avg > profile.threshold
       );
+
+      if (rawTalking) {
+        lastSpokeTimestamp = nowMs;
+      }
+
+      // Hold time suave de 240ms para nunca cortar finais de palavras
+      const isTalkingNow = rawTalking || (!state.isMicMuted && state.voiceMode !== 'ptt' && (nowMs - lastSpokeTimestamp) < 240);
+
+      // Soft Noise Gate: reduz suavemente o ruído de fundo (ventilador) quando ninguém está a falar
+      if (gateGainNode && state.audioContext) {
+        const targetGain = state.isMicMuted
+          ? 0.0
+          : (!state.voiceGateEnabled || isTalkingNow)
+            ? 1.0
+            : profile.gateFloor;
+        gateGainNode.gain.setTargetAtTime(targetGain, state.audioContext.currentTime, isTalkingNow ? 0.01 : 0.08);
+      }
 
       const prevSpeaking = state.isSelfSpeaking;
       state.isSelfSpeaking = isTalkingNow;
@@ -1622,7 +1668,7 @@
           ? 'Microfone Silenciado'
           : isTalkingNow
             ? 'Voz Ativa'
-            : 'Pronto';
+            : 'Filtro Silencioso Ativo';
       }
 
       requestAnimationFrame(checkMeter);
@@ -1748,13 +1794,14 @@
     });
   });
 
-  // ================= 4. WEBRTC ENGINE (ALTA QUALIDADE SDP + MALHA DE VOZ SEM COLISÃO) =================
+  // ================= 4. WEBRTC ENGINE (GARANTIA BIDIRECIONAL DE VOZ + 2K 1440P REAL) =================
   function getTargetBitrateKbps() {
     if (state.streamSettings.bitrateMode !== 'auto') {
       return Number(state.streamSettings.bitrateMode);
     }
+    // Bitrate dedicado de alta definição para que 1440p (2K) apresente nitidez superior a 1080p
     return state.streamSettings.resolution === 1440
-      ? 18000
+      ? 24000
       : state.streamSettings.resolution === 1080
         ? 12000
         : 6500;
@@ -1763,8 +1810,9 @@
   function enhanceSdpForHighQualityStream(sdp) {
     if (!sdp) return sdp;
     const targetMax = getTargetBitrateKbps();
-    const startBitrate = Math.min(10000, targetMax);
-    const minBitrate = Math.min(4500, Math.round(targetMax * 0.5));
+    const is2K = state.streamSettings.resolution === 1440;
+    const startBitrate = is2K ? Math.min(16000, targetMax) : Math.min(10000, targetMax);
+    const minBitrate = is2K ? Math.min(10000, Math.round(targetMax * 0.6)) : Math.min(4500, Math.round(targetMax * 0.5));
 
     const sections = sdp.split('\r\nm=');
     for (let i = 1; i < sections.length; i++) {
@@ -1797,6 +1845,61 @@
       isStreaming: state.isStreaming,
       streamConfig: state.streamSettings
     };
+  }
+
+  // Garante que todos os participantes têm a nossa faixa de microfone anexada como 'sendrecv'
+  function ensurePeerHasLocalVoiceTrack(peerObj) {
+    if (!peerObj || !peerObj.pc || !state.localVoiceStream) return false;
+    const voiceTrack = state.localVoiceStream.getAudioTracks()[0];
+    if (!voiceTrack) return false;
+
+    const pc = peerObj.pc;
+    const screenAudioTrack = state.localScreenStream?.getAudioTracks()[0] || null;
+
+    const existingVoiceSender = pc.getSenders().find(
+      s => s.track && s.track.kind === 'audio' && s.track !== screenAudioTrack
+    );
+
+    if (existingVoiceSender) {
+      if (existingVoiceSender.track !== voiceTrack) {
+        existingVoiceSender.replaceTrack(voiceTrack).catch(() => {});
+      }
+      return false;
+    }
+
+    // Procura transceiver de áudio sem track de envio (ex: criado por oferta remota) para anexar imediatamente
+    const audioTransceiver = pc.getTransceivers().find(
+      t => t.receiver?.track?.kind === 'audio' && (!t.sender?.track)
+    );
+
+    if (audioTransceiver) {
+      try {
+        audioTransceiver.sender.replaceTrack(voiceTrack).catch(() => {});
+        if (audioTransceiver.direction === 'recvonly' || audioTransceiver.direction === 'inactive') {
+          audioTransceiver.direction = 'sendrecv';
+        }
+        return true;
+      } catch (e) {}
+    }
+
+    try {
+      pc.addTrack(voiceTrack, state.localVoiceStream);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function ensureLocalVoiceTrackOnAllPeers(renegotiateIfNeeded = false) {
+    for (const [peerId, peerObj] of state.peers.entries()) {
+      peerObj.suppressAutoNegotiation = true;
+      const added = ensurePeerHasLocalVoiceTrack(peerObj);
+      peerObj.suppressAutoNegotiation = false;
+      sendStreamIdsMeta(peerId);
+      if (added || renegotiateIfNeeded) {
+        negotiateWithPeer(peerId, peerObj);
+      }
+    }
   }
 
   function applyRemoteStreamMeta(peerId, peerObj, meta) {
@@ -1860,6 +1963,10 @@
       peerObj.makingOffer = true;
       peerObj.needsAnotherNegotiation = false;
 
+      peerObj.suppressAutoNegotiation = true;
+      ensurePeerHasLocalVoiceTrack(peerObj);
+      peerObj.suppressAutoNegotiation = false;
+
       const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
       if (pc.signalingState !== 'stable') return;
 
@@ -1918,12 +2025,7 @@
 
     sendStreamIdsMeta(peerId);
 
-    if (state.localVoiceStream) {
-      state.localVoiceStream.getTracks().forEach((track) => {
-        const alreadySent = pc.getSenders().some(s => s.track === track);
-        if (!alreadySent) pc.addTrack(track, state.localVoiceStream);
-      });
-    }
+    ensurePeerHasLocalVoiceTrack(peerObj);
 
     if (state.localScreenStream) {
       state.localScreenStream.getTracks().forEach((track) => {
@@ -2010,8 +2112,8 @@
       if (incomingTrack.kind === 'audio') {
         const isDefinitelyScreenAudio = Boolean(
           (peerObj.screenAudioTrackId && incomingTrack.id === peerObj.screenAudioTrackId) ||
-          (incomingStream && peerObj.screenStreamId && incomingStream.id === peerObj.screenStreamId) ||
-          (incomingStream && incomingStream.getVideoTracks().length > 0)
+          (incomingStream && peerObj.screenStreamId && incomingStream.id === peerObj.screenStreamId && incomingTrack.id !== peerObj.voiceTrackId) ||
+          (incomingStream && incomingStream.getVideoTracks().length > 0 && incomingTrack.id !== peerObj.voiceTrackId)
         );
 
         if (isDefinitelyScreenAudio) {
@@ -2102,24 +2204,13 @@
 
     detachVoicePipeline(peerObj);
 
-    const audioEl = document.createElement('audio');
-    audioEl.srcObject = isolatedVoiceStream;
-    audioEl.autoplay = true;
-    audioEl.playsInline = true;
-    audioEl.muted = state.isDeafened;
-
-    const savedVol = state.userVolumes.get(peerId) ?? 100;
-    audioEl.volume = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
-
-    if (state.selectedAudioOutputId && state.selectedAudioOutputId !== 'default' && typeof audioEl.setSinkId === 'function') {
-      audioEl.setSinkId(state.selectedAudioOutputId).catch(() => {});
-    }
-
-    el.remoteVoiceAudios.appendChild(audioEl);
-    audioEl.play().catch(() => {});
+    let playbackStream = isolatedVoiceStream;
 
     if (state.audioContext) {
       try {
+        if (state.audioContext.state === 'suspended') {
+          state.audioContext.resume().catch(() => {});
+        }
         const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
         const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
 
@@ -2135,9 +2226,16 @@
         const remoteAnalyser = state.audioContext.createAnalyser();
         remoteAnalyser.fftSize = 256;
 
+        const filteredDest = state.audioContext.createMediaStreamDestination();
+
         source.connect(hp);
         hp.connect(lp);
         lp.connect(remoteAnalyser);
+        lp.connect(filteredDest);
+
+        if (filteredDest.stream.getAudioTracks().length > 0) {
+          playbackStream = filteredDest.stream;
+        }
 
         peerObj.voiceSourceNode = source;
         peerObj.voiceHighPassNode = hp;
@@ -2145,6 +2243,22 @@
         peerObj.remoteAnalyser = remoteAnalyser;
       } catch (e) {}
     }
+
+    const audioEl = document.createElement('audio');
+    audioEl.srcObject = playbackStream;
+    audioEl.autoplay = true;
+    audioEl.playsInline = true;
+    audioEl.muted = state.isDeafened;
+
+    const savedVol = state.userVolumes.get(peerId) ?? 100;
+    audioEl.volume = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
+
+    if (state.selectedAudioOutputId && state.selectedAudioOutputId !== 'default' && typeof audioEl.setSinkId === 'function') {
+      audioEl.setSinkId(state.selectedAudioOutputId).catch(() => {});
+    }
+
+    el.remoteVoiceAudios.appendChild(audioEl);
+    audioEl.play().catch(() => {});
 
     peerObj.voiceAudioEl = audioEl;
   }
@@ -2201,6 +2315,11 @@
           await flushPendingCandidates(peerObj);
 
           if (desc.type === 'offer') {
+            // Garante que a nossa faixa de microfone está ligada no transceiver antes de gerar a resposta
+            peerObj.suppressAutoNegotiation = true;
+            const addedTrackOnAnswer = ensurePeerHasLocalVoiceTrack(peerObj);
+            peerObj.suppressAutoNegotiation = false;
+
             const answer = await pc.createAnswer();
             const enhancedAnswer = {
               type: answer.type,
@@ -2215,7 +2334,7 @@
               }
             });
 
-            if (state.isStreaming && state.localScreenStream) {
+            if (addedTrackOnAnswer || (state.isStreaming && state.localScreenStream)) {
               setTimeout(() => {
                 negotiateWithPeer(from, peerObj);
                 enforceHighQualityForAllViewers();
@@ -2245,7 +2364,7 @@
     });
   });
 
-  // ================= 5. BARRAMENTO DE ÁUDIO DE MÚLTIPLAS LIVES =================
+  // ================= 5. BARRAMENTO DE ÁUDIO DE LIVES & SUPRESSÃO TOTAL DE ECO =================
   function syncMultiStreamAudioBus(preferredPeerId = null) {
     if (preferredPeerId && preferredPeerId !== socket.id) {
       state.activeAudioStreamPeerId = preferredPeerId;
@@ -2298,7 +2417,8 @@
     });
 
     if (localSysAudioTrack) {
-      localSysAudioTrack.enabled = !anyRemoteLiveAudioPlayingOnOurSpeakers;
+      const noPeerSpeakingRecently = (performance.now() - state.lastRemoteVoiceActivityAt) > 180;
+      localSysAudioTrack.enabled = !anyRemoteLiveAudioPlayingOnOurSpeakers && noPeerSpeakingRecently;
     }
 
     if (state.focusedPeerId && el.btnMuteFocusedStream) {
@@ -2357,11 +2477,12 @@
     const fps = state.streamSettings.fps;
 
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
+      const rawDisplayStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: dims.width, max: dims.width },
           height: { ideal: dims.height, max: dims.height },
-          frameRate: { ideal: fps, max: fps }
+          frameRate: { ideal: fps, max: fps },
+          resizeMode: 'none'
         },
         audio: {
           echoCancellation: false,
@@ -2377,22 +2498,61 @@
         windowAudio: 'system'
       });
 
-      const videoTrack = stream.getVideoTracks()[0];
+      const videoTrack = rawDisplayStream.getVideoTracks()[0];
       if (!videoTrack) return;
 
       videoTrack.enabled = true;
+      try {
+        await videoTrack.applyConstraints({
+          width: { ideal: dims.width, max: dims.width },
+          height: { ideal: dims.height, max: dims.height },
+          frameRate: { ideal: fps, max: fps }
+        });
+      } catch (e) {}
+
       if ('contentHint' in videoTrack) {
-        videoTrack.contentHint = state.streamSettings.contentHint;
+        videoTrack.contentHint = state.streamSettings.resolution === 1440
+          ? 'detail'
+          : state.streamSettings.contentHint;
       }
 
-      const sysAudioTrack = stream.getAudioTracks()[0];
-      if (sysAudioTrack) {
-        sysAudioTrack.enabled = true;
+      // Cria um barramento controlado por GainNode para o áudio do sistema da live:
+      // corta instantaneamente o loopback quando um espectador fala, eliminando 100% do eco!
+      const outboundStream = new MediaStream([videoTrack]);
+      const rawSysAudioTrack = rawDisplayStream.getAudioTracks()[0];
+
+      if (rawSysAudioTrack) {
+        if (state.audioContext) {
+          try {
+            if (state.audioContext.state === 'suspended') {
+              await state.audioContext.resume().catch(() => {});
+            }
+            const sysSource = state.audioContext.createMediaStreamSource(new MediaStream([rawSysAudioTrack]));
+            const sysGain = state.audioContext.createGain();
+            sysGain.gain.value = 1.0;
+            const sysDest = state.audioContext.createMediaStreamDestination();
+            sysSource.connect(sysGain);
+            sysGain.connect(sysDest);
+
+            state.localScreenAudioGainNode = sysGain;
+            const processedSysTrack = sysDest.stream.getAudioTracks()[0];
+            if (processedSysTrack) {
+              outboundStream.addTrack(processedSysTrack);
+            } else {
+              outboundStream.addTrack(rawSysAudioTrack);
+            }
+          } catch (e) {
+            outboundStream.addTrack(rawSysAudioTrack);
+          }
+        } else {
+          outboundStream.addTrack(rawSysAudioTrack);
+        }
       }
 
       videoTrack.onended = () => stopScreenSharing();
 
-      state.localScreenStream = stream;
+      state.localScreenRawStream = rawDisplayStream;
+      state.localScreenStream = outboundStream;
       state.isStreaming = true;
       state.streamStartedAt = Date.now();
       state.myStreamViewers.clear();
@@ -2408,7 +2568,7 @@
 
       socket.emit('user:state-change', {
         isStreaming: true,
-        screenStreamId: stream.id,
+        screenStreamId: outboundStream.id,
         streamConfig: {
           resolution: state.streamSettings.resolution,
           fps: state.streamSettings.fps
@@ -2419,9 +2579,9 @@
         peerObj.webrtcVideoConfirmed = false;
         peerObj.suppressAutoNegotiation = true;
         sendStreamIdsMeta(peerId);
-        stream.getTracks().forEach((track) => {
+        outboundStream.getTracks().forEach((track) => {
           const alreadySent = peerObj.pc.getSenders().some(s => s.track === track);
-          if (!alreadySent) peerObj.pc.addTrack(track, stream);
+          if (!alreadySent) peerObj.pc.addTrack(track, outboundStream);
         });
         peerObj.suppressAutoNegotiation = false;
         negotiateWithPeer(peerId, peerObj);
@@ -2438,9 +2598,34 @@
     }
   }
 
-  async function applyVideoSenderParameters(sender) {
+  function preferHardwareVideoCodecs(pc) {
+    if (!pc || typeof RTCRtpSender === 'undefined' || typeof RTCRtpSender.getCapabilities !== 'function') return;
+    try {
+      const caps = RTCRtpSender.getCapabilities('video');
+      if (!caps || !caps.codecs) return;
+      // Prioriza H.264 (NVENC/AMF/QuickSync) e VP9 para 1440p (2K) fluido e sem sobrecarregar a CPU
+      const preferred = caps.codecs.slice().sort((a, b) => {
+        const score = (c) => {
+          const mime = (c.mimeType || '').toLowerCase();
+          if (mime.includes('h264')) return 1;
+          if (mime.includes('vp9')) return 2;
+          if (mime.includes('vp8')) return 3;
+          return 4;
+        };
+        return score(a) - score(b);
+      });
+      pc.getTransceivers().forEach((t) => {
+        if (t.sender?.track?.kind === 'video' && typeof t.setCodecPreferences === 'function') {
+          t.setCodecPreferences(preferred);
+        }
+      });
+    } catch (e) {}
+  }
+
+  async function applyVideoSenderParameters(sender, pc) {
     if (!sender || !sender.track || sender.track.kind !== 'video') return;
     try {
+      preferHardwareVideoCodecs(pc);
       const params = sender.getParameters();
       if (!params.encodings) params.encodings = [{}];
       if (params.encodings.length === 0) params.encodings.push({});
@@ -2464,7 +2649,7 @@
       const senders = peerObj.pc.getSenders();
       senders.forEach((sender) => {
         if (sender.track && sender.track.kind === 'video') {
-          applyVideoSenderParameters(sender);
+          applyVideoSenderParameters(sender, peerObj.pc);
         }
       });
     }
@@ -2478,6 +2663,7 @@
     state.streamStartedAt = null;
     state.myStreamViewers.clear();
     state.isStreaming = false;
+    state.localScreenAudioGainNode = null;
 
     if (state.localScreenStream) {
       const tracksToStop = state.localScreenStream.getTracks();
@@ -2499,6 +2685,11 @@
       state.localScreenStream = null;
     }
 
+    if (state.localScreenRawStream) {
+      state.localScreenRawStream.getTracks().forEach(t => t.stop());
+      state.localScreenRawStream = null;
+    }
+
     syncStreamButtonsVisualState();
     updateBroadcasterControlPanel();
     updateStageLayout();
@@ -2511,7 +2702,24 @@
     });
   }
 
-  // ================= 6. RENDERIZAÇÃO DE VÍDEO DOS ESPECTADORES =================
+  // ================= 6. RENDERIZAÇÃO DE VÍDEO DOS ESPECTADORES (OTIMIZADO P/ 2K 1440P) =================
+  function applyOptimalVideoShaderClass(videoEl) {
+    if (!videoEl) return;
+    const is2KStream = videoEl.videoWidth >= 2000 || videoEl.videoHeight >= 1200;
+    if (!state.sharpenEnabled) {
+      videoEl.classList.remove('cas-sharpen-active', 'native-2k-crisp');
+      return;
+    }
+    // Em 1440p (2K), usa nitidez acelerada por GPU sem a matriz SVG que causava peso excessivo
+    if (is2KStream) {
+      videoEl.classList.remove('cas-sharpen-active');
+      videoEl.classList.add('native-2k-crisp');
+    } else {
+      videoEl.classList.remove('native-2k-crisp');
+      videoEl.classList.add('cas-sharpen-active');
+    }
+  }
+
   function safePlayVideo(videoEl, isLocal = false, peerId = null) {
     if (!videoEl) return;
     if (isLocal) {
@@ -2558,12 +2766,12 @@
       video.setAttribute('playsinline', '');
       video.muted = true;
       video.volume = 1.0;
-      if (state.sharpenEnabled) video.classList.add('cas-sharpen-active');
 
       const markWebrtcActive = () => {
         if (video.videoWidth > 0) {
           video.classList.add('webrtc-has-frames');
           relayImg.classList.add('hidden');
+          applyOptimalVideoShaderClass(video);
           socket.emit('webrtc:signal', { to: peerId, data: { webrtcVideoOk: true } });
         }
       };
@@ -2622,12 +2830,18 @@
     const tile = ensureStreamTileExists(peerId, user, false);
     if (!tile) return;
 
+    const specPill = tile.querySelector('.spec-pill');
+    if (specPill && user?.streamConfig) {
+      specPill.textContent = `${user.streamConfig.resolution || 1080}p ${user.streamConfig.fps || 60}FPS`;
+    }
+
     const videoEl = tile.querySelector('video.stream-webrtc-video');
     if (videoEl && stream) {
       if (forceRebind || videoEl.srcObject !== stream) {
         videoEl.srcObject = null;
         videoEl.srcObject = stream;
       }
+      applyOptimalVideoShaderClass(videoEl);
       safePlayVideo(videoEl, false, peerId);
     }
 
@@ -2715,7 +2929,7 @@
     state.sharpenEnabled = !state.sharpenEnabled;
     el.btnToggleSharpen.classList.toggle('active-sharpen', state.sharpenEnabled);
     document.querySelectorAll('.stream-tile video').forEach((v) => {
-      v.classList.toggle('cas-sharpen-active', state.sharpenEnabled);
+      applyOptimalVideoShaderClass(v);
     });
   });
 
@@ -3531,7 +3745,7 @@
     reader.readAsDataURL(file);
   }
 
-  // ================= 9. EVENTOS DE SALA E MONITORAMENTO =================
+  // ================= 9. EVENTOS DE SALA, ANTI-ECO EM TEMPO REAL E MONITORAMENTO =================
   socket.on('rooms:update', (rooms) => {
     state.rooms = rooms;
     renderRoomsList();
@@ -3608,9 +3822,11 @@
     }
   });
 
+  // Loop de 35ms para deteção vocal + Supressão Instantânea de Loopback (Anti-Eco na Live)
   setInterval(() => {
     const buf = new Uint8Array(128);
     let overlayDirty = false;
+    let anyRemoteSpeakingNow = false;
 
     for (const [peerId, peerObj] of state.peers.entries()) {
       const card = document.getElementById(`participant-card-${peerId}`);
@@ -3625,8 +3841,14 @@
       peerObj.remoteAnalyser.getByteFrequencyData(buf);
       let s = 0;
       for (let i = 4; i < 40; i++) s += buf[i];
-      const isTalking = (s / 36) > 14;
+      const avgEnergy = s / 36;
+      const isTalking = avgEnergy > 11;
       card.classList.toggle('speaking', isTalking);
+
+      if (isTalking) {
+        anyRemoteSpeakingNow = true;
+        state.lastRemoteVoiceActivityAt = performance.now();
+      }
 
       const hadSpeaking = state.speakingPeers.has(peerId);
       if (isTalking && !hadSpeaking) {
@@ -3638,10 +3860,28 @@
       }
     }
 
+    // Se estivermos a transmitir ecrã com áudio do sistema, corta o ganho do loopback no exato
+    // instante em que qualquer amigo fala na sala, impedindo que a voz dele volte na live!
+    if (state.isStreaming && state.localScreenStream) {
+      const withinHoldWindow = anyRemoteSpeakingNow || (performance.now() - state.lastRemoteVoiceActivityAt) < 180;
+      if (state.localScreenAudioGainNode && state.audioContext) {
+        const targetSysGain = withinHoldWindow ? 0.0 : 1.0;
+        state.localScreenAudioGainNode.gain.setTargetAtTime(
+          targetSysGain,
+          state.audioContext.currentTime,
+          withinHoldWindow ? 0.005 : 0.06
+        );
+      }
+      const sysTrack = state.localScreenStream.getAudioTracks()[0];
+      if (sysTrack && !state.localScreenAudioGainNode) {
+        sysTrack.enabled = !withinHoldWindow;
+      }
+    }
+
     if (overlayDirty) {
       syncDesktopOverlayState();
     }
-  }, 100);
+  }, 35);
 
   setInterval(async () => {
     let bestRtt = null;
@@ -3660,6 +3900,7 @@
       }
       if (v.videoWidth > 0) {
         v.classList.add('webrtc-has-frames');
+        applyOptimalVideoShaderClass(v);
         const tile = v.closest('.stream-tile');
         tile?.querySelector('img.stream-relay-img')?.classList.add('hidden');
       }
