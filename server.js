@@ -1,342 +1,364 @@
+'use strict';
+
 const express = require('express');
 const http = require('http');
-const https = require('https');
-const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
+const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  maxHttpBufferSize: 1e8, // 100 MB para envio de ficheiros
-  pingInterval: 5000,
-  pingTimeout: 10000,
-  cors: { origin: '*' }
+  cors: { origin: '*' },
+  maxHttpBufferSize: 75 * 1024 * 1024,
+  pingTimeout: 25000,
+  pingInterval: 10000
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const RELEASE_VERSION = '1.0.0';
+const GITHUB_RELEASE_EXE_URL =
+  process.env.AETHER_DOWNLOAD_URL ||
+  'https://github.com/homepython/aether-platform/releases/latest/download/Aether-Setup-1.0.0.exe';
 
-// Rota de Healthcheck para manter o servidor Cloud gratuito ativo
-app.get('/health', (req, res) => {
-  res.status(200).json({ ok: true, status: 'online', timestamp: Date.now() });
-});
-
-// Persistência em disco para que salas e mensagens continuem acessíveis
-const DATA_DIR = path.join(__dirname, 'data');
-const STATE_FILE = path.join(DATA_DIR, 'aether-state.json');
-const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
-
+// ================= ESTADO UNIFICADO (DESKTOP + WEB) =================
+const users = new Map();
 const rooms = new Map();
 
-function ensureDefaultRooms() {
+function createDefaultRooms() {
   const defaults = [
-    { id: 'lobby-principal', name: 'Lobby Principal', isPrivate: false, password: null },
-    { id: 'arena-competitiva', name: 'Arena Competitiva (2K 60FPS)', isPrivate: false, password: null },
-    { id: 'cinema-squad', name: 'Cinema & Watch Party', isPrivate: false, password: null }
+    { id: 'lobby-principal', name: 'Lobby Principal', isPrivate: false, password: '' },
+    { id: 'gaming-squad', name: 'Gaming & Squad', isPrivate: false, password: '' },
+    { id: 'cinema-2k', name: 'Cinema & Lives 2K', isPrivate: false, password: '' }
   ];
-  defaults.forEach((d) => {
-    if (!rooms.has(d.id)) {
-      rooms.set(d.id, {
-        id: d.id,
-        name: d.name,
-        isPrivate: d.isPrivate,
-        password: d.password,
-        users: new Map(),
-        messages: []
-      });
-    }
+  defaults.forEach((r) => {
+    rooms.set(r.id, {
+      id: r.id,
+      name: r.name,
+      isPrivate: r.isPrivate,
+      password: r.password,
+      users: new Map(),
+      messages: []
+    });
   });
 }
+createDefaultRooms();
 
-function loadPersistentState() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed.rooms)) {
-        parsed.rooms.forEach((r) => {
-          rooms.set(r.id, {
-            id: r.id,
-            name: r.name,
-            isPrivate: Boolean(r.isPrivate),
-            password: r.password || null,
-            users: new Map(),
-            messages: Array.isArray(r.messages) ? r.messages.slice(-100) : []
-          });
-        });
-      }
-    }
-  } catch (err) {
-    console.warn('Aviso ao carregar estado persistente:', err.message);
-  }
-  ensureDefaultRooms();
-}
-
-let saveTimeout = null;
-function scheduleSavePersistentState() {
-  if (saveTimeout) clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(() => {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      const serializableRooms = [];
-      for (const [, room] of rooms.entries()) {
-        serializableRooms.push({
-          id: room.id,
-          name: room.name,
-          isPrivate: room.isPrivate,
-          password: room.password,
-          // Preserva as últimas 80 mensagens da sala
-          messages: room.messages.slice(-80)
-        });
-      }
-      fs.writeFileSync(STATE_FILE, JSON.stringify({ rooms: serializableRooms }, null, 2), 'utf-8');
-    } catch (err) {
-      console.warn('Aviso ao guardar estado:', err.message);
-    }
-  }, 600);
-}
-
-loadPersistentState();
-
-function serializeRoomList() {
+function serializeRooms() {
   const list = [];
   for (const [, room] of rooms.entries()) {
+    const roomUsers = Array.from(room.users.values()).map((u) => ({
+      socketId: u.socketId,
+      name: u.name,
+      nick: u.nick,
+      avatarColor: u.avatarColor,
+      isMuted: Boolean(u.isMuted),
+      isDeafened: Boolean(u.isDeafened),
+      isStreaming: Boolean(u.isStreaming),
+      voiceStreamId: u.voiceStreamId || null,
+      screenStreamId: u.screenStreamId || null,
+      streamConfig: u.streamConfig || null
+    }));
     list.push({
       id: room.id,
       name: room.name,
       isPrivate: room.isPrivate,
-      userCount: room.users.size,
-      users: Array.from(room.users.values()).map(u => ({
-        socketId: u.socketId,
-        name: u.name,
-        nick: u.nick,
-        avatarColor: u.avatarColor,
-        isMuted: u.isMuted,
-        isDeafened: u.isDeafened,
-        isStreaming: u.isStreaming,
-        voiceStreamId: u.voiceStreamId || null,
-        screenStreamId: u.screenStreamId || null,
-        streamConfig: u.streamConfig
-      }))
+      userCount: roomUsers.length,
+      users: roomUsers
     });
   }
   return list;
 }
 
-io.on('connection', (socket) => {
-  let currentUser = null;
-  let currentRoomId = null;
+// ================= ROTAS DO SITE OFICIAL, VERSÃO WEB E DOWNLOAD =================
+app.get('/api/status', (_req, res) => {
+  let activeStreams = 0;
+  for (const [, u] of users.entries()) {
+    if (u.isStreaming) activeStreams += 1;
+  }
+  res.json({
+    ok: true,
+    version: RELEASE_VERSION,
+    onlineUsers: users.size,
+    totalRooms: rooms.size,
+    activeStreams,
+    serverStatus: 'online'
+  });
+});
 
-  socket.on('user:register', ({ name, nick, avatarColor }, callback) => {
-    currentUser = {
+app.get('/download/windows', (_req, res) => {
+  const localInstaller = path.join(PUBLIC_DIR, 'downloads', 'Aether-Setup.exe');
+  if (fs.existsSync(localInstaller)) {
+    res.download(localInstaller, `Aether-Setup-${RELEASE_VERSION}.exe`);
+    return;
+  }
+  res.redirect(302, GITHUB_RELEASE_EXE_URL);
+});
+
+// Rota da Versão Web (Abre o aplicativo diretamente no navegador)
+app.get('/app', (_req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
+
+// Rota explícita do Site Oficial
+app.get('/site', (_req, res) => {
+  const landingPath = path.join(PUBLIC_DIR, 'landing.html');
+  if (fs.existsSync(landingPath)) {
+    res.sendFile(landingPath);
+  } else {
+    res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+  }
+});
+
+// Rota Principal Inteligente:
+// - Se for o Aplicativo Desktop (Electron) ou tiver ?app=1, abre o aplicativo direto.
+// - Se for um visitante no navegador, exibe o Site Oficial + Página de Download.
+app.get('/', (req, res) => {
+  const ua = String(req.headers['user-agent'] || '');
+  const isElectronDesktop = ua.includes('Electron');
+  const forceWebApp = req.query.app === '1' || req.query.mode === 'web';
+  const landingPath = path.join(PUBLIC_DIR, 'landing.html');
+
+  if (isElectronDesktop || forceWebApp || !fs.existsSync(landingPath)) {
+    res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+    return;
+  }
+  res.sendFile(landingPath);
+});
+
+// Serve os recursos estáticos (CSS, JS, ícones) sem sobrescrever a rota '/'
+app.use(express.static(PUBLIC_DIR, { index: false }));
+
+// ================= MOTOR SOCKET.IO (PARTILHADO ENTRE DESKTOP E WEB) =================
+io.on('connection', (socket) => {
+  socket.on('user:register', (payload, cb) => {
+    const cleanName = String(payload?.name || 'Utilizador').trim().slice(0, 28) || 'Utilizador';
+    const cleanNick = String(payload?.nick || 'user').trim().replace(/[^a-zA-Z0-9_]/g, '').toLowerCase().slice(0, 20) || 'user';
+    const avatarColor = String(payload?.avatarColor || '#5E81F4');
+
+    const existing = users.get(socket.id) || {};
+    const userObj = {
+      ...existing,
       socketId: socket.id,
-      name: String(name || 'Utilizador').trim(),
-      nick: String(nick || 'user').trim().replace(/^@/, '').replace(/\s+/g, '_').toLowerCase(),
-      avatarColor: avatarColor || '#5E81F4',
-      isMuted: false,
-      isDeafened: false,
-      isStreaming: false,
-      voiceStreamId: null,
-      screenStreamId: null,
-      streamConfig: null
+      name: cleanName,
+      nick: cleanNick,
+      avatarColor,
+      roomId: existing.roomId || null,
+      isMuted: Boolean(existing.isMuted),
+      isDeafened: Boolean(existing.isDeafened),
+      isStreaming: Boolean(existing.isStreaming),
+      voiceStreamId: existing.voiceStreamId || null,
+      screenStreamId: existing.screenStreamId || null,
+      streamConfig: existing.streamConfig || null
     };
-    callback?.({ ok: true, user: currentUser, rooms: serializeRoomList() });
+
+    users.set(socket.id, userObj);
+
+    if (typeof cb === 'function') {
+      cb({
+        ok: true,
+        user: userObj,
+        rooms: serializeRooms()
+      });
+    }
+    io.emit('rooms:update', serializeRooms());
   });
 
-  socket.on('room:create', ({ name, isPrivate, password }, callback) => {
-    if (!name || !name.trim()) return callback?.({ ok: false, error: 'Nome inválido.' });
-    const id = 'room-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
-    rooms.set(id, {
-      id,
-      name: name.trim(),
+  socket.on('room:create', ({ name, isPrivate, password }, cb) => {
+    const user = users.get(socket.id);
+    if (!user) return cb?.({ ok: false, error: 'Utilizador não autenticado.' });
+
+    const cleanRoomName = String(name || '').trim().slice(0, 36);
+    if (cleanRoomName.length < 2) {
+      return cb?.({ ok: false, error: 'Nome de sala inválido.' });
+    }
+
+    const roomId =
+      cleanRoomName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '') +
+      '-' +
+      Math.random().toString(36).slice(2, 6);
+
+    rooms.set(roomId, {
+      id: roomId,
+      name: cleanRoomName,
       isPrivate: Boolean(isPrivate),
-      password: isPrivate ? String(password || '') : null,
+      password: Boolean(isPrivate) ? String(password || '') : '',
       users: new Map(),
       messages: []
     });
-    scheduleSavePersistentState();
-    io.emit('rooms:update', serializeRoomList());
-    callback?.({ ok: true, roomId: id });
+
+    io.emit('rooms:update', serializeRooms());
+    cb?.({ ok: true, roomId });
   });
 
-  socket.on('room:join', ({ roomId, password }, callback) => {
-    if (!currentUser) return callback?.({ ok: false, error: 'Utilizador não autenticado.' });
+  socket.on('room:join', ({ roomId, password }, cb) => {
+    const user = users.get(socket.id);
     const targetRoom = rooms.get(roomId);
-    if (!targetRoom) return callback?.({ ok: false, error: 'Sala não encontrada.' });
+
+    if (!user || !targetRoom) {
+      return cb?.({ ok: false, error: 'Espaço não encontrado.' });
+    }
 
     if (targetRoom.isPrivate && targetRoom.password !== String(password || '')) {
-      return callback?.({ ok: false, error: 'Palavra-passe incorreta para esta sala privada.' });
+      return cb?.({ ok: false, error: 'Palavra-passe incorreta.' });
     }
 
-    if (currentRoomId && rooms.has(currentRoomId)) {
-      const oldRoom = rooms.get(currentRoomId);
-      oldRoom.users.delete(socket.id);
-      socket.leave(currentRoomId);
-      socket.to(currentRoomId).emit('peer:left', { socketId: socket.id });
+    if (user.roomId && rooms.has(user.roomId)) {
+      const prevRoom = rooms.get(user.roomId);
+      prevRoom.users.delete(socket.id);
+      socket.leave(user.roomId);
+      socket.to(user.roomId).emit('peer:left', { socketId: socket.id });
     }
 
-    currentUser.isStreaming = false;
-    currentUser.screenStreamId = null;
-    currentUser.streamConfig = null;
-
-    currentRoomId = roomId;
-    targetRoom.users.set(socket.id, currentUser);
+    user.roomId = roomId;
+    user.isStreaming = false;
+    user.screenStreamId = null;
+    user.streamConfig = null;
+    targetRoom.users.set(socket.id, user);
     socket.join(roomId);
 
-    socket.to(roomId).emit('peer:joined', { user: currentUser });
-    io.emit('rooms:update', serializeRoomList());
+    socket.to(roomId).emit('peer:joined', { user });
 
-    callback?.({
+    const serializedRoomUsers = Array.from(targetRoom.users.values());
+    cb?.({
       ok: true,
       room: {
         id: targetRoom.id,
         name: targetRoom.name,
         isPrivate: targetRoom.isPrivate,
-        users: Array.from(targetRoom.users.values()),
-        messages: targetRoom.messages.slice(-100)
+        users: serializedRoomUsers,
+        messages: targetRoom.messages.slice(-80)
       }
     });
+
+    io.emit('rooms:update', serializeRooms());
   });
 
   socket.on('user:state-change', (patch) => {
-    if (!currentUser || !currentRoomId) return;
-    Object.assign(currentUser, patch);
-    socket.to(currentRoomId).emit('peer:state-updated', {
-      socketId: socket.id,
-      patch
-    });
-    io.emit('rooms:update', serializeRoomList());
+    const user = users.get(socket.id);
+    if (!user || !patch || typeof patch !== 'object') return;
+
+    if (typeof patch.name === 'string' && patch.name.trim().length >= 2) {
+      user.name = patch.name.trim().slice(0, 28);
+    }
+    if (typeof patch.nick === 'string' && patch.nick.trim().length >= 2) {
+      user.nick = patch.nick.trim().replace(/[^a-zA-Z0-9_]/g, '').toLowerCase().slice(0, 20);
+    }
+    if (typeof patch.isMuted === 'boolean') user.isMuted = patch.isMuted;
+    if (typeof patch.isDeafened === 'boolean') user.isDeafened = patch.isDeafened;
+    if (typeof patch.isStreaming === 'boolean') user.isStreaming = patch.isStreaming;
+    if (patch.voiceStreamId !== undefined) user.voiceStreamId = patch.voiceStreamId;
+    if (patch.screenStreamId !== undefined) user.screenStreamId = patch.screenStreamId;
+    if (patch.streamConfig !== undefined) user.streamConfig = patch.streamConfig;
+
+    if (user.roomId && rooms.has(user.roomId)) {
+      const room = rooms.get(user.roomId);
+      room.users.set(socket.id, user);
+      socket.to(user.roomId).emit('peer:state-updated', {
+        socketId: socket.id,
+        patch
+      });
+    }
+
+    io.emit('rooms:update', serializeRooms());
   });
 
   socket.on('webrtc:signal', ({ to, data }) => {
+    const sender = users.get(socket.id);
+    if (!to || !data) return;
     io.to(to).emit('webrtc:signal', {
       from: socket.id,
-      user: currentUser,
+      user: sender || null,
       data
     });
   });
 
   socket.on('chat:message', (payload) => {
-    if (!currentUser || !currentRoomId || !rooms.has(currentRoomId)) return;
-    const room = rooms.get(currentRoomId);
+    const user = users.get(socket.id);
+    if (!user || !user.roomId || !rooms.has(user.roomId)) return;
 
-    const now = Date.now();
-    const messageObj = {
-      id: 'msg-' + now + '-' + Math.random().toString(36).substring(2, 6),
+    const room = rooms.get(user.roomId);
+    const text = String(payload?.text || '').trim().slice(0, 1000);
+    const file = payload?.file || null;
+    if (!text && !file) return;
+
+    const msg = {
+      id: 'msg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
       senderId: socket.id,
-      senderName: currentUser.name,
-      senderNick: currentUser.nick,
-      avatarColor: currentUser.avatarColor,
-      text: payload.text || '',
-      replyTo: payload.replyTo || null,
-      file: payload.file || null,
-      createdAt: now,
-      edited: false,
-      editedAt: null,
-      timestamp: new Date(now).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+      senderName: user.name,
+      senderNick: user.nick,
+      avatarColor: user.avatarColor,
+      text,
+      file,
+      replyTo: payload?.replyTo || null,
+      createdAt: Date.now(),
+      timestamp: new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }),
+      edited: false
     };
 
-    room.messages.push(messageObj);
-    if (room.messages.length > 150) room.messages.shift();
-    scheduleSavePersistentState();
+    room.messages.push(msg);
+    if (room.messages.length > 120) room.messages.shift();
 
-    io.to(currentRoomId).emit('chat:new-message', messageObj);
+    io.to(user.roomId).emit('chat:new-message', msg);
   });
 
-  socket.on('chat:edit-message', ({ messageId, newText }, callback) => {
-    if (!currentUser || !currentRoomId || !rooms.has(currentRoomId)) {
-      return callback?.({ ok: false, error: 'Sessão inválida.' });
-    }
-    const trimmed = String(newText || '').trim();
-    if (!trimmed) {
-      return callback?.({ ok: false, error: 'A mensagem não pode ficar vazia.' });
-    }
+  socket.on('chat:edit-message', ({ messageId, newText }, cb) => {
+    const user = users.get(socket.id);
+    if (!user || !user.roomId || !rooms.has(user.roomId)) return cb?.({ ok: false });
 
-    const room = rooms.get(currentRoomId);
-    const msg = room.messages.find(m => m.id === messageId);
-    if (!msg) {
-      return callback?.({ ok: false, error: 'Mensagem não encontrada.' });
-    }
+    const room = rooms.get(user.roomId);
+    const msg = room.messages.find((m) => m.id === messageId);
+    if (!msg || msg.senderId !== socket.id) return cb?.({ ok: false });
+    if (Date.now() - (msg.createdAt || 0) > 15 * 60 * 1000) return cb?.({ ok: false });
 
-    const isAuthor = msg.senderId === socket.id || msg.senderNick === currentUser.nick;
-    if (!isAuthor) {
-      return callback?.({ ok: false, error: 'Só pode editar as suas próprias mensagens.' });
-    }
+    const cleaned = String(newText || '').trim().slice(0, 1000);
+    if (!cleaned) return cb?.({ ok: false });
 
-    const elapsed = Date.now() - (msg.createdAt || 0);
-    if (elapsed > FIFTEEN_MINUTES_MS) {
-      return callback?.({ ok: false, error: 'O limite de 15 minutos para edição já expirou.' });
-    }
-
-    msg.text = trimmed;
+    msg.text = cleaned;
     msg.edited = true;
-    msg.editedAt = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-    scheduleSavePersistentState();
-
-    io.to(currentRoomId).emit('chat:message-edited', {
-      messageId: msg.id,
-      newText: msg.text,
-      edited: true,
-      editedAt: msg.editedAt
-    });
-
-    callback?.({ ok: true });
+    io.to(user.roomId).emit('chat:message-edited', { messageId, newText: cleaned });
+    cb?.({ ok: true });
   });
 
-  socket.on('chat:delete-message', ({ messageId }, callback) => {
-    if (!currentUser || !currentRoomId || !rooms.has(currentRoomId)) {
-      return callback?.({ ok: false, error: 'Sessão inválida.' });
-    }
-    const room = rooms.get(currentRoomId);
-    const idx = room.messages.findIndex(m => m.id === messageId);
-    if (idx === -1) {
-      return callback?.({ ok: false, error: 'Mensagem não encontrada.' });
-    }
+  socket.on('chat:delete-message', ({ messageId }) => {
+    const user = users.get(socket.id);
+    if (!user || !user.roomId || !rooms.has(user.roomId)) return;
+
+    const room = rooms.get(user.roomId);
+    const idx = room.messages.findIndex((m) => m.id === messageId);
+    if (idx === -1) return;
 
     const msg = room.messages[idx];
-    const isAuthor = msg.senderId === socket.id || msg.senderNick === currentUser.nick;
-    if (!isAuthor) {
-      return callback?.({ ok: false, error: 'Só pode excluir as suas próprias mensagens.' });
-    }
-
-    const elapsed = Date.now() - (msg.createdAt || 0);
-    if (elapsed > FIFTEEN_MINUTES_MS) {
-      return callback?.({ ok: false, error: 'O tempo limite de 15 minutos para exclusão já expirou.' });
-    }
+    if (msg.senderId !== socket.id) return;
+    if (Date.now() - (msg.createdAt || 0) > 15 * 60 * 1000) return;
 
     room.messages.splice(idx, 1);
-    scheduleSavePersistentState();
-    io.to(currentRoomId).emit('chat:message-deleted', { messageId });
-    callback?.({ ok: true });
+    io.to(user.roomId).emit('chat:message-deleted', { messageId });
   });
 
   socket.on('disconnect', () => {
-    if (currentRoomId && rooms.has(currentRoomId)) {
-      const room = rooms.get(currentRoomId);
-      room.users.delete(socket.id);
-      socket.to(currentRoomId).emit('peer:left', { socketId: socket.id });
-      io.emit('rooms:update', serializeRoomList());
+    const user = users.get(socket.id);
+    if (user) {
+      if (user.roomId && rooms.has(user.roomId)) {
+        const room = rooms.get(user.roomId);
+        room.users.delete(socket.id);
+        socket.to(user.roomId).emit('peer:left', { socketId: socket.id });
+      }
+      users.delete(socket.id);
+      io.emit('rooms:update', serializeRooms());
     }
   });
 });
 
-// Keep-Alive automático quando alojado gratuitamente no Render.com
-if (process.env.RENDER_EXTERNAL_URL) {
-  setInterval(() => {
-    https.get(`${process.env.RENDER_EXTERNAL_URL}/health`, () => {}).on('error', () => {});
-  }, 10 * 60 * 1000);
-}
-
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`\n============================================================`);
+  console.log('====================================================');
   console.log(`🚀 AETHER REALTIME ENGINE ATIVO NA PORTA ${PORT}`);
-  console.log(`👉 Local: http://localhost:${PORT}`);
-  console.log(`============================================================\n`);
+  console.log(`🌐 Site Oficial: http://localhost:${PORT}/site`);
+  console.log(`💻 Versão Web:   http://localhost:${PORT}/app`);
+  console.log('====================================================');
 });

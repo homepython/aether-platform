@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aether — Comunicação por Voz & Transmissões 2K 60 FPS em Tempo Real</title>
+  <link rel="icon" href="/icon.png" type="image/png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg-deep: #090b10;
+      --bg-elevated: #0f131c;
+      --surface-glass: rgba(19, 24, 36, 0.68);
+      --surface-card: rgba(255, 255, 255, 0.035);
+      --border-hairline: rgba(255, 255, 255, 0.08);
+      --border-specular: rgba(255, 255, 255, 0.16);
+      --text-primary: #f3f6ff;
+      --text-secondary: #94a3b8;
+      --accent-primary: #5e81f4;
+      --accent-violet: #7c69ef;
+      --accent-emerald: #10b981;
+      --accent-rose: #f43f5e;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      background-color: var(--bg-deep);
+      color: var(--text-primary);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+
+    body {
+      min-height: 100vh;
+      overflow-x: hidden;
+      background:
+        radial-gradient(circle at 18% 12%, rgba(94, 129, 244, 0.18), transparent 38%),
+        radial-gradient(circle at 82% 18%, rgba(124, 105, 239, 0.15), transparent 42%),
+        radial-gradient(circle at 50% 85%, rgba(16, 185, 129, 0.08), transparent 45%),
+        var(--bg-deep);
+    }
+
+    .mono {
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ================= NAVBAR GLASSMORPHISM ================= */
+    .navbar {
+      position: sticky;
+      top: 16px;
+      z-index: 100;
+      margin: 16px auto 0;
+      max-width: 1180px;
+      padding: 0 16px;
+    }
+
+    .navbar-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 20px;
+      background: rgba(13, 17, 26, 0.76);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--border-specular);
+      border-radius: 18px;
+      box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.6);
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      text-decoration: none;
+      color: var(--text-primary);
+      font-weight: 800;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-logo {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent-primary), var(--accent-violet));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 20px rgba(94, 129, 244, 0.45);
+      font-weight: 800;
+      font-size: 16px;
+      color: #fff;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 26px;
+    }
+
+    .nav-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 13.5px;
+      font-weight: 500;
+      transition: color 160ms ease;
+    }
+
+    .nav-links a:hover {
+      color: var(--text-primary);
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #6ee7b7;
+      font-size: 11.5px;
+      font-weight: 600;
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent-emerald);
+      box-shadow: 0 0 10px var(--accent-emerald);
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      padding: 10px 18px;
+      border-radius: 12px;
+      font-size: 13.5px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      transition: all 180ms ease;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-primary), var(--accent-violet));
+      color: #ffffff;
+      box-shadow: 0 10px 25px -6px rgba(94, 129, 244, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 14px 30px -6px rgba(94, 129, 244, 0.75);
+    }
+
+    .btn-glass {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: var(--border-specular);
+      color: var(--text-primary);
+      backdrop-filter: blur(12px);
+    }
+
+    .btn-glass:hover {
+      background: rgba(255, 255, 255, 0.12);
+      transform: translateY(-2px);
+    }
+
+    .btn-lg {
+      padding: 15px 28px;
+      font-size: 15px;
+      border-radius: 14px;
+      font-weight: 700;
+    }
+
+    /* ================= HERO SECTION ================= */
+    .hero {
+      padding: 72px 0 50px;
+      text-align: center;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: rgba(94, 129, 244, 0.14);
+      border: 1px solid rgba(94, 129, 244, 0.38);
+      color: #c7d2fe;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 24px;
+    }
+
+    .hero h1 {
+      font-size: clamp(36px, 5.4vw, 64px);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.035em;
+      max-width: 920px;
+      margin: 0 auto 20px;
+      background: linear-gradient(180deg, #ffffff 0%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero p {
+      font-size: clamp(16px, 1.8vw, 19px);
+      color: var(--text-secondary);
+      max-width: 720px;
+      margin: 0 auto 36px;
+      line-height: 1.6;
+    }
+
+    .hero-cta-group {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .hero-meta {
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    /* ================= VITRINE INTERATIVA DO APLICATIVO (SCREENSHOT REAL) ================= */
+    .showcase-wrapper {
+      margin-top: 44px;
+    }
+
+    .showcase-tabs {
+      display: inline-flex;
+      gap: 6px;
+      padding: 5px;
+      border-radius: 12px;
+      background: rgba(15, 19, 28, 0.85);
+      border: 1px solid var(--border-hairline);
+      margin-bottom: 18px;
+    }
+
+    .showcase-tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      padding: 8px 16px;
+      border-radius: 9px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 150ms ease;
+    }
+
+    .showcase-tab-btn.active {
+      background: rgba(94, 129, 244, 0.22);
+      color: #fff;
+      border: 1px solid rgba(94, 129, 244, 0.45);
+    }
+
+    .app-window-frame {
+      background: rgba(14, 18, 27, 0.88);
+      border: 1px solid var(--border-specular);
+      border-radius: 22px;
+      box-shadow:
+        0 30px 90px -20px rgba(0, 0, 0, 0.85),
+        0 0 60px -15px rgba(94, 129, 244, 0.22),
+        inset 0 1px 0 rgba(255, 255, 255, 0.18);
+      overflow: hidden;
+      text-align: left;
+    }
+
+    .window-titlebar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      background: rgba(9, 12, 18, 0.9);
+      border-bottom: 1px solid var(--border-hairline);
+    }
+
+    .window-dots {
+      display: flex;
+      gap: 7px;
+    }
+
+    .window-dots span {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+    }
+
+    .window-dots span:nth-child(1) { background: #f43f5e; }
+    .window-dots span:nth-child(2) { background: #f59e0b; }
+    .window-dots span:nth-child(3) { background: #10b981; }
+
+    .window-title {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    .mock-grid {
+      display: grid;
+      grid-template-columns: 240px 1fr 270px;
+      min-height: 470px;
+    }
+
+    .mock-sidebar {
+      padding: 16px;
+      border-right: 1px solid var(--border-hairline);
+      background: rgba(12, 15, 23, 0.65);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .mock-section-label {
+      font-size: 10.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-secondary);
+      font-weight: 700;
+    }
+
+    .mock-room {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 11px;
+      border-radius: 10px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .mock-room.active {
+      background: rgba(94, 129, 244, 0.18);
+      border: 1px solid rgba(94, 129, 244, 0.42);
+      color: #fff;
+      font-weight: 600;
+    }
+
+    .mock-user-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      border-radius: 11px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-hairline);
+    }
+
+    .mock-user-card.speaking {
+      border-color: var(--accent-emerald);
+      box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.35);
+    }
+
+    .mock-user-left {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 12px;
+    }
+
+    .mock-avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 12px;
+      color: #fff;
+    }
+
+    .mock-stage {
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      background: rgba(8, 10, 16, 0.6);
+    }
+
+    .mock-broadcaster-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(244, 63, 94, 0.16), rgba(19, 24, 36, 0.8));
+      border: 1px solid rgba(244, 63, 94, 0.4);
+      font-size: 12px;
+    }
+
+    .mock-video-canvas {
+      flex: 1;
+      border-radius: 16px;
+      border: 1px solid rgba(94, 129, 244, 0.38);
+      background:
+        linear-gradient(160deg, rgba(17, 24, 39, 0.92), rgba(9, 13, 22, 0.96)),
+        radial-gradient(circle at 50% 40%, rgba(94, 129, 244, 0.25), transparent 60%);
+      position: relative;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 320px;
+      overflow: hidden;
+    }
+
+    .mock-stream-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      z-index: 2;
+    }
+
+    .mock-pill-live {
+      background: rgba(244, 63, 94, 0.24);
+      border: 1px solid rgba(244, 63, 94, 0.6);
+      color: #fecdd3;
+      padding: 4px 10px;
+      border-radius: 99px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .mock-spec-badge {
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 5px 11px;
+      border-radius: 8px;
+      font-size: 11.5px;
+      color: #93c5fd;
+    }
+
+    .mock-code-preview {
+      margin: auto 0;
+      padding: 16px;
+      border-radius: 12px;
+      background: rgba(10, 14, 23, 0.82);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 12px;
+      line-height: 1.65;
+      color: #e2e8f0;
+    }
+
+    .mock-chat {
+      padding: 16px;
+      border-left: 1px solid var(--border-hairline);
+      background: rgba(12, 15, 23, 0.65);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .mock-msg {
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-hairline);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .mock-msg.mentioned {
+      background: rgba(94, 129, 244, 0.14);
+      border-color: rgba(94, 129, 244, 0.45);
+    }
+
+    .hidden-view {
+      display: none !important;
+    }
+
+    /* Vista simulada do Overlay em Jogo */
+    .mock-game-screen {
+      min-height: 470px;
+      background:
+        radial-gradient(circle at 70% 35%, rgba(16, 185, 129, 0.16), transparent 45%),
+        linear-gradient(135deg, #0b1320 0%, #111827 55%, #090d16 100%);
+      position: relative;
+      padding: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .mock-overlay-floating {
+      position: absolute;
+      top: 28px;
+      left: 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(13, 17, 26, 0.72);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+    }
+
+    /* ================= BENTO GRID DE RECURSOS ================= */
+    .section {
+      padding: 84px 0;
+    }
+
+    .section-header {
+      text-align: center;
+      max-width: 680px;
+      margin: 0 auto 52px;
+    }
+
+    .section-header h2 {
+      font-size: clamp(28px, 3.6vw, 42px);
+      font-weight: 800;
+      letter-spacing: -0.025em;
+      margin-bottom: 14px;
+    }
+
+    .section-header p {
+      color: var(--text-secondary);
+      font-size: 16px;
+      line-height: 1.6;
+    }
+
+    .bento-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+    }
+
+    .bento-card {
+      background: var(--surface-glass);
+      border: 1px solid var(--border-hairline);
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+      transition: transform 180ms ease, border-color 180ms ease;
+    }
+
+    .bento-card:hover {
+      transform: translateY(-4px);
+      border-color: var(--border-specular);
+    }
+
+    .bento-card.span-2 {
+      grid-column: span 2;
+    }
+
+    .bento-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: rgba(94, 129, 244, 0.16);
+      border: 1px solid rgba(94, 129, 244, 0.38);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      margin-bottom: 18px;
+    }
+
+    .bento-card h3 {
+      font-size: 19px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .bento-card p {
+      color: var(--text-secondary);
+      font-size: 14.5px;
+      line-height: 1.6;
+    }
+
+    /* ================= TABELA DE COMPATIBILIDADE WEB + DESKTOP ================= */
+    .compat-box {
+      background: var(--surface-glass);
+      border: 1px solid var(--border-specular);
+      border-radius: 22px;
+      padding: 36px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+    }
+
+    .compat-col {
+      padding: 24px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.025);
+      border: 1px solid var(--border-hairline);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 20px;
+    }
+
+    .compat-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      font-size: 14px;
+      color: #dbeafe;
+    }
+
+    /* ================= SECÇÃO DE DOWNLOAD ================= */
+    .download-card {
+      background: linear-gradient(135deg, rgba(94, 129, 244, 0.18) 0%, rgba(15, 19, 28, 0.92) 65%);
+      border: 1px solid rgba(94, 129, 244, 0.45);
+      border-radius: 24px;
+      padding: 48px;
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 36px;
+      align-items: center;
+    }
+
+    .steps-list {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .step-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 18px;
+      border-radius: 14px;
+      background: rgba(10, 14, 22, 0.75);
+      border: 1px solid var(--border-hairline);
+    }
+
+    .step-num {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: var(--accent-primary);
+      color: #fff;
+      font-weight: 800;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    footer {
+      border-top: 1px solid var(--border-hairline);
+      padding: 36px 0;
+      margin-top: 40px;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+
+    @media (max-width: 960px) {
+      .mock-grid,
+      .bento-grid,
+      .compat-box,
+      .download-card {
+        grid-template-columns: 1fr;
+      }
+      .bento-card.span-2 {
+        grid-column: span 1;
+      }
+      .nav-links {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- NAVBAR -->
+  <header class="navbar">
+    <div class="navbar-inner">
+      <a href="/site" class="brand">
+        <div class="brand-logo">Æ</div>
+        <span>Aether</span>
+      </a>
+      <nav class="nav-links">
+        <a href="#recursos">Recursos</a>
+        <a href="#qualidade-2k">Áudio &amp; 2K</a>
+        <a href="#ecossistema">Web &amp; Desktop</a>
+        <a href="#download">Download</a>
+      </nav>
+      <div class="nav-actions">
+        <div class="status-pill" title="Infraestrutura Cloud 24/7 em Tempo Real">
+          <span class="status-dot"></span>
+          <span id="live-status-text">Cloud 24/7 Online</span>
+        </div>
+        <a href="/app" class="btn btn-glass">Abrir no Navegador</a>
+        <a href="/download/windows" class="btn btn-primary">Baixar para Windows</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- HERO -->
+  <main class="container">
+    <section class="hero">
+      <div class="hero-badge">
+        <span>✨ PLATAFORMA UNIFICADA DESKTOP &amp; WEB • VERSÃO 1.0.0</span>
+      </div>
+      <h1>Voz cristalina e transmissões em 2K 60 FPS sem limites.</h1>
+      <p>
+        Converse com os seus amigos com latência ultrabaixa, partilhe o seu ecrã em 1440p (2K) real sem redução de volume quando alguém fala e utilize diretamente no navegador ou no aplicativo instalado para Windows.
+      </p>
+
+      <div class="hero-cta-group">
+        <a href="/download/windows" class="btn btn-primary btn-lg">
+          <span>💻</span>
+          <span>Baixar para Windows</span>
+        </a>
+        <a href="/app" class="btn btn-glass btn-lg">
+          <span>🌐</span>
+          <span>Abrir no Navegador</span>
+        </a>
+      </div>
+
+      <div class="hero-meta mono">
+        <span>✓ Windows 10 &amp; 11 (64-bit)</span>
+        <span>•</span>
+        <span>✓ Acesso Web Instantâneo</span>
+        <span>•</span>
+        <span>✓ Mesmas Salas e Utilizadores em Tempo Real</span>
+      </div>
+
+      <!-- VITRINE INTERATIVA REAL DO APLICATIVO -->
+      <div class="showcase-wrapper">
+        <div class="showcase-tabs">
+          <button type="button" class="showcase-tab-btn active" id="btn-view-app">🖥️ Interface da Aplicação &amp; Live 2K</button>
+          <button type="button" class="showcase-tab-btn" id="btn-view-overlay">🎮 Overlay Flutuante Dentro de Jogos</button>
+        </div>
+
+        <div class="app-window-frame">
+          <div class="window-titlebar">
+            <div class="window-dots"><span></span><span></span><span></span></div>
+            <div class="window-title mono">Aether — Cinema &amp; Lives 2K (2560×1440 • 60 FPS • 32.0 Mbps)</div>
+            <div class="mono" style="font-size:11px;color:#10b981;">● 4 ms | 0.0% loss</div>
+          </div>
+
+          <!-- VISTA 1: APLICATIVO COMPLETO -->
+          <div id="showcase-app-view" class="mock-grid">
+            <aside class="mock-sidebar">
+              <div class="mock-section-label">Espaços de Voz</div>
+              <div class="mock-room"><span>🔊 Lobby Principal</span><span class="mono">2</span></div>
+              <div class="mock-room"><span>🔊 Gaming &amp; Squad</span><span class="mono">4</span></div>
+              <div class="mock-room active"><span>🔊 Cinema &amp; Lives 2K</span><span class="mono">3</span></div>
+
+              <div class="mock-section-label" style="margin-top:8px;">Na Sala (3)</div>
+              <div class="mock-user-card speaking">
+                <div class="mock-user-left">
+                  <div class="mock-avatar" style="background:#5E81F4">L</div>
+                  <div>
+                    <div style="font-weight:600;color:#fff;">Leo Oliveira</div>
+                    <div class="mono" style="font-size:10px;color:#94a3b8;">@leo • LIVE 2K</div>
+                  </div>
+                </div>
+                <span style="color:#10b981;font-size:11px;font-weight:700;">🔊</span>
+              </div>
+
+              <div class="mock-user-card speaking">
+                <div class="mock-user-left">
+                  <div class="mock-avatar" style="background:#10B981">A</div>
+                  <div>
+                    <div style="font-weight:600;color:#fff;">Amigo Squad</div>
+                    <div class="mono" style="font-size:10px;color:#94a3b8;">@squad</div>
+                  </div>
+                </div>
+                <span style="color:#10b981;font-size:11px;font-weight:700;">🎙️</span>
+              </div>
+            </aside>
+
+            <div class="mock-stage">
+              <div class="mock-broadcaster-bar">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span class="mock-pill-live">🔴 AO VIVO</span>
+                  <strong>Transmissão Ativa • Áudio Compartilhado Sem Ducking</strong>
+                </div>
+                <div class="mono" style="color:#e0e7ff;">👁 2 espectadores • 1440p (2K) • 60 FPS</div>
+              </div>
+
+              <div class="mock-video-canvas">
+                <div class="mock-stream-top">
+                  <span class="mock-pill-live">● AO VIVO • Leo Oliveira</span>
+                  <span class="mock-spec-badge mono">2560×1440 • 60 FPS • 32.0 Mbps</span>
+                </div>
+                <div class="mock-code-preview mono">
+                  <div style="color:#93c5fd;margin-bottom:6px;">// Nitidez 1440p (2K) Real &amp; Áudio Independente</div>
+                  <div>✓ Resolução nativa 2560×1440 preservando textos finos</div>
+                  <div>✓ Música, filmes e jogos mantêm 100% do volume enquanto todos conversam</div>
+                  <div>✓ Sincronizado entre utilizadores Desktop (.exe) e Navegador Web</div>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#cbd5e1;">
+                  <span>🔊 Áudio Estéreo 48 kHz Ativo</span>
+                  <span> Nitidez GPU CAS Ativa</span>
+                </div>
+              </div>
+            </div>
+
+            <aside class="mock-chat">
+              <div style="display:flex;flex-direction:column;gap:10px;">
+                <div class="mock-section-label">Chat da Sala</div>
+                <div class="mock-msg">
+                  <strong style="color:#6ee7b7;">@squad:</strong> Entrei direto pelo navegador e já estou a ouvir-te e a ver a live em 2K!
+                </div>
+                <div class="mock-msg mentioned">
+                  <strong style="color:#93c5fd;">@leo:</strong> Top! Podes falar à vontade que o som do vídeo e da música na live não baixa de volume.
+                </div>
+              </div>
+              <div style="padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid var(--border-hairline);font-size:12px;color:#64748b;">
+                Enviar mensagem ou colar print (Ctrl+V)...
+              </div>
+            </aside>
+          </div>
+
+          <!-- VISTA 2: OVERLAY DENTRO DE JOGOS -->
+          <div id="showcase-overlay-view" class="mock-game-screen hidden-view">
+            <div class="mock-overlay-floating">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span style="background:rgba(13,17,26,0.9);border:1px solid rgba(255,255,255,0.15);padding:4px 10px;border-radius:99px;font-size:11px;font-weight:700;">🟢 Gaming &amp; Squad</span>
+                <span class="mock-pill-live">🔴 AO VIVO</span>
+                <span style="background:rgba(94,129,244,0.28);border:1px solid rgba(94,129,244,0.55);padding:4px 9px;border-radius:99px;font-size:11px;font-weight:700;">👁 3 espectadores</span>
+              </div>
+              <div class="mock-user-card speaking" style="background:rgba(20,28,46,0.95);border-radius:999px;padding:5px 14px 5px 6px;">
+                <div class="mock-user-left">
+                  <div class="mock-avatar" style="background:#5E81F4">L</div>
+                  <span style="font-weight:600;color:#fff;">Leo Oliveira</span>
+                </div>
+                <span style="color:#10b981;margin-left:10px;font-weight:800;">ılı</span>
+              </div>
+              <div class="mock-user-card" style="background:rgba(15,19,29,0.78);border-radius:999px;padding:5px 14px 5px 6px;">
+                <div class="mock-user-left">
+                  <div class="mock-avatar" style="background:#10B981">A</div>
+                  <span style="font-weight:600;color:#cbd5e1;">Amigo Squad</span>
+                </div>
+              </div>
+            </div>
+            <div style="text-align:center;max-width:520px;padding:28px;border-radius:18px;background:rgba(13,17,26,0.78);border:1px solid var(--border-specular);backdrop-filter:blur(12px);">
+              <h3 style="font-size:20px;margin-bottom:10px;">Overlay Discreto em Ecrã Cheio</h3>
+              <p style="font-size:14px;color:var(--text-secondary);line-height:1.6;">
+                Aparece automaticamente apenas quando estás num jogo ou aplicação em ecrã cheio. Nunca rouba o foco do teclado ou do rato e suprime notificações visuais durante a partida.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RECURSOS PRINCIPAIS -->
+    <section id="recursos" class="section">
+      <div class="section-header">
+        <h2>Engenharia de Áudio e Vídeo de Nível Profissional</h2>
+        <p>Projetado para máxima nitidez, zero interrupções em jogos e comunicação transparente entre qualquer dispositivo.</p>
+      </div>
+
+      <div class="bento-grid">
+        <div id="qualidade-2k" class="bento-card span-2">
+          <div class="bento-icon">🖥️</div>
+          <h3>Transmissões em 1440p (2K) 60 FPS com 32 Mbps</h3>
+          <p>
+            Partilhe o seu ecrã, jogos ou filmes com definição real de 2560×1440 píxeis a 60 quadros por segundo. Textos nítidos, interfaces perfeitamente legíveis e aceleração por hardware sem perda de desempenho.
+          </p>
+        </div>
+
+        <div class="bento-card">
+          <div class="bento-icon">🔊</div>
+          <h3>Áudio de Live Sem Ducking</h3>
+          <p>
+            Ouça música, vídeos e filmes em conjunto com os seus amigos: quando alguém fala no microfone, o volume da transmissão permanece 100% estável, sem baixas automáticas.
+          </p>
+        </div>
+
+        <div class="bento-card">
+          <div class="bento-icon">🎙️</div>
+          <h3>Voz Cristalina &amp; Filtro de Ruído</h3>
+          <p>
+            Supressão inteligente de ruído ambiente (ventiladores e ar-condicionado), controlo de volume individual por participante e recuperação automática de microfone.
+          </p>
+        </div>
+
+        <div class="bento-card">
+          <div class="bento-icon">🎮</div>
+          <h3>Overlay em Jogo &amp; Hotkeys Globais</h3>
+          <p>
+            Identifique quem está a falar, veja o estado de mute e o contador de espectadores em tempo real sobre qualquer jogo em ecrã cheio, com atalhos de teclado personalizáveis.
+          </p>
+        </div>
+
+        <div class="bento-card">
+          <div class="bento-icon">💬</div>
+          <h3>Chat Rico com Ficheiros até 60 MB</h3>
+          <p>
+            Envie imagens diretamente da área de transferência (Ctrl+V), vídeos e documentos até 60 MB, utilize menções com @autocompletar, respostas e edição de mensagens.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- COMPATIBILIDADE ENTRE VERSÕES (WEB + DESKTOP) -->
+    <section id="ecossistema" class="section">
+      <div class="section-header">
+        <h2>Um Único Sistema. Duas Formas de Aceder.</h2>
+        <p>Utilizadores da versão Desktop e da versão Web partilham exatamente o mesmo servidor, as mesmas salas e as mesmas transmissões em tempo real.</p>
+      </div>
+
+      <div class="compat-box">
+        <div class="compat-col">
+          <div>
+            <span class="hero-badge" style="margin-bottom:12px;">💻 APLICATIVO DESKTOP (WINDOWS)</span>
+            <h3 style="font-size:22px;margin-bottom:12px;">Experiência Nativa Completa</h3>
+            <ul class="compat-list">
+              <li>✓ Instalador profissional com atalhos na Área de Trabalho e Menu Iniciar</li>
+              <li>✓ Overlay flutuante personalizável dentro de jogos em ecrã cheio</li>
+              <li>✓ Hotkeys globais que funcionam com o aplicativo minimizado</li>
+              <li>✓ Notificações nativas do Windows com supressão automática em jogos</li>
+              <li>✓ Captura de áudio do sistema (Loopback) e transmissões até 2K 60 FPS</li>
+            </ul>
+          </div>
+          <a href="/download/windows" class="btn btn-primary btn-lg" style="width:100%;">Baixar Aplicativo para Windows (.exe)</a>
+        </div>
+
+        <div class="compat-col">
+          <div>
+            <span class="hero-badge" style="margin-bottom:12px;">🌐 VERSÃO WEB (NAVEGADOR)</span>
+            <h3 style="font-size:22px;margin-bottom:12px;">Acesso Instantâneo Sem Instalação</h3>
+            <ul class="compat-list">
+              <li>✓ Entre imediatamente pelo navegador em qualquer computador</li>
+              <li>✓ Conecte-se às mesmas salas dos utilizadores do aplicativo instalado</li>
+              <li>✓ Converse por voz, utilize o chat e envie ficheiros normalmente</li>
+              <li>✓ Assista a todas as transmissões em 1080p e 1440p (2K) com áudio</li>
+              <li>✓ Partilhe o seu ecrã e áudio diretamente pelo navegador</li>
+            </ul>
+          </div>
+          <a href="/app" class="btn btn-glass btn-lg" style="width:100%;">Abrir Aether no Navegador Agora</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- DOWNLOAD DO APLICATIVO -->
+    <section id="download" class="section">
+      <div class="download-card">
+        <div>
+          <span class="hero-badge">🚀 TRANSFERÊNCIA OFICIAL • V1.0.0 STABLE</span>
+          <h2 style="font-size:34px;font-weight:800;margin-bottom:14px;">Instale o Aether no seu Windows</h2>
+          <p style="color:var(--text-secondary);font-size:15.5px;line-height:1.6;margin-bottom:24px;">
+            Processo de instalação simples e rápido. O aplicativo sincroniza atualizações automaticamente com a nuvem 24/7 sem precisar reinstalar a cada melhoria.
+          </p>
+          <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+            <a href="/download/windows" class="btn btn-primary btn-lg">
+              <span>⬇️</span>
+              <span>Baixar Aether Setup 1.0.0.exe</span>
+            </a>
+            <a href="/app" class="btn btn-glass btn-lg">Usar Versão Web</a>
+          </div>
+          <div class="mono" style="font-size:12px;color:var(--text-secondary);">
+            Versão 1.0.0 • Arquitetura x64 • Windows 10 / Windows 11 • Atualizações Cloud Automáticas
+          </div>
+        </div>
+
+        <div class="steps-list">
+          <div class="step-item">
+            <div class="step-num">1</div>
+            <div>
+              <strong style="display:block;font-size:14px;">Baixe o Instalador Oficial</strong>
+              <span style="font-size:12.5px;color:var(--text-secondary);">Clique em "Baixar para Windows" para transferir o ficheiro <code class="mono">Aether-Setup-1.0.0.exe</code>.</span>
+            </div>
+          </div>
+          <div class="step-item">
+            <div class="step-num">2</div>
+            <div>
+              <strong style="display:block;font-size:14px;">Instale em Segundos</strong>
+              <span style="font-size:12.5px;color:var(--text-secondary);">Execute o instalador. Ele criará automaticamente os atalhos na Área de Trabalho e no Menu Iniciar.</span>
+            </div>
+          </div>
+          <div class="step-item">
+            <div class="step-num">3</div>
+            <div>
+              <strong style="display:block;font-size:14px;">Entre e Converse</strong>
+              <span style="font-size:12.5px;color:var(--text-secondary);">O seu perfil fica salvo localmente com login automático em todas as aberturas seguintes.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+      <div><strong>Aether Realtime Platform</strong> — Voz, Chat e Streaming 2K em Tempo Real.</div>
+      <div style="display:flex;gap:18px;">
+        <a href="/app" style="color:var(--text-secondary);text-decoration:none;">Abrir Web App</a>
+        <a href="/download/windows" style="color:var(--text-secondary);text-decoration:none;">Baixar para Windows</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    const btnApp = document.getElementById('btn-view-app');
+    const btnOverlay = document.getElementById('btn-view-overlay');
+    const viewApp = document.getElementById('showcase-app-view');
+    const viewOverlay = document.getElementById('showcase-overlay-view');
+
+    btnApp?.addEventListener('click', () => {
+      btnApp.classList.add('active');
+      btnOverlay.classList.remove('active');
+      viewApp.classList.remove('hidden-view');
+      viewOverlay.classList.add('hidden-view');
+    });
+
+    btnOverlay?.addEventListener('click', () => {
+      btnOverlay.classList.add('active');
+      btnApp.classList.remove('active');
+      viewOverlay.classList.remove('hidden-view');
+      viewApp.classList.add('hidden-view');
+    });
+
+    fetch('/api/status')
+      .then((r) => r.json())
+      .then((data) => {
+        if (!data || !data.ok) return;
+        const el = document.getElementById('live-status-text');
+        if (el) {
+          el.textContent = data.onlineUsers > 0
+            ? `Cloud 24/7 • ${data.onlineUsers} online agora`
+            : `Cloud 24/7 Online • ${data.totalRooms} salas ativas`;
+        }
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>
