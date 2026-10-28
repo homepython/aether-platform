@@ -105,6 +105,11 @@
     myStreamViewers: new Set(),
     sharpenEnabled: true,
     roomSfxEnabled: localStorage.getItem('aether_room_sfx') !== 'off',
+    desktopPrefs: {
+      openAtLogin: localStorage.getItem('aether_open_at_login') === 'on',
+      startMinimized: localStorage.getItem('aether_start_minimized') === 'on',
+      minimizeToTrayOnClose: localStorage.getItem('aether_close_to_tray') !== 'off'
+    },
     overlayEnabled: localStorage.getItem('aether_overlay_enabled') !== 'off',
     overlayFullscreenOnly: localStorage.getItem('aether_overlay_fullscreen_only') !== 'off',
     overlayShowRoomTitle: localStorage.getItem('aether_overlay_show_title') !== 'off',
@@ -262,7 +267,28 @@
     toggleUiAnimations: document.getElementById('toggle-ui-animations')
   };
 
-  function injectAuxiliaryStyles() {
+  // Injeta estilos auxiliares e o filtro SVG Sub-Píxel dedicado para 2K (#cas-sharpen-2k)
+  function injectAuxiliaryStylesAnd2KFilter() {
+    if (!document.getElementById('aether-2k-svg-defs')) {
+      const svgWrap = document.createElement('div');
+      svgWrap.id = 'aether-2k-svg-defs';
+      svgWrap.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;';
+      svgWrap.innerHTML = `
+        <svg xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <filter id="cas-sharpen-2k" color-interpolation-filters="sRGB">
+              <feConvolveMatrix
+                order="3 3"
+                preserveAlpha="true"
+                kernelMatrix="0 -0.18 0 -0.18 1.72 -0.18 0 -0.18 0"
+              />
+            </filter>
+          </defs>
+        </svg>
+      `;
+      document.body.appendChild(svgWrap);
+    }
+
     if (document.getElementById('aether-final-injected-styles')) return;
     const style = document.createElement('style');
     style.id = 'aether-final-injected-styles';
@@ -370,8 +396,9 @@
         color: #fecdd3 !important;
         box-shadow: 0 0 16px rgba(244, 63, 94, 0.28);
       }
+      /* Filtro Sub-Píxel Dedicado para 2K (2560x1440) */
       video.stream-webrtc-video.native-2k-crisp {
-        filter: contrast(1.03) saturate(1.03) !important;
+        filter: url(#cas-sharpen-2k) contrast(1.03) saturate(1.03) !important;
         image-rendering: -webkit-optimize-contrast;
         transform: translateZ(0);
         backface-visibility: hidden;
@@ -380,7 +407,7 @@
     `;
     document.head.appendChild(style);
   }
-  injectAuxiliaryStyles();
+  injectAuxiliaryStylesAnd2KFilter();
 
   function syncStreamButtonsVisualState() {
     if (el.btnStartStream) {
@@ -554,6 +581,7 @@
 
     const tabInterface = document.getElementById('tab-interface');
 
+    // 1. Cartão de Perfil do Utilizador
     if (tabInterface && !document.getElementById('user-profile-settings-card')) {
       const profileCard = document.createElement('div');
       profileCard.id = 'user-profile-settings-card';
@@ -619,6 +647,77 @@
       if (nickInp && !nickInp.value) nickInp.value = state.user.nick;
     }
 
+    // 2. Cartão de Experiência Desktop (Iniciar com Windows, Iniciar Minimizado e Bandeja do Sistema)
+    if (tabInterface && !document.getElementById('desktop-startup-tray-card')) {
+      const startupCard = document.createElement('div');
+      startupCard.id = 'desktop-startup-tray-card';
+      startupCard.className = 'settings-group-card';
+      startupCard.innerHTML = `
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Iniciar automaticamente quando o Windows for iniciado</strong>
+            <small>Abre o Aether automaticamente assim que você faz login no Windows.</small>
+          </div>
+          <label class="apple-switch">
+            <input type="checkbox" id="toggle-open-at-login" ${state.desktopPrefs.openAtLogin ? 'checked' : ''} />
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Iniciar minimizado na bandeja do sistema</strong>
+            <small>Inicia o aplicativo de forma silenciosa e oculta junto ao relógio do Windows.</small>
+          </div>
+          <label class="apple-switch">
+            <input type="checkbox" id="toggle-start-minimized" ${state.desktopPrefs.startMinimized ? 'checked' : ''} />
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+        <div class="setting-divider"></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <strong>Comportamento ao Clicar no X (Fechar Janela)</strong>
+            <small>Escolha entre minimizar para a bandeja do sistema (estilo Discord) ou encerrar completamente.</small>
+          </div>
+          <select id="select-close-behavior" class="apple-select">
+            <option value="tray" ${state.desktopPrefs.minimizeToTrayOnClose ? 'selected' : ''}>☑ Fechar no X minimiza para a bandeja</option>
+            <option value="quit" ${!state.desktopPrefs.minimizeToTrayOnClose ? 'selected' : ''}>☐ Fechar no X encerra completamente</option>
+          </select>
+        </div>
+      `;
+      tabInterface.appendChild(startupCard);
+
+      const openLoginChk = document.getElementById('toggle-open-at-login');
+      const startMinChk = document.getElementById('toggle-start-minimized');
+      const closeSelect = document.getElementById('select-close-behavior');
+
+      const syncPrefsToMain = () => {
+        localStorage.setItem('aether_open_at_login', state.desktopPrefs.openAtLogin ? 'on' : 'off');
+        localStorage.setItem('aether_start_minimized', state.desktopPrefs.startMinimized ? 'on' : 'off');
+        localStorage.setItem('aether_close_to_tray', state.desktopPrefs.minimizeToTrayOnClose ? 'on' : 'off');
+        if (isDesktopInstalledApp && window.aetherDesktop?.updateDesktopPrefs) {
+          window.aetherDesktop.updateDesktopPrefs(state.desktopPrefs);
+        }
+      };
+
+      openLoginChk?.addEventListener('change', () => {
+        state.desktopPrefs.openAtLogin = openLoginChk.checked;
+        syncPrefsToMain();
+      });
+
+      startMinChk?.addEventListener('change', () => {
+        state.desktopPrefs.startMinimized = startMinChk.checked;
+        syncPrefsToMain();
+      });
+
+      closeSelect?.addEventListener('change', () => {
+        state.desktopPrefs.minimizeToTrayOnClose = closeSelect.value === 'tray';
+        syncPrefsToMain();
+      });
+    }
+
+    // 3. Cartão de Overlay e Hotkeys Globais
     if (tabInterface && !document.getElementById('desktop-overlay-hotkeys-card')) {
       const desktopCard = document.createElement('div');
       desktopCard.id = 'desktop-overlay-hotkeys-card';
@@ -1007,6 +1106,23 @@
     pushOverlayConfigToDesktop();
     window.aetherDesktop.updateHotkeys(state.globalHotkeys);
 
+    if (window.aetherDesktop.getDesktopPrefs) {
+      window.aetherDesktop.getDesktopPrefs().then((prefs) => {
+        if (!prefs) return;
+        state.desktopPrefs = {
+          openAtLogin: Boolean(prefs.openAtLogin),
+          startMinimized: Boolean(prefs.startMinimized),
+          minimizeToTrayOnClose: prefs.minimizeToTrayOnClose !== false
+        };
+        const openLoginChk = document.getElementById('toggle-open-at-login');
+        const startMinChk = document.getElementById('toggle-start-minimized');
+        const closeSelect = document.getElementById('select-close-behavior');
+        if (openLoginChk) openLoginChk.checked = state.desktopPrefs.openAtLogin;
+        if (startMinChk) startMinChk.checked = state.desktopPrefs.startMinimized;
+        if (closeSelect) closeSelect.value = state.desktopPrefs.minimizeToTrayOnClose ? 'tray' : 'quit';
+      }).catch(() => {});
+    }
+
     window.aetherDesktop.onHotkeyCommand((cmd) => {
       if (!cmd || !cmd.action) return;
       if (cmd.action === 'toggle-mic') {
@@ -1204,7 +1320,7 @@
     const audioStatusEl = document.getElementById('broadcaster-audio-status');
     if (audioStatusEl) {
       audioStatusEl.textContent = hasSysAudio
-        ? '🔊 Áudio Mid-Side + Lookahead 25ms Ativo (Zero Eco / Volume 100%)'
+        ? '🔊 Cancelamento Algébrico Ativo (Zero Eco • Volume 100%)'
         : '🔇 Somente tela (sem áudio)';
     }
 
@@ -1231,7 +1347,7 @@
       const trackSettings = vidTrack?.getSettings ? vidTrack.getSettings() : {};
       const actualHeight = trackSettings.height || state.streamSettings.resolution;
       const resLabel = state.streamSettings.resolution === 1440
-        ? `1440p (2K • ${actualHeight}p • 32 Mbps)`
+        ? `1440p (2K VP9 • ${actualHeight}p • 45 Mbps)`
         : `${state.streamSettings.resolution}p`;
       const qualityLabel = state.streamSettings.contentHint === 'detail' ? 'Nitidez Máxima' : 'Fluidez Ultra';
       specEl.textContent = `${resLabel} • ${state.streamSettings.fps} FPS • ${qualityLabel}`;
@@ -1306,7 +1422,7 @@
   const tabTitles = {
     'tab-audio': 'Áudio & Processamento Vocal',
     'tab-stream': 'Qualidade de Transmissão',
-    'tab-interface': 'Perfil, Overlay & Hotkeys'
+    'tab-interface': 'Perfil, Bandeja, Overlay & Hotkeys'
   };
 
   document.querySelectorAll('.settings-nav-item').forEach((item) => {
@@ -1464,7 +1580,6 @@
       avatarColor
     }));
 
-    // Conclui initLocalVoiceEngine() obrigatoriamente antes de entrar na sala
     await initLocalVoiceEngine();
 
     socket.emit('user:register', {
@@ -1522,7 +1637,7 @@
     }
   } catch (e) {}
 
-  // ================= 2. MOTOR DE VOZ + RELAY AUTOMÁTICO CGNAT (voice:relay) =================
+  // ================= 2. MOTOR DE VOZ + RELAY AUTOMÁTICO CGNAT + INJEÇÃO ORTOGONAL (L = +V, R = -V) =================
   function getNoiseFilterFrequencies(level) {
     switch (level) {
       case 'low':
@@ -1602,7 +1717,6 @@
       processor.onaudioprocess = (e) => {
         if (state.isMicMuted || !state.isSelfSpeaking || !state.currentRoomId) return;
 
-        // Envia pacotes voice:relay apenas para pares cujo fluxo P2P direto ainda não confirmou p2pVoiceOk
         const relayTargets = [];
         const now = Date.now();
         for (const [peerId, peerObj] of state.peers.entries()) {
@@ -1613,7 +1727,7 @@
         if (relayTargets.length === 0) return;
 
         const input = e.inputBuffer.getChannelData(0);
-        const step = 3; // Downsample ~48kHz -> ~16kHz Int16
+        const step = 3;
         const outLen = Math.floor(input.length / step);
         const pcm16 = new Int16Array(outLen);
         for (let i = 0; i < outLen; i++) {
@@ -1776,7 +1890,7 @@
     }, 40);
   }
 
-  // Recebe pacotes de voz via Relay caso CGNAT estrito bloqueie P2P direto entre Usuário A e Usuário B
+  // Recebe pacotes de voz via Relay com fase invertida (VL = +V, VR = -V) durante transmissões com áudio
   socket.on('voice:relay', ({ from, pcm, sampleRate }) => {
     if (state.isDeafened || !pcm || !state.audioContext) return;
     const peerObj = state.peers.get(from);
@@ -1802,7 +1916,6 @@
       const src = ctx.createBufferSource();
       src.buffer = audioBuffer;
 
-      // Aplica filtro Mono estrito (185 Hz - 3700 Hz) e Lookahead de 25ms quando estiver transmitindo
       const hp = ctx.createBiquadFilter();
       hp.type = 'highpass';
       hp.frequency.value = 185;
@@ -1811,23 +1924,24 @@
       lp.type = 'lowpass';
       lp.frequency.value = 3700;
 
-      const delayNode = ctx.createDelay(0.1);
-      delayNode.delayTime.value = state.isStreaming ? 0.025 : 0.0;
-
       const gainNode = ctx.createGain();
       const userVol = state.userVolumes.get(from) ?? 100;
       gainNode.gain.value = state.isDeafened ? 0 : Math.min(1, userVol / 100);
 
-      // Força saída 100% Mono idêntica nos canais L e R (L = R) para cancelamento Mid-Side perfeito
-      const monoMerger = ctx.createChannelMerger(2);
+      // Fase ortogonal: L = +V, R = -V quando estiver a transmitir com áudio (cancela-se para 0,000% no canal Mid!)
+      const useOrthogonalPhase = Boolean(state.isStreaming && state.localScreenStream?.getAudioTracks().length > 0);
+      const rightPhase = ctx.createGain();
+      rightPhase.gain.value = useOrthogonalPhase ? -1.0 : 1.0;
+
+      const stereoMerger = ctx.createChannelMerger(2);
 
       src.connect(hp);
       hp.connect(lp);
-      lp.connect(delayNode);
-      delayNode.connect(gainNode);
-      gainNode.connect(monoMerger, 0, 0);
-      gainNode.connect(monoMerger, 0, 1);
-      monoMerger.connect(ctx.destination);
+      lp.connect(gainNode);
+      gainNode.connect(stereoMerger, 0, 0);
+      gainNode.connect(rightPhase);
+      rightPhase.connect(stereoMerger, 0, 1);
+      stereoMerger.connect(ctx.destination);
 
       const now = ctx.currentTime;
       const nextTime = Math.max(now, peerObj?.relayNextPlayTime || now);
@@ -1903,7 +2017,6 @@
     const currentSession = state.roomSessionToken;
     cleanupAllPeers();
 
-    // Garante que initLocalVoiceEngine() é concluído ANTES de socket.emit('room:join')
     const currentMicTrack = state.localVoiceStream?.getAudioTracks()[0];
     if (!currentMicTrack || currentMicTrack.readyState === 'ended') {
       await initLocalVoiceEngine();
@@ -1967,17 +2080,42 @@
     });
   });
 
-  // ================= 4. WEBRTC ENGINE (HANDSHAKE BLINDADO + ROLLBACK 3.5S + LOOKAHEAD 25MS) =================
+  // ================= 4. WEBRTC ENGINE (MODO 1440P 2K @ 45 MBPS + VP9 EXCLUSIVO EM 2K) =================
   function getTargetBitrateKbps() {
     if (state.streamSettings.bitrateMode !== 'auto') {
       const manualVal = Number(state.streamSettings.bitrateMode);
-      return state.streamSettings.resolution === 1440 ? Math.max(25000, manualVal) : manualVal;
+      return state.streamSettings.resolution === 1440 ? Math.max(35000, manualVal) : manualVal;
     }
+    // 1080p permanece em 12000 kbps; 1440p (2K) é elevado para 45 Mbps (45000 kbps)
     return state.streamSettings.resolution === 1440
-      ? 32000
+      ? 45000
       : state.streamSettings.resolution === 1080
         ? 12000
         : 6500;
+  }
+
+  // Prioriza exclusivamente o codec VP9 (superblocos 64x64) quando em 1440p (2K), mantendo 1080p inalterado
+  function preferVp9CodecFor2K(pc) {
+    if (state.streamSettings.resolution !== 1440) return;
+    if (!pc || typeof RTCRtpSender === 'undefined' || typeof RTCRtpSender.getCapabilities !== 'function') return;
+    try {
+      const caps = RTCRtpSender.getCapabilities('video');
+      if (!caps || !Array.isArray(caps.codecs)) return;
+
+      const vp9Codecs = caps.codecs.filter(c => /vp9/i.test(c.mimeType || ''));
+      if (vp9Codecs.length === 0) return;
+
+      const otherCodecs = caps.codecs.filter(c => !/vp9/i.test(c.mimeType || ''));
+      const ordered = [...vp9Codecs, ...otherCodecs];
+
+      pc.getTransceivers().forEach((t) => {
+        if (t.sender?.track?.kind === 'video' && typeof t.setCodecPreferences === 'function') {
+          try {
+            t.setCodecPreferences(ordered);
+          } catch (_err) {}
+        }
+      });
+    } catch (_err) {}
   }
 
   function enhanceSdpForHighQualityStream(sdp) {
@@ -1985,8 +2123,8 @@
     const targetMax = getTargetBitrateKbps();
     const targetBps = targetMax * 1000;
     const is2K = state.streamSettings.resolution === 1440;
-    const startBitrate = is2K ? Math.min(24000, targetMax) : Math.min(10000, targetMax);
-    const minBitrate = is2K ? Math.min(16000, targetMax) : Math.min(4500, Math.round(targetMax * 0.5));
+    const startBitrate = is2K ? 35000 : Math.min(10000, targetMax);
+    const minBitrate = is2K ? 25000 : Math.min(4500, Math.round(targetMax * 0.5));
 
     const sections = sdp.split('\r\nm=');
     for (let i = 1; i < sections.length; i++) {
@@ -2160,7 +2298,6 @@
     }
   }
 
-  // Se qualquer conexão demorar mais de 3,5 segundos presa em negociação, sofre rollback e reconecta automaticamente
   function armNegotiationWatchdogTimer(peerId, peerObj) {
     if (peerObj.negotiationWatchdogTimer) {
       clearTimeout(peerObj.negotiationWatchdogTimer);
@@ -2201,6 +2338,9 @@
 
       peerObj.suppressAutoNegotiation = true;
       ensureLocalAudioSenderOnPeer(peerObj);
+      if (state.isStreaming && state.streamSettings.resolution === 1440) {
+        preferVp9CodecFor2K(pc);
+      }
       peerObj.suppressAutoNegotiation = false;
 
       const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
@@ -2252,9 +2392,9 @@
       voiceSourceNode: null,
       voiceHighPassNode: null,
       voiceLowPassNode: null,
-      voiceDelayNode: null,
       voiceGainNode: null,
-      voiceMonoMerger: null,
+      voiceRightPhaseNode: null,
+      voiceStereoMerger: null,
       voiceAudioEl: null,
       remoteAnalyser: null,
       screenStream: null,
@@ -2325,7 +2465,6 @@
       }
     };
 
-    // onnegotiationneeded fica bloqueado até o fim do handshake inicial para eliminar colisões entre Usuário A e B
     pc.onnegotiationneeded = () => {
       if (peerObj.suppressAutoNegotiation || !peerObj.initialHandshakeDone) return;
       negotiateWithPeer(peerId, peerObj);
@@ -2453,17 +2592,17 @@
       try { peerObj.voiceLowPassNode.disconnect(); } catch (e) {}
       peerObj.voiceLowPassNode = null;
     }
-    if (peerObj.voiceDelayNode) {
-      try { peerObj.voiceDelayNode.disconnect(); } catch (e) {}
-      peerObj.voiceDelayNode = null;
-    }
     if (peerObj.voiceGainNode) {
       try { peerObj.voiceGainNode.disconnect(); } catch (e) {}
       peerObj.voiceGainNode = null;
     }
-    if (peerObj.voiceMonoMerger) {
-      try { peerObj.voiceMonoMerger.disconnect(); } catch (e) {}
-      peerObj.voiceMonoMerger = null;
+    if (peerObj.voiceRightPhaseNode) {
+      try { peerObj.voiceRightPhaseNode.disconnect(); } catch (e) {}
+      peerObj.voiceRightPhaseNode = null;
+    }
+    if (peerObj.voiceStereoMerger) {
+      try { peerObj.voiceStereoMerger.disconnect(); } catch (e) {}
+      peerObj.voiceStereoMerger = null;
     }
     if (peerObj.remoteAnalyser) {
       try { peerObj.remoteAnalyser.disconnect(); } catch (e) {}
@@ -2478,34 +2617,45 @@
     peerObj.attachedVoiceTrackId = null;
   }
 
-  // Atualiza dinamicamente o atraso de Lookahead de 25ms e o filtro Mono (185 Hz - 3700 Hz) nas vozes recebidas
-  function syncRemoteVoicesLookaheadState() {
+  // Alterna a fase do canal direito das vozes dos participantes:
+  // - Quando você transmite tela com áudio: VL = +V(t), VR = -V(t) (Fase Ortogonal que se anula para 0,000% no canal Mid da live!)
+  // - Quando não transmite: VL = +V(t), VR = +V(t) (Fase normal)
+  function syncRemoteVoicesOrthogonalPhaseState() {
     if (!state.audioContext) return;
     const now = state.audioContext.currentTime;
+    const useOrthogonalPhase = Boolean(
+      state.isStreaming && state.localScreenStream && state.localScreenStream.getAudioTracks().length > 0
+    );
+
     for (const [peerId, peerObj] of state.peers.entries()) {
       const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
       const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
 
       if (peerObj.voiceHighPassNode) {
-        const targetHp = state.isStreaming ? Math.max(185, hpFreq) : hpFreq;
+        const targetHp = useOrthogonalPhase ? Math.max(185, hpFreq) : hpFreq;
         peerObj.voiceHighPassNode.frequency.setTargetAtTime(targetHp, now, 0.02);
       }
       if (peerObj.voiceLowPassNode) {
-        const targetLp = state.isStreaming ? Math.min(3700, lpFreq) : lpFreq;
+        const targetLp = useOrthogonalPhase ? Math.min(3900, lpFreq) : lpFreq;
         peerObj.voiceLowPassNode.frequency.setTargetAtTime(targetLp, now, 0.02);
       }
-      if (peerObj.voiceDelayNode) {
-        peerObj.voiceDelayNode.delayTime.setTargetAtTime(state.isStreaming ? 0.025 : 0.0, now, 0.015);
+      if (peerObj.voiceRightPhaseNode) {
+        peerObj.voiceRightPhaseNode.gain.setTargetAtTime(useOrthogonalPhase ? -1.0 : 1.0, now, 0.01);
+      }
+      if (peerObj.voiceAudioEl && peerObj.voiceGainNode) {
+        // Garante que o elemento <audio> auxiliar permanece silenciado para nunca vazar áudio em fase (+V, +V) fora do barramento
+        peerObj.voiceAudioEl.muted = true;
+        peerObj.voiceAudioEl.volume = 0;
       }
     }
   }
 
   function applyRemotePeerNoiseProfile(peerId, level) {
     state.userNoiseLevels.set(peerId, level);
-    syncRemoteVoicesLookaheadState();
+    syncRemoteVoicesOrthogonalPhaseState();
   }
 
-  // Pipeline de Voz Remota com Lookahead de 25ms e Saída 100% Mono (L = R) quando em transmissão
+  // Pipeline de Voz Remota com Barramento Ortogonal (VL = +V, VR = -V quando em transmissão)
   function setupRemoteVoicePipeline(peerId, isolatedVoiceStream) {
     const peerObj = state.peers.get(peerId);
     if (!peerObj) return;
@@ -2528,46 +2678,50 @@
         const ctx = state.audioContext;
         const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
         const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
+        const useOrthogonalPhase = Boolean(
+          state.isStreaming && state.localScreenStream && state.localScreenStream.getAudioTracks().length > 0
+        );
 
         const source = ctx.createMediaStreamSource(isolatedVoiceStream);
 
-        // O analisador lê a voz ANTES do DelayNode de 25ms (Lookahead de 25ms!)
         const remoteAnalyser = ctx.createAnalyser();
         remoteAnalyser.fftSize = 256;
-        remoteAnalyser.smoothingTimeConstant = 0.2;
-        source.connect(remoteAnalyser);
+        remoteAnalyser.smoothingTimeConstant = 0.25;
 
         const hp = ctx.createBiquadFilter();
         hp.type = 'highpass';
-        hp.frequency.value = state.isStreaming ? Math.max(185, hpFreq) : hpFreq;
+        hp.frequency.value = useOrthogonalPhase ? Math.max(185, hpFreq) : hpFreq;
 
         const lp = ctx.createBiquadFilter();
         lp.type = 'lowpass';
-        lp.frequency.value = state.isStreaming ? Math.min(3700, lpFreq) : lpFreq;
-
-        const delayNode = ctx.createDelay(0.1);
-        delayNode.delayTime.value = state.isStreaming ? 0.025 : 0.0;
+        lp.frequency.value = useOrthogonalPhase ? Math.min(3900, lpFreq) : lpFreq;
 
         const gainNode = ctx.createGain();
         gainNode.gain.value = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
 
-        // Garante que a voz recebida no PC é 100% Mono simétrica (L = R) para que no canal Side (L - R) ela se cancele para 0,0%
-        const monoMerger = ctx.createChannelMerger(2);
+        // Canal Esquerdo: +V(t) | Canal Direito: -V(t) durante transmissão com áudio
+        const rightPhaseNode = ctx.createGain();
+        rightPhaseNode.gain.value = useOrthogonalPhase ? -1.0 : 1.0;
+
+        const stereoMerger = ctx.createChannelMerger(2);
 
         source.connect(hp);
         hp.connect(lp);
-        lp.connect(delayNode);
-        delayNode.connect(gainNode);
-        gainNode.connect(monoMerger, 0, 0);
-        gainNode.connect(monoMerger, 0, 1);
-        monoMerger.connect(ctx.destination);
+        lp.connect(remoteAnalyser);
+        lp.connect(gainNode);
+
+        gainNode.connect(stereoMerger, 0, 0);
+        gainNode.connect(rightPhaseNode);
+        rightPhaseNode.connect(stereoMerger, 0, 1);
+
+        stereoMerger.connect(ctx.destination);
 
         peerObj.voiceSourceNode = source;
         peerObj.voiceHighPassNode = hp;
         peerObj.voiceLowPassNode = lp;
-        peerObj.voiceDelayNode = delayNode;
         peerObj.voiceGainNode = gainNode;
-        peerObj.voiceMonoMerger = monoMerger;
+        peerObj.voiceRightPhaseNode = rightPhaseNode;
+        peerObj.voiceStereoMerger = stereoMerger;
         peerObj.remoteAnalyser = remoteAnalyser;
         webAudioRoutingActive = true;
       } catch (e) {
@@ -2575,7 +2729,7 @@
       }
     }
 
-    // Mantém o elemento <audio> ligado ao stream para o Chromium puxar os pacotes da rede sem duplicar som
+    // Mantém <audio> estritamente silenciado quando o barramento WebAudio está ativo para não duplicar o sinal fora do barramento
     audioEl.muted = webAudioRoutingActive ? true : state.isDeafened;
     audioEl.volume = webAudioRoutingActive ? 0 : (state.isDeafened ? 0 : Math.min(1, savedVol / 100));
 
@@ -2589,7 +2743,6 @@
     peerObj.voiceAudioEl = audioEl;
   }
 
-  // webrtc:signal NUNCA descarta pacotes precoces
   socket.on('webrtc:signal', ({ from, user, data }) => {
     if (!from || !data) return;
 
@@ -2670,6 +2823,9 @@
           if (desc.type === 'offer') {
             peerObj.suppressAutoNegotiation = true;
             const addedVoice = ensureLocalAudioSenderOnPeer(peerObj);
+            if (state.isStreaming && state.streamSettings.resolution === 1440) {
+              preferVp9CodecFor2K(pc);
+            }
             peerObj.suppressAutoNegotiation = false;
 
             const answer = await pc.createAnswer();
@@ -2726,8 +2882,11 @@
     });
   });
 
-  // ================= 5. MATRIZ MID-SIDE (M = (L+R)/2, S = (L-R)/2) + BAND-SPLIT (150Hz - 4100Hz) =================
-  function createMidSideBandSplitMatrix(rawSysAudioTrack) {
+  // ================= 5. CANCELADOR ALGÉBRICO NO CANAL MID (M = (DL + DR)/2) COM GANHO FIXO 1.0 =================
+  // Como as vozes dos participantes saem em fase invertida (DL = VideoL + g*V, DR = VideoR - g*V),
+  // no canal Mid (M = (DL + DR)/2) a voz dos espectadores cancela-se algebricamente para 0,000% (+g*V - g*V = 0)
+  // em todas as amostras, mantendo 100% do volume do vídeo/música (ganho fixo 1.0 sempre, zero ducking)!
+  function createAlgebraicMidCancellerStream(rawSysAudioTrack) {
     if (!state.audioContext || !rawSysAudioTrack) return null;
     try {
       const ctx = state.audioContext;
@@ -2739,95 +2898,66 @@
       const splitter = ctx.createChannelSplitter(2);
       sysSource.connect(splitter);
 
-      // Canal Mid: M = (L + R) / 2
+      // Canal Central da Transmissão: M(t) = (D_L(t) + D_R(t)) / 2 -> +g*V(t-tau) - g*V(t-tau) = 0,000%!
       const midGainL = ctx.createGain();
       midGainL.gain.value = 0.5;
       const midGainR = ctx.createGain();
       midGainR.gain.value = 0.5;
-      const midSum = ctx.createGain();
-      midSum.gain.value = 1.0;
+      const midChannelFixed = ctx.createGain();
+      midChannelFixed.gain.value = 1.0; // Ganho fixo de 1.0 (100% do volume sempre)
 
       splitter.connect(midGainL, 0);
       splitter.connect(midGainR, 1);
-      midGainL.connect(midSum);
-      midGainR.connect(midSum);
+      midGainL.connect(midChannelFixed);
+      midGainR.connect(midChannelFixed);
 
-      // Canal Side (Estéreo Lateral): S = (L - R) / 2 -> A voz Mono dos amigos (L = R) cancela-se para 0,0% (V - V = 0)!
+      // Canal Estéreo Lateral (S = (D_L - D_R)/2) filtrado apenas para Graves (< 150 Hz) e Agudos (> 4100 Hz) com ganho fixo 1.0
       const sideGainL = ctx.createGain();
       sideGainL.gain.value = 0.5;
       const sideGainRInv = ctx.createGain();
       sideGainRInv.gain.value = -0.5;
-      const sideSum = ctx.createGain();
-      sideSum.gain.value = 1.0;
+      const sideRaw = ctx.createGain();
+      sideRaw.gain.value = 1.0;
 
       splitter.connect(sideGainL, 0);
       splitter.connect(sideGainRInv, 1);
-      sideGainL.connect(sideSum);
-      sideGainRInv.connect(sideSum);
+      sideGainL.connect(sideRaw);
+      sideGainRInv.connect(sideRaw);
 
-      // Band-Split no Canal Mid (M):
-      // 1) Graves (< 150 Hz): 100% preservados sempre
-      const midLowPass = ctx.createBiquadFilter();
-      midLowPass.type = 'lowpass';
-      midLowPass.frequency.value = 150;
-      midLowPass.Q.value = 0.707;
+      const sideBassLP = ctx.createBiquadFilter();
+      sideBassLP.type = 'lowpass';
+      sideBassLP.frequency.value = 150;
+      sideBassLP.Q.value = 0.707;
 
-      // 2) Agudos (> 4100 Hz): 100% preservados sempre
-      const midHighPass = ctx.createBiquadFilter();
-      midHighPass.type = 'highpass';
-      midHighPass.frequency.value = 4100;
-      midHighPass.Q.value = 0.707;
+      const sideTrebleHP = ctx.createBiquadFilter();
+      sideTrebleHP.type = 'highpass';
+      sideTrebleHP.frequency.value = 4100;
+      sideTrebleHP.Q.value = 0.707;
 
-      // 3) Faixa Vocal Central Mono (150 Hz - 4100 Hz): silenciada apenas no instante em que um espectador fala
-      const vocalBandHP = ctx.createBiquadFilter();
-      vocalBandHP.type = 'highpass';
-      vocalBandHP.frequency.value = 150;
-      vocalBandHP.Q.value = 0.707;
+      const sideCleanFixed = ctx.createGain();
+      sideCleanFixed.gain.value = 1.0; // Ganho fixo de 1.0 (sem qualquer ducking)
 
-      const vocalBandLP = ctx.createBiquadFilter();
-      vocalBandLP.type = 'lowpass';
-      vocalBandLP.frequency.value = 4100;
-      vocalBandLP.Q.value = 0.707;
+      sideRaw.connect(sideBassLP);
+      sideRaw.connect(sideTrebleHP);
+      sideBassLP.connect(sideCleanFixed);
+      sideTrebleHP.connect(sideCleanFixed);
 
-      const midVocalGateGain = ctx.createGain();
-      midVocalGateGain.gain.value = 1.0;
-
-      midSum.connect(midLowPass);
-      midSum.connect(midHighPass);
-      midSum.connect(vocalBandHP);
-      vocalBandHP.connect(vocalBandLP);
-      vocalBandLP.connect(midVocalGateGain);
-
-      const midRecombined = ctx.createGain();
-      midRecombined.gain.value = 1.0;
-      midLowPass.connect(midRecombined);
-      midHighPass.connect(midRecombined);
-      midVocalGateGain.connect(midRecombined);
-
-      // Ganho de compensação automática no canal Estéreo Lateral (S) quando a banda vocal central é atenuada
-      const sideCompensatedGain = ctx.createGain();
-      sideCompensatedGain.gain.value = 1.0;
-      sideSum.connect(sideCompensatedGain);
-
-      // Reconstrução Estéreo: L_out = M_out + S, R_out = M_out - S
-      const sideRightInvert = ctx.createGain();
-      sideRightInvert.gain.value = -1.0;
-      sideCompensatedGain.connect(sideRightInvert);
+      const sideCleanRightInv = ctx.createGain();
+      sideCleanRightInv.gain.value = -1.0;
+      sideCleanFixed.connect(sideCleanRightInv);
 
       const merger = ctx.createChannelMerger(2);
-      midRecombined.connect(merger, 0, 0);
-      sideCompensatedGain.connect(merger, 0, 0);
+      midChannelFixed.connect(merger, 0, 0);
+      sideCleanFixed.connect(merger, 0, 0);
 
-      midRecombined.connect(merger, 0, 1);
-      sideRightInvert.connect(merger, 0, 1);
+      midChannelFixed.connect(merger, 0, 1);
+      sideCleanRightInv.connect(merger, 0, 1);
 
       const destination = ctx.createMediaStreamDestination();
       merger.connect(destination);
 
       return {
         sysSource,
-        midVocalGateGain,
-        sideCompensatedGain,
         outputTrack: destination.stream.getAudioTracks()[0] || null
       };
     } catch (e) {
@@ -2886,6 +3016,7 @@
       }
     });
 
+    // Mantém a track de áudio da transmissão 100% ativa (sempre em volume 1.0, mesmo quando várias pessoas falam)
     if (localSysAudioTrack) {
       localSysAudioTrack.enabled = !anyRemoteLiveAudioPlayingOnOurSpeakers;
     }
@@ -3014,11 +3145,11 @@
           } catch (_audErr) {}
         }
 
-        // Conecta a Matriz Mid-Side + Band-Split com Lookahead de 25ms
-        const dspMatrix = createMidSideBandSplitMatrix(rawSysAudioTrack);
-        if (dspMatrix && dspMatrix.outputTrack) {
-          state.localScreenDspNodes = dspMatrix;
-          outboundStream.addTrack(dspMatrix.outputTrack);
+        // Conecta o Cancelador Algébrico Mid (M = (DL + DR)/2) com ganho fixo 1.0
+        const algebraicCanceller = createAlgebraicMidCancellerStream(rawSysAudioTrack);
+        if (algebraicCanceller && algebraicCanceller.outputTrack) {
+          state.localScreenDspNodes = algebraicCanceller;
+          outboundStream.addTrack(algebraicCanceller.outputTrack);
         } else {
           outboundStream.addTrack(rawSysAudioTrack);
         }
@@ -3032,8 +3163,8 @@
       state.streamStartedAt = Date.now();
       state.myStreamViewers.clear();
 
-      // Ativa o atraso de Lookahead de 25ms e o filtro Mono (185 Hz - 3700 Hz) nas vozes recebidas
-      syncRemoteVoicesLookaheadState();
+      // Ativa imediatamente a Fase Ortogonal (VL = +V, VR = -V) nas vozes recebidas dos amigos
+      syncRemoteVoicesOrthogonalPhaseState();
 
       if (state.streamTimerInterval) clearInterval(state.streamTimerInterval);
       state.streamTimerInterval = setInterval(updateBroadcasterControlPanel, 1000);
@@ -3061,6 +3192,9 @@
           const alreadySent = peerObj.pc.getSenders().some(s => s.track === track);
           if (!alreadySent) peerObj.pc.addTrack(track, outboundStream);
         });
+        if (state.streamSettings.resolution === 1440) {
+          preferVp9CodecFor2K(peerObj.pc);
+        }
         peerObj.suppressAutoNegotiation = false;
         negotiateWithPeer(peerId, peerObj);
       }
@@ -3072,7 +3206,7 @@
       setTimeout(() => enforceHighQualityForAllViewers(), 1000);
     } catch (err) {
       state.isStreaming = false;
-      syncRemoteVoicesLookaheadState();
+      syncRemoteVoicesOrthogonalPhaseState();
       syncStreamButtonsVisualState();
       console.log('Partilha de ecrã cancelada:', err);
     }
@@ -3134,9 +3268,6 @@
       state.localScreenDspNodes = null;
     }
 
-    // Desativa o atraso de Lookahead de 25ms voltando para latência zero quando não está transmitindo
-    syncRemoteVoicesLookaheadState();
-
     if (state.localScreenStream) {
       const tracksToStop = state.localScreenStream.getTracks();
 
@@ -3162,6 +3293,9 @@
       state.localScreenRawStream.getTracks().forEach(t => t.stop());
       state.localScreenRawStream = null;
     }
+
+    // Restaura a fase normal (VL = +V, VR = +V) nas vozes recebidas ao encerrar a transmissão
+    syncRemoteVoicesOrthogonalPhaseState();
 
     syncStreamButtonsVisualState();
     updateBroadcasterControlPanel();
@@ -4238,7 +4372,7 @@
     reader.readAsDataURL(file);
   }
 
-  // ================= 9. EVENTOS DE SALA + CONTROLO MID-SIDE COM LOOKAHEAD DE 25MS =================
+  // ================= 9. EVENTOS DE SALA E MONITORAMENTO EM TEMPO REAL =================
   socket.on('rooms:update', (rooms) => {
     state.rooms = rooms;
     renderRoomsList();
@@ -4326,11 +4460,10 @@
     }
   });
 
-  // Loop de 20ms: Deteta voz 25ms antes de sair no fone (Lookahead) e atua apenas na banda vocal Mono (150Hz-4100Hz)
+  // Loop de 40ms: Apenas Deteção Visual de Voz (o Cancelamento Algébrico M = (DL + DR)/2 elimina 100% do eco sem mexer no volume!)
   setInterval(() => {
     const buf = new Uint8Array(128);
     let overlayDirty = false;
-    let anyRemoteSpeakingNow = false;
     const nowPerf = performance.now();
 
     for (const [peerId, peerObj] of state.peers.entries()) {
@@ -4366,7 +4499,6 @@
       if (card) card.classList.toggle('speaking', isTalking);
 
       if (isTalking) {
-        anyRemoteSpeakingNow = true;
         state.lastRemoteVoiceActivityAt = nowPerf;
       }
 
@@ -4380,32 +4512,10 @@
       }
     }
 
-    // Atuação da Matriz Mid-Side + Band-Split durante a transmissão:
-    // - Quando ninguém fala: 100% do áudio original (M + S) passa intacto (midVocalGateGain = 1.0, sideCompensatedGain = 1.0).
-    // - No instante em que alguém fala (25ms antes de sair no fone): silencia APENAS a faixa vocal Mono central (150Hz-4100Hz),
-    //   mantendo 100% do canal Estéreo Lateral (L-R), 100% dos Graves (<150Hz) e 100% dos Agudos (>4100Hz) com compensação de ganho!
-    if (state.isStreaming && state.localScreenDspNodes && state.audioContext) {
-      const withinHoldWindow = anyRemoteSpeakingNow || (nowPerf - state.lastRemoteVoiceActivityAt) < 220;
-      const nowAudio = state.audioContext.currentTime;
-      const targetVocalMidGain = withinHoldWindow ? 0.0 : 1.0;
-      const targetSideBoostGain = withinHoldWindow ? 1.35 : 1.0;
-
-      state.localScreenDspNodes.midVocalGateGain.gain.setTargetAtTime(
-        targetVocalMidGain,
-        nowAudio,
-        withinHoldWindow ? 0.004 : 0.05
-      );
-      state.localScreenDspNodes.sideCompensatedGain.gain.setTargetAtTime(
-        targetSideBoostGain,
-        nowAudio,
-        withinHoldWindow ? 0.006 : 0.05
-      );
-    }
-
     if (overlayDirty) {
       syncDesktopOverlayState();
     }
-  }, 20);
+  }, 40);
 
   // Auditor Contínuo de Saúde da Malha de Voz, Transmissões e Telemetria (a cada 1.8s)
   setInterval(async () => {
@@ -4449,6 +4559,7 @@
 
     if (state.isStreaming) {
       enforceHighQualityForAllViewers();
+      syncRemoteVoicesOrthogonalPhaseState();
     }
 
     for (const [peerId, peerObj] of state.peers.entries()) {

@@ -5,7 +5,7 @@ const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
 const https = require('https');
-const { execFileSync } = require('child_process');
+const { exec, execFileSync } = require('child_process');
 
 // ================= 1. GERADOR AUTOMÁTICO DO ÍCONE OFICIAL (.ICO / .PNG) =================
 function ensureAppIcons() {
@@ -170,9 +170,7 @@ async function ensureWinCodeSignCache() {
         try {
           fs.renameSync(candidatePath, targetDir);
           return;
-        } catch (_err) {
-          // Ignora falha de renomeação e prossegue para extração limpa
-        }
+        } catch (_err) {}
       }
     }
   }
@@ -188,15 +186,23 @@ async function ensureWinCodeSignCache() {
     execFileSync(sevenZipPath, ['x', '-bd', '-y', '-xr!darwin', archivePath, '-o' + targetDir], {
       stdio: 'ignore'
     });
-  } catch (_err) {
-    // Ignora avisos não fatais do 7-Zip
-  }
+  } catch (_err) {}
 
   try {
     fs.unlinkSync(archivePath);
-  } catch (_err) {
-    // Ignora caso o arquivo temporário já tenha sido removido
-  }
+  } catch (_err) {}
+}
+
+// Desativa automaticamente a atenuação de 80% do Windows ("UserDuckingPreference = 3")
+function disableWindowsCommunicationsDucking() {
+  if (process.platform !== 'win32') return;
+  try {
+    exec(
+      'reg add "HKCU\\Software\\Microsoft\\Multimedia\\Audio" /v UserDuckingPreference /t REG_DWORD /d 3 /f',
+      { windowsHide: true },
+      () => {}
+    );
+  } catch (_err) {}
 }
 
 // ================= 2. EXECUÇÃO PRINCIPAL DO ELECTRON =================
@@ -204,6 +210,9 @@ function startElectronRuntime(iconPaths) {
   const {
     app,
     BrowserWindow,
+    Tray,
+    Menu,
+    nativeImage,
     desktopCapturer,
     session,
     globalShortcut,
@@ -213,11 +222,13 @@ function startElectronRuntime(iconPaths) {
   } = require('electron');
 
   const CLOUD_URL = process.env.AETHER_CLOUD_URL || 'https://aether-platform.onrender.com';
-  const LOCAL_URL = 'http://localhost:3000';
+  const LOCAL_URL = 'http://localhost:10000';
 
   if (CLOUD_URL === LOCAL_URL) {
     require('./server.js');
   }
+
+  disableWindowsCommunicationsDucking();
 
   app.setAppUserModelId('com.aether.realtime');
   app.commandLine.appendSwitch('enable-gpu-rasterization');
@@ -227,17 +238,26 @@ function startElectronRuntime(iconPaths) {
   app.commandLine.appendSwitch('ignore-gpu-blocklist');
   app.commandLine.appendSwitch('disable-renderer-backgrounding');
   app.commandLine.appendSwitch('disable-background-timer-throttling');
+  app.commandLine.appendSwitch('disable-ducking');
   app.commandLine.appendSwitch('webrtc-max-cpu-consumption-percentage', '100');
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
   let mainWindow = null;
   let overlayWindow = null;
+  let appTray = null;
+  let isQuittingApp = false;
   let runtimePathsGlobal = null;
   let usingLocalMode = false;
   let isMainWindowFocused = true;
   let isOverlayDomReady = false;
   let isApplyingBoundsProgrammatically = false;
   let queuedNotifications = [];
+
+  let desktopPrefs = {
+    openAtLogin: false,
+    startMinimized: false,
+    minimizeToTrayOnClose: true
+  };
 
   let overlayConfig = {
     enabled: true,
@@ -268,6 +288,110 @@ function startElectronRuntime(iconPaths) {
     toggleDeafen: 'CommandOrControl+Shift+D'
   };
 
+  function getDesktopPrefsFilePath() {
+    return path.join(app.getPath('userData'), 'aether-desktop-prefs.json');
+  }
+
+  function loadPersistedDesktopPrefs() {
+    try {
+      const p = getDesktopPrefsFilePath();
+      if (fs.existsSync(p)) {
+        const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+        desktopPrefs = {
+          openAtLogin: Boolean(parsed.openAtLogin),
+          startMinimized: Boolean(parsed.startMinimized),
+          minimizeToTrayOnClose: parsed.minimizeToTrayOnClose !== false
+        };
+      }
+    } catch (_err) {}
+    return desktopPrefs;
+  }
+
+  function saveAndApplyDesktopPrefs(newPrefs) {
+    if (newPrefs && typeof newPrefs === 'object') {
+      if (typeof newPrefs.openAtLogin === 'boolean') desktopPrefs.openAtLogin = newPrefs.openAtLogin;
+      if (typeof newPrefs.startMinimized === 'boolean') desktopPrefs.startMinimized = newPrefs.startMinimized;
+      if (typeof newPrefs.minimizeToTrayOnClose === 'boolean') desktopPrefs.minimizeToTrayOnClose = newPrefs.minimizeToTrayOnClose;
+    }
+
+    try {
+      fs.writeFileSync(getDesktopPrefsFilePath(), JSON.stringify(desktopPrefs, null, 2), 'utf8');
+    } catch (_err) {}
+
+    if (app.isPackaged) {
+      try {
+        app.setLoginItemSettings({
+          openAtLogin: Boolean(desktopPrefs.openAtLogin),
+          path: process.execPath,
+          args: desktopPrefs.startMinimized ? ['--StartMinimized'] : []
+        });
+      } catch (_err) {}
+    }
+
+    return desktopPrefs;
+  }
+
+  function ensureSystemTray() {
+    if (appTray) return appTray;
+    try {
+      const trayImg = nativeImage.createFromPath(iconPaths.pngPath).resize({ width: 16, height: 16 });
+      appTray = new Tray(trayImg);
+      appTray.setToolTip('Aether — Comunicação & Streaming 2K');
+
+      const contextMenu = Menu.buildFromTemplate([
+        {
+          label: 'Abrir Aether',
+          click: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.show();
+              if (mainWindow.isMinimized()) mainWindow.restore();
+              mainWindow.focus();
+            }
+          }
+        },
+        {
+          label: 'Alternar Microfone (Mute/Unmute)',
+          click: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('desktop:hotkey-command', { action: 'toggle-mic' });
+            }
+          }
+        },
+        {
+          label: 'Mostrar / Ocultar Overlay em Jogo',
+          click: () => {
+            overlayConfig.enabled = !overlayConfig.enabled;
+            syncOverlayVisibilityAndContent();
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('desktop:overlay-toggled', overlayConfig.enabled);
+            }
+          }
+        },
+        { type: 'separator' },
+        {
+          label: 'Encerrar Aether Completamente',
+          click: () => {
+            isQuittingApp = true;
+            app.quit();
+          }
+        }
+      ]);
+
+      appTray.setContextMenu(contextMenu);
+      appTray.on('click', () => {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
+          mainWindow.focus();
+        } else {
+          mainWindow.show();
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          mainWindow.focus();
+        }
+      });
+    } catch (_err) {}
+    return appTray;
+  }
+
   function ensureRuntimeBridgeFiles() {
     const userDataDir = app.getPath('userData');
     const preloadPath = path.join(userDataDir, 'aether-preload.js');
@@ -282,6 +406,8 @@ function startElectronRuntime(iconPaths) {
       "  lockOverlayFromHud: () => ipcRenderer.send('desktop:overlay-lock-from-hud'),",
       "  updateHotkeys: (hk) => ipcRenderer.invoke('desktop:update-hotkeys', hk),",
       "  getHotkeys: () => ipcRenderer.invoke('desktop:get-hotkeys'),",
+      "  getDesktopPrefs: () => ipcRenderer.invoke('desktop:get-prefs'),",
+      "  updateDesktopPrefs: (prefs) => ipcRenderer.invoke('desktop:update-prefs', prefs),",
       "  notify: (payload) => ipcRenderer.send('desktop:notify', payload),",
       "  onHotkeyCommand: (cb) => {",
       "    ipcRenderer.removeAllListeners('desktop:hotkey-command');",
@@ -352,9 +478,7 @@ function startElectronRuntime(iconPaths) {
       '      -webkit-app-region: drag;',
       '      cursor: move;',
       '    }',
-      '    .overlay-root.unlocked-mode .overlay-drag-bar {',
-      '      display: flex;',
-      '    }',
+      '    .overlay-root.unlocked-mode .overlay-drag-bar { display: flex; }',
       '    .overlay-lock-btn {',
       '      -webkit-app-region: no-drag;',
       '      background: #10b981;',
@@ -760,9 +884,7 @@ function startElectronRuntime(iconPaths) {
       if (!accel || typeof accel !== 'string' || !accel.trim()) return;
       try {
         globalShortcut.register(accel.trim(), handler);
-      } catch (_err) {
-        // Ignora combinações de teclas inválidas ou reservadas pelo SO
-      }
+      } catch (_err) {}
     };
 
     safeRegister(currentHotkeys.toggleMic, () => {
@@ -805,11 +927,17 @@ function startElectronRuntime(iconPaths) {
   }
 
   function createMainWindow(runtimePaths) {
+    loadPersistedDesktopPrefs();
+    const shouldStartHidden = Boolean(
+      desktopPrefs.startMinimized || process.argv.includes('--StartMinimized')
+    );
+
     mainWindow = new BrowserWindow({
       width: 1366,
       height: 768,
       minWidth: 1024,
       minHeight: 640,
+      show: !shouldStartHidden,
       title: 'Aether',
       icon: iconPaths.icoPath,
       backgroundColor: '#141821',
@@ -822,6 +950,10 @@ function startElectronRuntime(iconPaths) {
       }
     });
 
+    if (shouldStartHidden) {
+      isMainWindowFocused = false;
+    }
+
     session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
       desktopCapturer.getSources({ types: ['screen', 'window'] }).then((sources) => {
         if (sources && sources.length > 0) {
@@ -832,9 +964,18 @@ function startElectronRuntime(iconPaths) {
       }).catch(() => callback({}));
     });
 
-    mainWindow.loadURL(CLOUD_URL).catch(() => {
+    mainWindow.loadURL(CLOUD_URL + '/app').catch(() => {
       require('./server.js');
-      mainWindow.loadURL(LOCAL_URL);
+      mainWindow.loadURL(LOCAL_URL + '/app');
+    });
+
+    mainWindow.on('close', (event) => {
+      if (!isQuittingApp && desktopPrefs.minimizeToTrayOnClose) {
+        event.preventDefault();
+        mainWindow.hide();
+        isMainWindowFocused = false;
+        syncOverlayVisibilityAndContent();
+      }
     });
 
     mainWindow.on('focus', () => {
@@ -869,7 +1010,7 @@ function startElectronRuntime(iconPaths) {
       }
       if (input.control && input.shift && input.key.toLowerCase() === 'l') {
         usingLocalMode = !usingLocalMode;
-        mainWindow.loadURL(usingLocalMode ? LOCAL_URL : CLOUD_URL);
+        mainWindow.loadURL((usingLocalMode ? LOCAL_URL : CLOUD_URL) + '/app');
       }
     });
 
@@ -881,8 +1022,15 @@ function startElectronRuntime(iconPaths) {
     });
   }
 
+  app.on('before-quit', () => {
+    isQuittingApp = true;
+  });
+
   app.whenReady().then(() => {
     runtimePathsGlobal = ensureRuntimeBridgeFiles();
+    loadPersistedDesktopPrefs();
+    saveAndApplyDesktopPrefs(desktopPrefs);
+    ensureSystemTray();
 
     ipcMain.on('desktop:overlay-state', (_event, payload) => {
       lastOverlayPayload = {
@@ -922,6 +1070,13 @@ function startElectronRuntime(iconPaths) {
 
     ipcMain.handle('desktop:get-hotkeys', () => currentHotkeys);
 
+    ipcMain.handle('desktop:get-prefs', () => desktopPrefs);
+
+    ipcMain.handle('desktop:update-prefs', (_event, newPrefs) => {
+      const updated = saveAndApplyDesktopPrefs(newPrefs);
+      return { ok: true, prefs: updated };
+    });
+
     ipcMain.on('desktop:notify', (_event, payload) => {
       if (!payload || !payload.title) return;
 
@@ -947,6 +1102,7 @@ function startElectronRuntime(iconPaths) {
         });
         notif.on('click', () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.show();
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.focus();
           }
