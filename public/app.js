@@ -85,7 +85,6 @@
     localMicMeterTimer: null,
     localScreenStream: null,
     localScreenRawStream: null,
-    localScreenDspNodes: null,
     lastRemoteVoiceActivityAt: 0,
     lastVideoBytesReceived: new Map(),
     audioContext: null,
@@ -267,7 +266,6 @@
     toggleUiAnimations: document.getElementById('toggle-ui-animations')
   };
 
-  // Injeta estilos auxiliares e o filtro SVG Sub-Píxel dedicado para 2K (#cas-sharpen-2k)
   function injectAuxiliaryStylesAnd2KFilter() {
     if (!document.getElementById('aether-2k-svg-defs')) {
       const svgWrap = document.createElement('div');
@@ -396,7 +394,6 @@
         color: #fecdd3 !important;
         box-shadow: 0 0 16px rgba(244, 63, 94, 0.28);
       }
-      /* Filtro Sub-Píxel Dedicado para 2K (2560x1440) */
       video.stream-webrtc-video.native-2k-crisp {
         filter: url(#cas-sharpen-2k) contrast(1.03) saturate(1.03) !important;
         image-rendering: -webkit-optimize-contrast;
@@ -1320,7 +1317,7 @@
     const audioStatusEl = document.getElementById('broadcaster-audio-status');
     if (audioStatusEl) {
       audioStatusEl.textContent = hasSysAudio
-        ? '🔊 Cancelamento Algébrico Ativo (Zero Eco • Volume 100%)'
+        ? '🔊 Compartilhando áudio'
         : '🔇 Somente tela (sem áudio)';
     }
 
@@ -1553,7 +1550,7 @@
     });
   }
 
-  // ================= 1. LOGIN AUTOMÁTICO (CONCLUI initLocalVoiceEngine ANTES DE room:join) =================
+  // ================= 1. LOGIN AUTOMÁTICO =================
   function validateEntryInputs() {
     const nameValid = el.inputName.value.trim().length >= 2;
     const cleanedNick = el.inputNick.value.replace(/[^a-zA-Z0-9_\s]/g, '');
@@ -1637,7 +1634,7 @@
     }
   } catch (e) {}
 
-  // ================= 2. MOTOR DE VOZ + RELAY AUTOMÁTICO CGNAT + INJEÇÃO ORTOGONAL (L = +V, R = -V) =================
+  // ================= 2. MOTOR DE VOZ PURO E INDEPENDENTE DE LIVES =================
   function getNoiseFilterFrequencies(level) {
     switch (level) {
       case 'low':
@@ -1890,7 +1887,7 @@
     }, 40);
   }
 
-  // Recebe pacotes de voz via Relay com fase invertida (VL = +V, VR = -V) durante transmissões com áudio
+  // Reproduz voz via Relay sem qualquer inversão de fase ou corte de frequência quando há live ativa
   socket.on('voice:relay', ({ from, pcm, sampleRate }) => {
     if (state.isDeafened || !pcm || !state.audioContext) return;
     const peerObj = state.peers.get(from);
@@ -1916,32 +1913,12 @@
       const src = ctx.createBufferSource();
       src.buffer = audioBuffer;
 
-      const hp = ctx.createBiquadFilter();
-      hp.type = 'highpass';
-      hp.frequency.value = 185;
-
-      const lp = ctx.createBiquadFilter();
-      lp.type = 'lowpass';
-      lp.frequency.value = 3700;
-
       const gainNode = ctx.createGain();
       const userVol = state.userVolumes.get(from) ?? 100;
       gainNode.gain.value = state.isDeafened ? 0 : Math.min(1, userVol / 100);
 
-      // Fase ortogonal: L = +V, R = -V quando estiver a transmitir com áudio (cancela-se para 0,000% no canal Mid!)
-      const useOrthogonalPhase = Boolean(state.isStreaming && state.localScreenStream?.getAudioTracks().length > 0);
-      const rightPhase = ctx.createGain();
-      rightPhase.gain.value = useOrthogonalPhase ? -1.0 : 1.0;
-
-      const stereoMerger = ctx.createChannelMerger(2);
-
-      src.connect(hp);
-      hp.connect(lp);
-      lp.connect(gainNode);
-      gainNode.connect(stereoMerger, 0, 0);
-      gainNode.connect(rightPhase);
-      rightPhase.connect(stereoMerger, 0, 1);
-      stereoMerger.connect(ctx.destination);
+      src.connect(gainNode);
+      gainNode.connect(ctx.destination);
 
       const now = ctx.currentTime;
       const nextTime = Math.max(now, peerObj?.relayNextPlayTime || now);
@@ -2080,13 +2057,12 @@
     });
   });
 
-  // ================= 4. WEBRTC ENGINE (MODO 1440P 2K @ 45 MBPS + VP9 EXCLUSIVO EM 2K) =================
+  // ================= 4. WEBRTC ENGINE (VOZ DE ALTA DEFINIÇÃO BLINDADA DURANTE LIVES) =================
   function getTargetBitrateKbps() {
     if (state.streamSettings.bitrateMode !== 'auto') {
       const manualVal = Number(state.streamSettings.bitrateMode);
       return state.streamSettings.resolution === 1440 ? Math.max(35000, manualVal) : manualVal;
     }
-    // 1080p permanece em 12000 kbps; 1440p (2K) é elevado para 45 Mbps (45000 kbps)
     return state.streamSettings.resolution === 1440
       ? 45000
       : state.streamSettings.resolution === 1080
@@ -2094,7 +2070,6 @@
         : 6500;
   }
 
-  // Prioriza exclusivamente o codec VP9 (superblocos 64x64) quando em 1440p (2K), mantendo 1080p inalterado
   function preferVp9CodecFor2K(pc) {
     if (state.streamSettings.resolution !== 1440) return;
     if (!pc || typeof RTCRtpSender === 'undefined' || typeof RTCRtpSender.getCapabilities !== 'function') return;
@@ -2118,6 +2093,7 @@
     } catch (_err) {}
   }
 
+  // Preserva a qualidade máxima de voz Opus (128 kbps CBR, sem compressão nem DTX) mesmo quando uma live é iniciada
   function enhanceSdpForHighQualityStream(sdp) {
     if (!sdp) return sdp;
     const targetMax = getTargetBitrateKbps();
@@ -2139,6 +2115,11 @@
           /(a=fmtp:\d+ (?!.*apt=)(?!.*x-google-max-bitrate)[^\r\n]+)/g,
           `$1;x-google-max-bitrate=${targetMax};x-google-min-bitrate=${minBitrate};x-google-start-bitrate=${startBitrate}`
         );
+      } else if (sections[i].startsWith('audio')) {
+        sections[i] = sections[i].replace(
+          /(a=fmtp:\d+ minptime=10;useinbandfec=1(?!.*maxaveragebitrate)[^\r\n]*)/g,
+          `$1;maxaveragebitrate=128000;cbr=1;usedtx=0`
+        );
       }
     }
     return sections.join('\r\nm=');
@@ -2157,6 +2138,19 @@
       isStreaming: state.isStreaming,
       streamConfig: state.streamSettings
     };
+  }
+
+  async function applyVoiceSenderHighPriority(sender) {
+    if (!sender || !sender.track || sender.track.kind !== 'audio') return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) return;
+      params.encodings[0].maxBitrate = 128000;
+      params.encodings[0].priority = 'high';
+      params.encodings[0].networkPriority = 'high';
+      params.encodings[0].active = true;
+      await sender.setParameters(params);
+    } catch (_err) {}
   }
 
   function ensureLocalAudioSenderOnPeer(peerObj) {
@@ -2184,6 +2178,7 @@
           }
         });
       }
+      applyVoiceSenderHighPriority(existingVoiceSender);
       return false;
     }
 
@@ -2195,13 +2190,15 @@
         try {
           freeAudioTransceiver.sender.replaceTrack(voiceTrack).catch(() => {});
           freeAudioTransceiver.direction = 'sendrecv';
+          applyVoiceSenderHighPriority(freeAudioTransceiver.sender);
           return true;
         } catch (e) {}
       }
     }
 
     try {
-      pc.addTrack(voiceTrack, state.localVoiceStream);
+      const newSender = pc.addTrack(voiceTrack, state.localVoiceStream);
+      applyVoiceSenderHighPriority(newSender);
       return true;
     } catch (e) {
       return false;
@@ -2392,9 +2389,6 @@
       voiceSourceNode: null,
       voiceHighPassNode: null,
       voiceLowPassNode: null,
-      voiceGainNode: null,
-      voiceRightPhaseNode: null,
-      voiceStereoMerger: null,
       voiceAudioEl: null,
       remoteAnalyser: null,
       screenStream: null,
@@ -2592,18 +2586,6 @@
       try { peerObj.voiceLowPassNode.disconnect(); } catch (e) {}
       peerObj.voiceLowPassNode = null;
     }
-    if (peerObj.voiceGainNode) {
-      try { peerObj.voiceGainNode.disconnect(); } catch (e) {}
-      peerObj.voiceGainNode = null;
-    }
-    if (peerObj.voiceRightPhaseNode) {
-      try { peerObj.voiceRightPhaseNode.disconnect(); } catch (e) {}
-      peerObj.voiceRightPhaseNode = null;
-    }
-    if (peerObj.voiceStereoMerger) {
-      try { peerObj.voiceStereoMerger.disconnect(); } catch (e) {}
-      peerObj.voiceStereoMerger = null;
-    }
     if (peerObj.remoteAnalyser) {
       try { peerObj.remoteAnalyser.disconnect(); } catch (e) {}
       peerObj.remoteAnalyser = null;
@@ -2617,45 +2599,22 @@
     peerObj.attachedVoiceTrackId = null;
   }
 
-  // Alterna a fase do canal direito das vozes dos participantes:
-  // - Quando você transmite tela com áudio: VL = +V(t), VR = -V(t) (Fase Ortogonal que se anula para 0,000% no canal Mid da live!)
-  // - Quando não transmite: VL = +V(t), VR = +V(t) (Fase normal)
-  function syncRemoteVoicesOrthogonalPhaseState() {
-    if (!state.audioContext) return;
-    const now = state.audioContext.currentTime;
-    const useOrthogonalPhase = Boolean(
-      state.isStreaming && state.localScreenStream && state.localScreenStream.getAudioTracks().length > 0
-    );
+  function applyRemotePeerNoiseProfile(peerId, level) {
+    state.userNoiseLevels.set(peerId, level);
+    const peerObj = state.peers.get(peerId);
+    if (!peerObj) return;
 
-    for (const [peerId, peerObj] of state.peers.entries()) {
-      const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
-      const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
-
-      if (peerObj.voiceHighPassNode) {
-        const targetHp = useOrthogonalPhase ? Math.max(185, hpFreq) : hpFreq;
-        peerObj.voiceHighPassNode.frequency.setTargetAtTime(targetHp, now, 0.02);
-      }
-      if (peerObj.voiceLowPassNode) {
-        const targetLp = useOrthogonalPhase ? Math.min(3900, lpFreq) : lpFreq;
-        peerObj.voiceLowPassNode.frequency.setTargetAtTime(targetLp, now, 0.02);
-      }
-      if (peerObj.voiceRightPhaseNode) {
-        peerObj.voiceRightPhaseNode.gain.setTargetAtTime(useOrthogonalPhase ? -1.0 : 1.0, now, 0.01);
-      }
-      if (peerObj.voiceAudioEl && peerObj.voiceGainNode) {
-        // Garante que o elemento <audio> auxiliar permanece silenciado para nunca vazar áudio em fase (+V, +V) fora do barramento
-        peerObj.voiceAudioEl.muted = true;
-        peerObj.voiceAudioEl.volume = 0;
-      }
+    const { hpFreq, lpFreq } = getNoiseFilterFrequencies(level);
+    if (peerObj.voiceHighPassNode && state.audioContext) {
+      peerObj.voiceHighPassNode.frequency.setTargetAtTime(hpFreq, state.audioContext.currentTime, 0.03);
+    }
+    if (peerObj.voiceLowPassNode && state.audioContext) {
+      peerObj.voiceLowPassNode.frequency.setTargetAtTime(lpFreq, state.audioContext.currentTime, 0.03);
     }
   }
 
-  function applyRemotePeerNoiseProfile(peerId, level) {
-    state.userNoiseLevels.set(peerId, level);
-    syncRemoteVoicesOrthogonalPhaseState();
-  }
-
-  // Pipeline de Voz Remota com Barramento Ortogonal (VL = +V, VR = -V quando em transmissão)
+  // Reproduz a voz dos participantes SEMPRE de forma 100% direta, limpa e natural no elemento <audio>,
+  // sem alterar fase, filtros ou volume quando uma transmissão é iniciada!
   function setupRemoteVoicePipeline(peerId, isolatedVoiceStream) {
     const peerObj = state.peers.get(peerId);
     if (!peerObj) return;
@@ -2667,9 +2626,17 @@
     audioEl.srcObject = isolatedVoiceStream;
     audioEl.autoplay = true;
     audioEl.playsInline = true;
+    audioEl.muted = state.isDeafened;
+    audioEl.volume = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
 
-    let webAudioRoutingActive = false;
+    if (state.selectedAudioOutputId && state.selectedAudioOutputId !== 'default' && typeof audioEl.setSinkId === 'function') {
+      audioEl.setSinkId(state.selectedAudioOutputId).catch(() => {});
+    }
 
+    el.remoteVoiceAudios.appendChild(audioEl);
+    audioEl.play().catch(() => {});
+
+    // O AudioContext é ligado apenas ao analisador visual de voz (nunca altera nem abafa o som reproduzido)
     if (state.audioContext) {
       try {
         if (state.audioContext.state === 'suspended') {
@@ -2678,67 +2645,30 @@
         const ctx = state.audioContext;
         const nrLevel = state.userNoiseLevels.get(peerId) || 'auto';
         const { hpFreq, lpFreq } = getNoiseFilterFrequencies(nrLevel);
-        const useOrthogonalPhase = Boolean(
-          state.isStreaming && state.localScreenStream && state.localScreenStream.getAudioTracks().length > 0
-        );
 
         const source = ctx.createMediaStreamSource(isolatedVoiceStream);
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = hpFreq;
+
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = lpFreq;
 
         const remoteAnalyser = ctx.createAnalyser();
         remoteAnalyser.fftSize = 256;
         remoteAnalyser.smoothingTimeConstant = 0.25;
 
-        const hp = ctx.createBiquadFilter();
-        hp.type = 'highpass';
-        hp.frequency.value = useOrthogonalPhase ? Math.max(185, hpFreq) : hpFreq;
-
-        const lp = ctx.createBiquadFilter();
-        lp.type = 'lowpass';
-        lp.frequency.value = useOrthogonalPhase ? Math.min(3900, lpFreq) : lpFreq;
-
-        const gainNode = ctx.createGain();
-        gainNode.gain.value = state.isDeafened ? 0 : Math.min(1, savedVol / 100);
-
-        // Canal Esquerdo: +V(t) | Canal Direito: -V(t) durante transmissão com áudio
-        const rightPhaseNode = ctx.createGain();
-        rightPhaseNode.gain.value = useOrthogonalPhase ? -1.0 : 1.0;
-
-        const stereoMerger = ctx.createChannelMerger(2);
-
         source.connect(hp);
         hp.connect(lp);
         lp.connect(remoteAnalyser);
-        lp.connect(gainNode);
-
-        gainNode.connect(stereoMerger, 0, 0);
-        gainNode.connect(rightPhaseNode);
-        rightPhaseNode.connect(stereoMerger, 0, 1);
-
-        stereoMerger.connect(ctx.destination);
 
         peerObj.voiceSourceNode = source;
         peerObj.voiceHighPassNode = hp;
         peerObj.voiceLowPassNode = lp;
-        peerObj.voiceGainNode = gainNode;
-        peerObj.voiceRightPhaseNode = rightPhaseNode;
-        peerObj.voiceStereoMerger = stereoMerger;
         peerObj.remoteAnalyser = remoteAnalyser;
-        webAudioRoutingActive = true;
-      } catch (e) {
-        webAudioRoutingActive = false;
-      }
+      } catch (e) {}
     }
-
-    // Mantém <audio> estritamente silenciado quando o barramento WebAudio está ativo para não duplicar o sinal fora do barramento
-    audioEl.muted = webAudioRoutingActive ? true : state.isDeafened;
-    audioEl.volume = webAudioRoutingActive ? 0 : (state.isDeafened ? 0 : Math.min(1, savedVol / 100));
-
-    if (state.selectedAudioOutputId && state.selectedAudioOutputId !== 'default' && typeof audioEl.setSinkId === 'function') {
-      audioEl.setSinkId(state.selectedAudioOutputId).catch(() => {});
-    }
-
-    el.remoteVoiceAudios.appendChild(audioEl);
-    audioEl.play().catch(() => {});
 
     peerObj.voiceAudioEl = audioEl;
   }
@@ -2882,89 +2812,7 @@
     });
   });
 
-  // ================= 5. CANCELADOR ALGÉBRICO NO CANAL MID (M = (DL + DR)/2) COM GANHO FIXO 1.0 =================
-  // Como as vozes dos participantes saem em fase invertida (DL = VideoL + g*V, DR = VideoR - g*V),
-  // no canal Mid (M = (DL + DR)/2) a voz dos espectadores cancela-se algebricamente para 0,000% (+g*V - g*V = 0)
-  // em todas as amostras, mantendo 100% do volume do vídeo/música (ganho fixo 1.0 sempre, zero ducking)!
-  function createAlgebraicMidCancellerStream(rawSysAudioTrack) {
-    if (!state.audioContext || !rawSysAudioTrack) return null;
-    try {
-      const ctx = state.audioContext;
-      if (ctx.state === 'suspended') {
-        ctx.resume().catch(() => {});
-      }
-
-      const sysSource = ctx.createMediaStreamSource(new MediaStream([rawSysAudioTrack]));
-      const splitter = ctx.createChannelSplitter(2);
-      sysSource.connect(splitter);
-
-      // Canal Central da Transmissão: M(t) = (D_L(t) + D_R(t)) / 2 -> +g*V(t-tau) - g*V(t-tau) = 0,000%!
-      const midGainL = ctx.createGain();
-      midGainL.gain.value = 0.5;
-      const midGainR = ctx.createGain();
-      midGainR.gain.value = 0.5;
-      const midChannelFixed = ctx.createGain();
-      midChannelFixed.gain.value = 1.0; // Ganho fixo de 1.0 (100% do volume sempre)
-
-      splitter.connect(midGainL, 0);
-      splitter.connect(midGainR, 1);
-      midGainL.connect(midChannelFixed);
-      midGainR.connect(midChannelFixed);
-
-      // Canal Estéreo Lateral (S = (D_L - D_R)/2) filtrado apenas para Graves (< 150 Hz) e Agudos (> 4100 Hz) com ganho fixo 1.0
-      const sideGainL = ctx.createGain();
-      sideGainL.gain.value = 0.5;
-      const sideGainRInv = ctx.createGain();
-      sideGainRInv.gain.value = -0.5;
-      const sideRaw = ctx.createGain();
-      sideRaw.gain.value = 1.0;
-
-      splitter.connect(sideGainL, 0);
-      splitter.connect(sideGainRInv, 1);
-      sideGainL.connect(sideRaw);
-      sideGainRInv.connect(sideRaw);
-
-      const sideBassLP = ctx.createBiquadFilter();
-      sideBassLP.type = 'lowpass';
-      sideBassLP.frequency.value = 150;
-      sideBassLP.Q.value = 0.707;
-
-      const sideTrebleHP = ctx.createBiquadFilter();
-      sideTrebleHP.type = 'highpass';
-      sideTrebleHP.frequency.value = 4100;
-      sideTrebleHP.Q.value = 0.707;
-
-      const sideCleanFixed = ctx.createGain();
-      sideCleanFixed.gain.value = 1.0; // Ganho fixo de 1.0 (sem qualquer ducking)
-
-      sideRaw.connect(sideBassLP);
-      sideRaw.connect(sideTrebleHP);
-      sideBassLP.connect(sideCleanFixed);
-      sideTrebleHP.connect(sideCleanFixed);
-
-      const sideCleanRightInv = ctx.createGain();
-      sideCleanRightInv.gain.value = -1.0;
-      sideCleanFixed.connect(sideCleanRightInv);
-
-      const merger = ctx.createChannelMerger(2);
-      midChannelFixed.connect(merger, 0, 0);
-      sideCleanFixed.connect(merger, 0, 0);
-
-      midChannelFixed.connect(merger, 0, 1);
-      sideCleanRightInv.connect(merger, 0, 1);
-
-      const destination = ctx.createMediaStreamDestination();
-      merger.connect(destination);
-
-      return {
-        sysSource,
-        outputTrack: destination.stream.getAudioTracks()[0] || null
-      };
-    } catch (e) {
-      return null;
-    }
-  }
-
+  // ================= 5. BARRAMENTO DE ÁUDIO DE LIVES (SEM INTERFERIR NA VOZ DA SALA) =================
   function syncMultiStreamAudioBus(preferredPeerId = null) {
     if (preferredPeerId && preferredPeerId !== socket.id) {
       state.activeAudioStreamPeerId = preferredPeerId;
@@ -3016,7 +2864,6 @@
       }
     });
 
-    // Mantém a track de áudio da transmissão 100% ativa (sempre em volume 1.0, mesmo quando várias pessoas falam)
     if (localSysAudioTrack) {
       localSysAudioTrack.enabled = !anyRemoteLiveAudioPlayingOnOurSpeakers;
     }
@@ -3144,15 +2991,7 @@
             });
           } catch (_audErr) {}
         }
-
-        // Conecta o Cancelador Algébrico Mid (M = (DL + DR)/2) com ganho fixo 1.0
-        const algebraicCanceller = createAlgebraicMidCancellerStream(rawSysAudioTrack);
-        if (algebraicCanceller && algebraicCanceller.outputTrack) {
-          state.localScreenDspNodes = algebraicCanceller;
-          outboundStream.addTrack(algebraicCanceller.outputTrack);
-        } else {
-          outboundStream.addTrack(rawSysAudioTrack);
-        }
+        outboundStream.addTrack(rawSysAudioTrack);
       }
 
       videoTrack.onended = () => stopScreenSharing();
@@ -3162,9 +3001,6 @@
       state.isStreaming = true;
       state.streamStartedAt = Date.now();
       state.myStreamViewers.clear();
-
-      // Ativa imediatamente a Fase Ortogonal (VL = +V, VR = -V) nas vozes recebidas dos amigos
-      syncRemoteVoicesOrthogonalPhaseState();
 
       if (state.streamTimerInterval) clearInterval(state.streamTimerInterval);
       state.streamTimerInterval = setInterval(updateBroadcasterControlPanel, 1000);
@@ -3206,7 +3042,6 @@
       setTimeout(() => enforceHighQualityForAllViewers(), 1000);
     } catch (err) {
       state.isStreaming = false;
-      syncRemoteVoicesOrthogonalPhaseState();
       syncStreamButtonsVisualState();
       console.log('Partilha de ecrã cancelada:', err);
     }
@@ -3243,12 +3078,15 @@
       lockCaptureVideoTrackResolution(vidTrack, dims, state.streamSettings.fps);
     }
 
+    const screenAudioTrack = state.localScreenStream?.getAudioTracks()[0] || null;
     for (const [, peerObj] of state.peers.entries()) {
       if (peerObj.pc.signalingState !== 'stable') continue;
       const senders = peerObj.pc.getSenders();
       senders.forEach((sender) => {
         if (sender.track && sender.track.kind === 'video') {
           applyVideoSenderParameters(sender);
+        } else if (sender.track && sender.track.kind === 'audio' && sender.track !== screenAudioTrack) {
+          applyVoiceSenderHighPriority(sender);
         }
       });
     }
@@ -3262,11 +3100,6 @@
     state.streamStartedAt = null;
     state.myStreamViewers.clear();
     state.isStreaming = false;
-
-    if (state.localScreenDspNodes) {
-      try { state.localScreenDspNodes.sysSource.disconnect(); } catch (e) {}
-      state.localScreenDspNodes = null;
-    }
 
     if (state.localScreenStream) {
       const tracksToStop = state.localScreenStream.getTracks();
@@ -3293,9 +3126,6 @@
       state.localScreenRawStream.getTracks().forEach(t => t.stop());
       state.localScreenRawStream = null;
     }
-
-    // Restaura a fase normal (VL = +V, VR = +V) nas vozes recebidas ao encerrar a transmissão
-    syncRemoteVoicesOrthogonalPhaseState();
 
     syncStreamButtonsVisualState();
     updateBroadcasterControlPanel();
@@ -3620,13 +3450,7 @@
 
     for (const [peerId, peerObj] of state.peers.entries()) {
       const vol = state.userVolumes.get(peerId) ?? 100;
-      if (peerObj.voiceGainNode && state.audioContext) {
-        peerObj.voiceGainNode.gain.setTargetAtTime(
-          state.isDeafened ? 0 : Math.min(1, vol / 100),
-          state.audioContext.currentTime,
-          0.015
-        );
-      } else if (peerObj.voiceAudioEl) {
+      if (peerObj.voiceAudioEl) {
         peerObj.voiceAudioEl.muted = state.isDeafened;
         peerObj.voiceAudioEl.volume = state.isDeafened ? 0 : Math.min(1, vol / 100);
       }
@@ -3721,13 +3545,7 @@
           state.userVolumes.set(u.socketId, val);
           label.textContent = `${val}%`;
           const pObj = state.peers.get(u.socketId);
-          if (pObj?.voiceGainNode && state.audioContext) {
-            pObj.voiceGainNode.gain.setTargetAtTime(
-              state.isDeafened ? 0 : Math.min(1, val / 100),
-              state.audioContext.currentTime,
-              0.015
-            );
-          } else if (pObj?.voiceAudioEl) {
+          if (pObj?.voiceAudioEl) {
             pObj.voiceAudioEl.muted = state.isDeafened || val === 0;
             pObj.voiceAudioEl.volume = state.isDeafened ? 0 : Math.min(1, val / 100);
           }
@@ -4460,7 +4278,6 @@
     }
   });
 
-  // Loop de 40ms: Apenas Deteção Visual de Voz (o Cancelamento Algébrico M = (DL + DR)/2 elimina 100% do eco sem mexer no volume!)
   setInterval(() => {
     const buf = new Uint8Array(128);
     let overlayDirty = false;
@@ -4517,7 +4334,6 @@
     }
   }, 40);
 
-  // Auditor Contínuo de Saúde da Malha de Voz, Transmissões e Telemetria (a cada 1.8s)
   setInterval(async () => {
     let bestRtt = null;
     let totalLost = 0;
@@ -4559,7 +4375,6 @@
 
     if (state.isStreaming) {
       enforceHighQualityForAllViewers();
-      syncRemoteVoicesOrthogonalPhaseState();
     }
 
     for (const [peerId, peerObj] of state.peers.entries()) {
