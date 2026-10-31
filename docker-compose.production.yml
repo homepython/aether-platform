@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aether}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:-aether}
+    volumes:
+      - aether_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aether}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - aether_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./deploy/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_STATIC_AUTH_SECRET:?Defina TURN_STATIC_AUTH_SECRET}"
+      - "--realm=${PUBLIC_DOMAIN:-aether.local}"
+      - "--external-ip=${MEDIASOUP_ANNOUNCED_IP:?Defina MEDIASOUP_ANNOUNCED_IP com o IP publico do servidor}"
+
+  aether-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-aether}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aether}}
+      DATABASE_SSL: ${DATABASE_SSL:-false}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      PASSWORD_PEPPER: ${PASSWORD_PEPPER:?Defina PASSWORD_PEPPER no .env.production}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?Defina DATA_ENCRYPTION_KEY no .env.production}
+      DESKTOP_INSTALLER_URL: ${DESKTOP_INSTALLER_URL:-}
+    ports:
+      - "127.0.0.1:3001:3001"
+      - "40000-40400:40000-40400/udp"
+      - "40000-40400:40000-40400/tcp"
+    volumes:
+      - aether_uploads:/app/uploads
+      - ./release/desktop:/app/release/desktop:ro
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - aether-server
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - aether_caddy_data:/data
+      - aether_caddy_config:/config
+
+volumes:
+  aether_pg_data:
+  aether_redis_data:
+  aether_uploads:
+  aether_caddy_data:
+  aether_caddy_config:

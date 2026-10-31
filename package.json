@@ -1,55 +1,30 @@
 {
-  "name": "aether-realtime-platform",
+  "name": "aether-platform",
   "version": "1.0.0",
-  "description": "Aether — Plataforma de Comunicação e Streaming em Tempo Real",
-  "author": "Leo Oliveira",
-  "main": "main.js",
+  "private": true,
+  "description": "Aether — Production Real-Time Voice, Chat & Ultra-HD Streaming Platform",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
-    "start": "node server.js",
-    "electron": "electron .",
-    "build:exe": "node main.js --generate-icon && electron-builder --win --x64"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "express": "^4.21.0",
-    "socket.io": "^4.8.0"
+    "build:shared": "npm --workspace=@aether/shared run build",
+    "build:server": "npm --workspace=@aether/server run build",
+    "build:web": "npm --workspace=@aether/web run build",
+    "build:native": "dotnet publish apps/desktop/native-helper/AetherNativeHelper.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o apps/desktop/resources/bin",
+    "build:desktop": "npm run build:shared && npm run build:web && npm run build:native && npm --workspace=@aether/desktop run build",
+    "dist:desktop": "npm run build:desktop && npm --workspace=@aether/desktop run dist",
+    "build": "npm run build:shared && npm run build:web && npm run build:server",
+    "dev:server": "npm --workspace=@aether/server run dev",
+    "dev:web": "npm --workspace=@aether/web run dev",
+    "dev:desktop": "npm --workspace=@aether/desktop run dev",
+    "start": "npm --workspace=@aether/server run start",
+    "test": "vitest run"
   },
   "devDependencies": {
-    "electron": "^33.0.0",
-    "electron-builder": "^25.1.8"
-  },
-  "build": {
-    "appId": "com.aether.realtime",
-    "productName": "Aether",
-    "directories": {
-      "output": "dist"
-    },
-    "files": [
-      "main.js",
-      "server.js",
-      "public/**/*",
-      "package.json"
-    ],
-    "win": {
-      "target": [
-        "nsis"
-      ],
-      "icon": "public/icon.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowElevation": true,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Aether",
-      "installerIcon": "public/icon.ico",
-      "uninstallerIcon": "public/icon.ico",
-      "installerHeaderIcon": "public/icon.ico",
-      "runAfterFinish": true
-    }
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.7"
   }
 }

@@ -1,10 +1,39 @@
+# ==============================================================================
+# AETHER — BLUEPRINT RENDER.COM (API + AUTH + CHAT + SINALIZAÇÃO + POSTGRES FREE)
+# Nota: Render Web Services roteiam HTTP/WSS (TCP 443). Para mídia WebRTC UDP pura
+# em 1440p @ 75 FPS sem relay TURN TCP, utilize preferencialmente a stack gratuita
+# Oracle Cloud Always Free (`deploy/bootstrap-oracle-free.sh`).
+# ==============================================================================
 services:
   - type: web
-    name: aether-realtime-server
-    env: node
+    name: aether-platform
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PORT
+        value: "3001"
+      - key: MEDIASOUP_WORKERS
+        value: "2"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: aether-postgres
+          property: connectionString
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: PASSWORD_PEPPER
+        generateValue: true
+      - key: DATA_ENCRYPTION_KEY
+        generateValue: true
+
+databases:
+  - name: aether-postgres
+    plan: free
+    databaseName: aether
+    user: aether
+

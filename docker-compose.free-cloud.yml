@@ -1,0 +1,80 @@
+# ==============================================================================
+# AETHER — STACK ONLINE 100% GRATUITA 24/7 (ZERO DEPENDÊNCIA DO SEU PC)
+# Recomendado: Oracle Cloud Always Free (VM.Standard.A1.Flex: 4 OCPU / 24 GB RAM)
+#              + Neon.tech Free PostgreSQL (Serverless TLS)
+#              + Cloudflare R2 Free (10 GB S3 Storage c/ Egress Grátis)
+#              + Caddy (HTTPS + WSS Automático Let's Encrypt) + Coturn (STUN/TURN)
+# ==============================================================================
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./deploy/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_STATIC_AUTH_SECRET:?Defina TURN_STATIC_AUTH_SECRET no .env.production}"
+      - "--realm=${PUBLIC_DOMAIN:-aether.local}"
+      - "--external-ip=${MEDIASOUP_ANNOUNCED_IP:?Defina MEDIASOUP_ANNOUNCED_IP com o IPv4 publico da VM}"
+
+  aether-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATABASE_URL: ${DATABASE_URL:?Defina DATABASE_URL do Neon.tech / Supabase PostgreSQL no .env.production}
+      DATABASE_SSL: ${DATABASE_SSL:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      PASSWORD_PEPPER: ${PASSWORD_PEPPER:?Defina PASSWORD_PEPPER no .env.production}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?Defina DATA_ENCRYPTION_KEY no .env.production}
+      DESKTOP_INSTALLER_URL: ${DESKTOP_INSTALLER_URL:-}
+    ports:
+      - "127.0.0.1:3001:3001"
+      - "40000-40400:40000-40400/udp"
+      - "40000-40400:40000-40400/tcp"
+    volumes:
+      - aether_uploads:/app/uploads
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - aether-server
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?Defina PUBLIC_DOMAIN no .env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - aether_caddy_data:/data
+      - aether_caddy_config:/config
+
+volumes:
+  aether_uploads:
+  aether_caddy_data:
+  aether_caddy_config:
+

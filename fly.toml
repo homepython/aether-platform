@@ -1,0 +1,71 @@
+# ==============================================================================
+# AETHER — MANIFESTO ALTERNATIVO FLY.IO (HTTP/WSS + PORTAS UDP DEDICADAS SFU)
+# Requer IPv4 dedicado no Fly.io (`fly ips allocate-v4`) definido em MEDIASOUP_ANNOUNCED_IP
+# e segredos configurados com `fly secrets set JWT_ACCESS_SECRET=... PASSWORD_PEPPER=...`
+# ==============================================================================
+app = "aether-realtime"
+primary_region = "gru"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  HOST = "0.0.0.0"
+  PORT = "3001"
+  MEDIASOUP_LISTEN_IP = "fly-global-services"
+  MEDIASOUP_MIN_PORT = "40000"
+  MEDIASOUP_MAX_PORT = "40020"
+  MEDIASOUP_WORKERS = "2"
+  DATABASE_SSL = "true"
+
+[[services]]
+  internal_port = 3001
+  protocol = "tcp"
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+# Mapeamento direto de portas UDP para o SFU mediasoup (baixa latência real)
+[[services]]
+  internal_port = 40000
+  protocol = "udp"
+  [[services.ports]]
+    port = 40000
+
+[[services]]
+  internal_port = 40001
+  protocol = "udp"
+  [[services.ports]]
+    port = 40001
+
+[[services]]
+  internal_port = 40002
+  protocol = "udp"
+  [[services.ports]]
+    port = 40002
+
+[[services]]
+  internal_port = 40003
+  protocol = "udp"
+  [[services.ports]]
+    port = 40003
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+

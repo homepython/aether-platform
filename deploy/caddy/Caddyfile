@@ -1,0 +1,13 @@
+{$PUBLIC_DOMAIN} {
+  encode zstd gzip
+
+  request_body {
+    max_size 55MB
+  }
+
+  reverse_proxy 127.0.0.1:3001 {
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-Proto {scheme}
+  }
+}
+

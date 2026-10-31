@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Aether Overlay</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        user-select: none;
+        pointer-events: none;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', 'Segoe UI', sans-serif;
+      }
+      #overlay-root {
+        display: inline-flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 10px;
+        transform-origin: top left;
+        transition: opacity 0.16s ease, transform 0.16s ease;
+      }
+      .room-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(10, 12, 16, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        color: rgba(255, 255, 255, 0.72);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+        width: fit-content;
+      }
+      .room-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #10b981;
+      }
+      .peer-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 11px 5px 6px;
+        border-radius: 999px;
+        background: rgba(13, 16, 22, 0.82);
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        color: #f4f6fa;
+        font-size: 12px;
+        font-weight: 600;
+        width: fit-content;
+        transition: border-color 0.12s ease, background 0.12s ease, transform 0.12s ease;
+      }
+      .peer-pill.speaking {
+        background: rgba(13, 24, 21, 0.92);
+        border-color: rgba(16, 185, 129, 0.85);
+        box-shadow: 0 0 14px rgba(16, 185, 129, 0.28);
+      }
+      .avatar {
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 9px;
+        font-weight: 700;
+        color: #fff;
+      }
+      .speaking .avatar {
+        box-shadow: 0 0 0 2px #10b981;
+      }
+      .muted-tag {
+        font-size: 9px;
+        color: #f87171;
+        font-weight: 700;
+      }
+      .live-tag {
+        font-size: 9px;
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: rgba(239, 68, 68, 0.25);
+        color: #f87171;
+        font-weight: 700;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="overlay-root"></div>
+    <script>
+      const root = document.getElementById('overlay-root');
+      let currentConfig = { scale: 1, opacity: 0.88, showOnlySpeaking: false, alignRight: false };
+      let currentState = { roomName: null, participants: [] };
+
+      function render() {
+        if (!currentState.roomName || !currentState.participants.length) {
+          root.innerHTML = '';
+          return;
+        }
+        root.style.opacity = String(currentConfig.opacity ?? 0.88);
+        root.style.transformOrigin = currentConfig.alignRight ? 'top right' : 'top left';
+        root.style.transform = `scale(${currentConfig.scale ?? 1})`;
+        root.style.alignItems = currentConfig.alignRight ? 'flex-end' : 'flex-start';
+        document.body.style.display = 'flex';
+        document.body.style.justifyContent = currentConfig.alignRight ? 'flex-end' : 'flex-start';
+
+        const list = currentConfig.showOnlySpeaking
+          ? currentState.participants.filter((p) => p.speaking)
+          : currentState.participants;
+
+        if (!list.length && currentConfig.showOnlySpeaking) {
+          root.innerHTML = '';
+          return;
+        }
+
+        const header = `<div class="room-badge"><span class="room-dot"></span><span>${escapeHtml(
+          currentState.roomName
+        )}</span></div>`;
+
+        const items = list
+          .map((p) => {
+            const initials = escapeHtml((p.displayName || '?').slice(0, 2).toUpperCase());
+            return `<div class="peer-pill ${p.speaking ? 'speaking' : ''}">
+              <div class="avatar" style="background:${escapeHtml(p.avatarColor || '#2563EB')}">${initials}</div>
+              <span>${escapeHtml(p.displayName)}</span>
+              ${p.micMuted ? '<span class="muted-tag">MUDO</span>' : ''}
+              ${p.isStreaming ? '<span class="live-tag">LIVE</span>' : ''}
+            </div>`;
+          })
+          .join('');
+
+        root.innerHTML = header + items;
+      }
+
+      function escapeHtml(str) {
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      if (window.aetherOverlay) {
+        window.aetherOverlay.onUpdate((payload) => {
+          if (payload.config) currentConfig = { ...currentConfig, ...payload.config };
+          if (payload.state) currentState = payload.state;
+          render();
+        });
+      }
+    </script>
+  </body>
+</html>
+
