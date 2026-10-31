@@ -140,6 +140,10 @@ export class SfuManager {
   public onStreamStopped?: (roomId: string, streamId: string, broadcasterId: string) => void;
 
   async init(): Promise<void> {
+    if (config.mediasoup.mediaMode === 'p2p') {
+      console.log('[SFU] Cloud WebRTC Direct-Plane mode active (signaling via WSS)');
+      return;
+    }
     const count = config.mediasoup.numWorkers;
     for (let i = 0; i < count; i++) {
       const worker = await this.spawnWorker(i);

@@ -515,7 +515,10 @@ export class RealtimeGateway {
         peer.speaking = false;
 
         this.sfu.registerPeer(peer.peerId, roomRow.id, peer.user);
-        const router = await this.sfu.getOrCreateRoomRouter(roomRow.id);
+        const routerRtpCapabilities =
+          config.mediasoup.mediaMode === 'p2p'
+            ? { codecs: [], headerExtensions: [] }
+            : (await this.sfu.getOrCreateRoomRouter(roomRow.id)).rtpCapabilities;
         const messages = await this.db.listRoomMessages(roomRow.id, 60);
         const participant = this.serializeParticipant(peer);
 
@@ -536,7 +539,7 @@ export class RealtimeGateway {
           room: this.mapRoomSummary(roomRow),
           participants: this.listRoomParticipants(roomRow.id),
           activeStreams: this.listCombinedRoomStreams(roomRow.id),
-          routerRtpCapabilities: router.rtpCapabilities,
+          routerRtpCapabilities,
           iceServers: buildIceServersForUser(peer.user.id),
           messages,
           mediaMode: config.mediasoup.mediaMode,

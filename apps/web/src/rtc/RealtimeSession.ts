@@ -63,6 +63,7 @@ export class RealtimeSession {
   >();
 
   private myPeerId = '';
+  private inActiveRoom = false;
   private mediaMode: 'sfu' | 'p2p' = 'sfu';
   private localMicTrack: MediaStreamTrack | null = null;
   private p2pVoicePeers = new Map<string, P2pVoiceEntry>();
@@ -496,12 +497,9 @@ export class RealtimeSession {
     });
 
     this.myPeerId = joinRes.peerId;
+    this.inActiveRoom = true;
     this.mediaMode = joinRes.mediaMode ?? 'sfu';
     this.iceServers = joinRes.iceServers;
-    this.device = new Device();
-    await this.device.load({
-      routerRtpCapabilities: joinRes.routerRtpCapabilities as mediasoupTypes.RtpCapabilities,
-    });
 
     if (this.mediaMode === 'p2p') {
       // Cloud P2P WebRTC Mode (100% real Dual-Plane media over STUN/TURN when PaaS blocks container UDP)
@@ -525,6 +523,11 @@ export class RealtimeSession {
 
       return joinRes;
     }
+
+    this.device = new Device();
+    await this.device.load({
+      routerRtpCapabilities: joinRes.routerRtpCapabilities as mediasoupTypes.RtpCapabilities,
+    });
 
     // 1. Setup Dedicated Voice Transports (completely isolated from Video Stream Plane)
     this.voiceRecvTransport = await this.initClientTransport('voice', 'recv');
@@ -792,7 +795,7 @@ export class RealtimeSession {
     contentOptimization: 'detail' | 'motion';
     desktopSource?: DesktopCaptureSourceItem | null;
   }): Promise<ActiveStreamInfo> {
-    if (!this.device) throw new Error('Entre em uma sala antes de transmitir');
+    if (!this.inActiveRoom) throw new Error('Entre em uma sala antes de transmitir');
     await this.stopLiveStream();
 
     const spec = STREAM_RESOLUTION_SPECS[options.resolution];
@@ -1153,7 +1156,7 @@ export class RealtimeSession {
     videoStream: MediaStream;
     hasAudio: boolean;
   }> {
-    if (!this.device) throw new Error('Dispositivo de mídia não inicializado');
+    if (!this.inActiveRoom) throw new Error('Entre em uma sala para assistir à transmissão');
     await audioEngine.resumeContexts();
     this.cleanupWatchedStream(streamId);
 
@@ -1287,6 +1290,10 @@ export class RealtimeSession {
         viewerPc.close();
         throw err;
       }
+    }
+
+    if (!this.device) {
+      throw new Error('Dispositivo SFU não inicializado na sala.');
     }
 
     if (!this.streamRecvTransport || this.streamRecvTransport.closed) {
@@ -1441,6 +1448,7 @@ export class RealtimeSession {
     } catch {
       // Ignore
     }
+    this.inActiveRoom = false;
     this.localMicTrack = null;
     this.voiceProducer = null;
     this.voiceSendTransport = null;
