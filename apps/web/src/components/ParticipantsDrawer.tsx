@@ -1,14 +1,19 @@
 import React, { useState } from 'react';
 import {
+  Ban,
   HeadphoneOff,
   Laptop,
   MicOff,
+  ShieldAlert,
   Sliders,
   Sparkles,
+  UserMinus,
   Volume2,
   VolumeX,
 } from 'lucide-react';
+import { hasRoleAtLeast, ROLE_RANK } from '@aether/shared';
 import { useAppStore } from '../store/useAppStore.js';
+import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
 
 export const ParticipantsDrawer: React.FC = () => {
   const user = useAppStore((s) => s.user);
@@ -16,10 +21,25 @@ export const ParticipantsDrawer: React.FC = () => {
   const participants = useAppStore((s) => s.participants);
   const peerOverrides = useAppStore((s) => s.settings.audio.peerOverrides);
   const setPeerAudioOverride = useAppStore((s) => s.setPeerAudioOverride);
+  const kickParticipant = useAppStore((s) => s.kickParticipant);
+  const forceMuteParticipant = useAppStore((s) => s.forceMuteParticipant);
+  const pushToast = useAppStore((s) => s.pushToast);
 
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
 
   if (!currentRoom) return null;
+
+  const runModeration = async (action: () => Promise<void>, label: string) => {
+    try {
+      await action();
+      pushToast({ title: 'Moderação aplicada', body: label });
+    } catch (err) {
+      pushToast({
+        title: 'Falha na moderação',
+        body: err instanceof Error ? err.message : 'Permissão insuficiente',
+      });
+    }
+  };
 
   return (
     <aside
@@ -48,6 +68,12 @@ export const ParticipantsDrawer: React.FC = () => {
             noiseReductionLevel: 50,
           };
           const isExpanded = !isMe && expandedUserId === p.user.id;
+          const myRole = user?.role ?? 'member';
+          const targetRole = p.user.role ?? 'member';
+          const canModerate =
+            !isMe &&
+            hasRoleAtLeast(myRole, 'moderator') &&
+            (myRole === 'owner' || ROLE_RANK[myRole] > ROLE_RANK[targetRole]);
 
           return (
             <div
@@ -71,11 +97,14 @@ export const ParticipantsDrawer: React.FC = () => {
                   </div>
 
                   <div className="min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <span className="truncate text-xs font-semibold">
-                        {p.user.displayName}
-                        {isMe ? ' (Você)' : ''}
-                      </span>
+                    <div className="flex min-w-0 items-center gap-1.5 text-xs">
+                      <StyledUserName
+                        name={p.user.displayName}
+                        role={p.user.role}
+                        suffix={isMe ? '(Você)' : undefined}
+                        className="font-semibold"
+                      />
+                      <UserRoleBadge role={p.user.role} compact />
                       {p.clientPlatform === 'desktop' && (
                         <span title="Aplicativo Desktop">
                           <Laptop className="h-3 w-3 shrink-0" style={{ color: 'var(--text-muted)' }} />
@@ -211,6 +240,55 @@ export const ParticipantsDrawer: React.FC = () => {
                       </div>
                     )}
                   </div>
+
+                  {canModerate && (
+                    <div className="border-t pt-3" style={{ borderColor: 'var(--border-hairline)' }}>
+                      <div
+                        className="mb-2 inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        <ShieldAlert className="h-3.5 w-3.5" />
+                        Moderação
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void runModeration(
+                              () => forceMuteParticipant(p.peerId),
+                              `${p.user.displayName} foi silenciado na sala.`
+                            )
+                          }
+                          className="inline-flex items-center justify-center gap-1.5 rounded-lg border px-2 py-1.5 text-[11px] font-medium"
+                          style={{
+                            borderColor: 'var(--border-hairline)',
+                            backgroundColor: 'var(--bg-elevated)',
+                            color: 'var(--text-secondary)',
+                          }}
+                        >
+                          <Ban className="h-3 w-3" />
+                          Silenciar na Sala
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void runModeration(
+                              () => kickParticipant(p.peerId),
+                              `${p.user.displayName} foi removido da sala.`
+                            )
+                          }
+                          className="inline-flex items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[11px] font-semibold"
+                          style={{
+                            backgroundColor: 'var(--live-red-soft)',
+                            color: 'var(--live-red)',
+                          }}
+                        >
+                          <UserMinus className="h-3 w-3" />
+                          Remover da Sala
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

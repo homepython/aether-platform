@@ -8,6 +8,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  powerSaveBlocker,
   protocol,
   safeStorage,
   screen,
@@ -31,11 +32,21 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-// Critical Chromium flags for Zero Audio Ducking & Hardware GPU Video Encode/Decode
+// Critical Chromium flags for Zero Audio Ducking, Zero Unfocused FPS Drop & Hardware GPU Video Encode/Decode
 app.commandLine.appendSwitch(
   'disable-features',
-  'AudioDucking,WebRtcHybridAgc,CalculateNativeWinOcclusion'
+  'AudioDucking,WebRtcHybridAgc,CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes'
 );
+app.commandLine.appendSwitch(
+  'enable-features',
+  'WebRtcUseGpuMemoryBufferVideoFrames,MediaFoundationD3D11VideoCapture'
+);
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('enable-accelerated-video-encode');
+app.commandLine.appendSwitch('enable-accelerated-video-decode');
+app.commandLine.appendSwitch('webrtc-max-cpu-consumption-percentage', '100');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('enable-gpu-rasterization');
 app.commandLine.appendSwitch('enable-zero-copy');
@@ -46,6 +57,10 @@ let overlayWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let pendingDisplayCaptureSourceId: string | null = null;
+let activePowerBlockerId: number | null = null;
+let lastOverlayBoundsKey = '';
+let lastOverlayRenderJson = '';
+let overlayAlignRight = false;
 
 interface OverlayConfig {
   enabled: boolean;
@@ -322,6 +337,12 @@ function createMainWindow(): void {
     void mainWindow.loadURL('aether://app/index.html');
   }
 
+  mainWindow.webContents.on('did-finish-load', () => {
+    // Immediately opt Electron Browser, GPU, and Renderer processes out of Windows 11 EcoQoS & unfocused timer throttling
+    const pids = app.getAppMetrics().map((m) => m.pid);
+    void nativeHelper.sendCommand('setBroadcastBoost', { active: false, pids });
+  });
+
   mainWindow.on('close', (e) => {
     if (!isQuitting) {
       e.preventDefault();
@@ -365,18 +386,12 @@ function createOverlayWindow(): void {
     if (hwnd) {
       void nativeHelper.sendCommand('applyOverlayShield', { hwnd, clickThrough: true });
     }
-    repositionAndSyncOverlay();
+    syncOverlayVisibilityAndRender(true);
   });
 }
 
-function repositionAndSyncOverlay(): void {
+function repositionOverlayIfNeeded(): void {
   if (!overlayWindow || overlayWindow.isDestroyed()) return;
-
-  const hasRoom = Boolean(currentOverlayState.roomName);
-  if (!currentOverlayConfig.enabled || !hasRoom) {
-    overlayWindow.hide();
-    return;
-  }
 
   const primary = screen.getPrimaryDisplay();
   const { x: areaX, y: areaY, width: areaW, height: areaH } = primary.workArea;
@@ -422,7 +437,42 @@ function repositionAndSyncOverlay(): void {
       break;
   }
 
-  overlayWindow.setBounds({ x: targetX, y: targetY, width: winW, height: winH });
+  overlayAlignRight = alignRight;
+  const boundsKey = `${targetX}:${targetY}:${winW}:${winH}`;
+  // Never spam Win32 SetWindowPos on TOPMOST layered windows when bounds did not change!
+  // Preserves Windows DWM DirectFlip / Multiplane Overlay for full 1% low FPS in DirectX 11/12 & Vulkan games.
+  if (boundsKey !== lastOverlayBoundsKey) {
+    lastOverlayBoundsKey = boundsKey;
+    overlayWindow.setBounds({ x: targetX, y: targetY, width: winW, height: winH });
+  }
+}
+
+function syncOverlayVisibilityAndRender(forceReposition = false): void {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+
+  const participants = Array.isArray(currentOverlayState.participants)
+    ? (currentOverlayState.participants as Array<{ speaking?: boolean }>)
+    : [];
+  const hasVisiblePeers = currentOverlayConfig.showOnlySpeaking
+    ? participants.some((p) => Boolean(p.speaking))
+    : participants.length > 0;
+  const shouldShow =
+    Boolean(currentOverlayConfig.enabled) &&
+    Boolean(currentOverlayState.roomName) &&
+    hasVisiblePeers;
+
+  if (!shouldShow) {
+    if (overlayWindow.isVisible()) {
+      overlayWindow.hide();
+    }
+    lastOverlayRenderJson = '';
+    return;
+  }
+
+  if (forceReposition || !lastOverlayBoundsKey) {
+    repositionOverlayIfNeeded();
+  }
+
   if (!overlayWindow.isVisible()) {
     overlayWindow.showInactive();
     const hwnd = getHwndNumber(overlayWindow);
@@ -431,10 +481,15 @@ function repositionAndSyncOverlay(): void {
     }
   }
 
-  overlayWindow.webContents.send('overlay:render', {
-    config: { ...currentOverlayConfig, alignRight },
+  const payload = {
+    config: { ...currentOverlayConfig, alignRight: overlayAlignRight },
     state: currentOverlayState,
-  });
+  };
+  const serialized = JSON.stringify(payload);
+  if (serialized !== lastOverlayRenderJson) {
+    lastOverlayRenderJson = serialized;
+    overlayWindow.webContents.send('overlay:render', payload);
+  }
 }
 
 function createSystemTray(): void {
@@ -590,14 +645,34 @@ function registerIpcHandlers(): void {
     await nativeHelper.sendCommand('configureShortcuts', cfg);
   });
 
+  ipcMain.handle('perf:setBroadcastActive', async (_ev, active: boolean) => {
+    const isBroadcasting = Boolean(active);
+    if (isBroadcasting) {
+      if (activePowerBlockerId === null || !powerSaveBlocker.isStarted(activePowerBlockerId)) {
+        activePowerBlockerId = powerSaveBlocker.start('prevent-display-sleep');
+      }
+    } else if (activePowerBlockerId !== null) {
+      if (powerSaveBlocker.isStarted(activePowerBlockerId)) {
+        powerSaveBlocker.stop(activePowerBlockerId);
+      }
+      activePowerBlockerId = null;
+    }
+
+    const pids = app.getAppMetrics().map((m) => m.pid);
+    return nativeHelper.sendCommand('setBroadcastBoost', {
+      active: isBroadcasting,
+      pids,
+    });
+  });
+
   ipcMain.handle('overlay:updateConfig', (_ev, settings: OverlayConfig) => {
     currentOverlayConfig = { ...currentOverlayConfig, ...settings };
-    repositionAndSyncOverlay();
+    syncOverlayVisibilityAndRender(true);
   });
 
   ipcMain.on('overlay:updateState', (_ev, state: { roomName: string | null; participants: unknown[] }) => {
     currentOverlayState = state;
-    repositionAndSyncOverlay();
+    syncOverlayVisibilityAndRender(false);
   });
 
   // Forward Native Helper PCM frames & Global Input Hooks to Renderer
@@ -618,6 +693,15 @@ function registerIpcHandlers(): void {
       mainWindow.webContents.send('input:shortcutTriggered', action);
     }
   });
+}
+
+// Register custom OS deep-link protocol (aether-app://open) so the official website can launch/focus Aether Desktop
+if (process.defaultApp) {
+  if (process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient('aether-app', process.execPath, [path.resolve(process.argv[1])]);
+  }
+} else {
+  app.setAsDefaultProtocolClient('aether-app');
 }
 
 const gotSingleLock = app.requestSingleInstanceLock();
@@ -641,5 +725,8 @@ if (!gotSingleLock) {
     createSystemTray();
     createMainWindow();
     createOverlayWindow();
+    screen.on('display-metrics-changed', () => {
+      syncOverlayVisibilityAndRender(true);
+    });
   });
 }

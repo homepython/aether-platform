@@ -53,7 +53,9 @@ export const StreamLauncherModal: React.FC = () => {
     setResolution(streamSettings.resolution);
     setFps(streamSettings.fps);
     setShareAudio(streamSettings.shareAudio);
-    setContentOptimization(streamSettings.contentOptimization);
+    setContentOptimization(
+      streamSettings.resolution === '1440p' ? streamSettings.contentOptimization : 'motion'
+    );
     setError(null);
 
     if (desktopApi) {
@@ -267,7 +269,10 @@ export const StreamLauncherModal: React.FC = () => {
                   <button
                     key={resId}
                     type="button"
-                    onClick={() => setResolution(resId)}
+                    onClick={() => {
+                      setResolution(resId);
+                      setContentOptimization(resId === '1440p' ? 'detail' : 'motion');
+                    }}
                     className="rounded-2xl border p-3 text-left transition-all"
                     style={{
                       borderColor: active ? 'var(--accent)' : 'var(--border-hairline)',
@@ -381,9 +386,7 @@ export const StreamLauncherModal: React.FC = () => {
           >
             <span className="inline-flex items-center gap-1.5">
               <ShieldCheck className="h-4 w-4" style={{ color: 'var(--voice-green)' }} />
-              {desktopApi
-                ? 'Isolamento de áudio por processo ativo (0% de eco das vozes da sala)'
-                : 'No navegador, compartilhe uma Aba para isolamento nativo sem eco de voz'}
+              Isolamento WASAPI por processo ativo (0% eco das vozes) • GPU NVENC/AMF/QSV
             </span>
             <span className="font-semibold tabular-nums">
               Alvo: {(targetKbps / 1000).toFixed(1)} Mbps

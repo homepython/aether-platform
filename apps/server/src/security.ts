@@ -168,6 +168,23 @@ export function safeEqualHex(aHex: string, bHex: string): boolean {
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
+/**
+ * Constant-time HMAC-SHA256 verification of the server-side Admin Master Key.
+ * Leaks zero information about key length or prefix via timing side-channels.
+ */
+export function verifyAdminMasterKey(candidate: string): boolean {
+  if (!candidate || !config.security.adminMasterKey) return false;
+  const candidateMac = crypto
+    .createHmac('sha256', BLIND_INDEX_KEY)
+    .update(candidate.trim(), 'utf8')
+    .digest();
+  const masterMac = crypto
+    .createHmac('sha256', BLIND_INDEX_KEY)
+    .update(config.security.adminMasterKey.trim(), 'utf8')
+    .digest();
+  return crypto.timingSafeEqual(candidateMac, masterMac);
+}
+
 export interface AccessTokenPayload {
   sub: string;
   username: string;

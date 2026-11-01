@@ -14,7 +14,9 @@ export class NativeDesktopHelperClient extends EventEmitter {
     string,
     { resolve: (val: Record<string, unknown>) => void; reject: (err: Error) => void }
   >();
-  private pcmRemainder = Buffer.alloc(0);
+  // Pre-allocated ring/staging buffer eliminates per-chunk Buffer.concat GC pressure during 60/75 FPS streams
+  private pcmStaging = Buffer.allocUnsafe(131072);
+  private pcmBufferedBytes = 0;
 
   private resolveBinaryPath(): string | null {
     const candidates = [
@@ -77,26 +79,42 @@ export class NativeDesktopHelperClient extends EventEmitter {
     this.pcmSocket = sock;
 
     sock.on('data', (chunk: Buffer) => {
-      let buf = this.pcmRemainder.length > 0 ? Buffer.concat([this.pcmRemainder, chunk]) : chunk;
-      let offset = 0;
+      if (this.pcmBufferedBytes + chunk.length > this.pcmStaging.length) {
+        const nextCap = Math.max(this.pcmStaging.length * 2, this.pcmBufferedBytes + chunk.length + 16384);
+        const grown = Buffer.allocUnsafe(nextCap);
+        if (this.pcmBufferedBytes > 0) {
+          this.pcmStaging.copy(grown, 0, 0, this.pcmBufferedBytes);
+        }
+        this.pcmStaging = grown;
+      }
 
-      while (buf.length - offset >= 4) {
-        const byteLen = buf.readInt32LE(offset);
+      chunk.copy(this.pcmStaging, this.pcmBufferedBytes);
+      this.pcmBufferedBytes += chunk.length;
+
+      let offset = 0;
+      while (this.pcmBufferedBytes - offset >= 4) {
+        const byteLen = this.pcmStaging.readInt32LE(offset);
         if (byteLen <= 0 || byteLen > 1024 * 1024) {
-          offset = buf.length;
+          offset = this.pcmBufferedBytes;
           break;
         }
-        if (buf.length - offset - 4 < byteLen) {
+        if (this.pcmBufferedBytes - offset - 4 < byteLen) {
           break;
         }
-        const pcmSlice = buf.subarray(offset + 4, offset + 4 + byteLen);
+        const pcmSlice = this.pcmStaging.subarray(offset + 4, offset + 4 + byteLen);
         const alignedCopy = new Uint8Array(byteLen);
         alignedCopy.set(pcmSlice);
         this.emit('pcm', alignedCopy.buffer);
         offset += 4 + byteLen;
       }
 
-      this.pcmRemainder = offset < buf.length ? Buffer.from(buf.subarray(offset)) : Buffer.alloc(0);
+      if (offset > 0) {
+        const remaining = this.pcmBufferedBytes - offset;
+        if (remaining > 0) {
+          this.pcmStaging.copyWithin(0, offset, this.pcmBufferedBytes);
+        }
+        this.pcmBufferedBytes = remaining;
+      }
     });
 
     sock.on('error', () => {});

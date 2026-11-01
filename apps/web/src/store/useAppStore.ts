@@ -92,6 +92,7 @@ interface AppState {
   watchedStreams: Record<string, WatchedStreamViewState>;
   settingsModalOpen: boolean;
   settingsActiveTab: 'audio' | 'stream' | 'app' | 'interface';
+  adminModalOpen: boolean;
   streamLauncherOpen: boolean;
   createRoomModalOpen: boolean;
   lightboxImageUrl: string | null;
@@ -99,6 +100,7 @@ interface AppState {
 
   // Actions
   setViewMode: (mode: 'landing' | 'auth' | 'app') => void;
+  setAdminModalOpen: (open: boolean) => void;
   bootstrap: () => Promise<void>;
   login: (input: LoginInput) => Promise<void>;
   register: (input: RegisterInput) => Promise<void>;
@@ -140,6 +142,12 @@ interface AppState {
   sendMessage: (content: string, attachmentIds: string[]) => Promise<void>;
   editMessage: (messageId: string, content: string) => Promise<void>;
   deleteMessage: (messageId: string) => Promise<void>;
+
+  // Cloud Administration & Real-Time Moderation
+  claimOwnerRole: (masterKey: string) => Promise<void>;
+  kickParticipant: (peerId: string, reason?: string) => Promise<void>;
+  forceMuteParticipant: (peerId: string) => Promise<void>;
+  forceStopStream: (streamId: string, reason?: string) => Promise<void>;
 }
 
 let settingsSaveTimer: number | null = null;
@@ -176,6 +184,7 @@ function syncDesktopOverlayParticipants(roomName: string | null, participants: R
       userId: p.user.id,
       displayName: p.user.displayName,
       avatarColor: p.user.avatarColor,
+      role: p.user.role,
       speaking: p.speaking,
       micMuted: p.micMuted,
       isStreaming: p.isStreaming,
@@ -355,14 +364,132 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         break;
       }
+
+      case 'user:roleUpdated': {
+        const { userId, role } = ev.payload;
+        const nextParticipants = state.participants.map((p) =>
+          p.user.id === userId ? { ...p, user: { ...p.user, role } } : p
+        );
+        const nextMessages = state.messages.map((m) =>
+          m.author.id === userId ? { ...m, author: { ...m.author, role } } : m
+        );
+        const nextStreams = state.activeStreams.map((st) => ({
+          ...st,
+          broadcasterRole: st.broadcasterId === userId ? role : st.broadcasterRole,
+          viewerUsers: st.viewerUsers.map((v) => (v.id === userId ? { ...v, role } : v)),
+        }));
+        const nextRooms = state.rooms.map((r) => ({
+          ...r,
+          participantsPreview: r.participantsPreview.map((p) =>
+            p.userId === userId ? { ...p, role } : p
+          ),
+        }));
+
+        const isMe = state.user?.id === userId;
+        set({
+          user: isMe && state.user ? { ...state.user, role } : state.user,
+          participants: nextParticipants,
+          messages: nextMessages,
+          activeStreams: nextStreams,
+          rooms: nextRooms,
+        });
+        if (state.currentRoom) {
+          syncDesktopOverlayParticipants(state.currentRoom.name, nextParticipants);
+        }
+        if (isMe) {
+          const label =
+            role === 'owner'
+              ? 'Fundador'
+              : role === 'admin'
+                ? 'Administrador'
+                : role === 'moderator'
+                  ? 'Moderador'
+                  : 'Membro';
+          get().pushToast({
+            title: 'Credencial atualizada em tempo real',
+            body: `Seu cargo agora é ${label}.`,
+          });
+        }
+        break;
+      }
+
+      case 'admin:kickedFromRoom': {
+        realtimeSession.teardownRoomMedia();
+        syncDesktopOverlayParticipants(null, []);
+        set({
+          currentRoom: null,
+          myPeerId: null,
+          participants: [],
+          activeStreams: [],
+          messages: [],
+          watchedStreams: {},
+          localSpeaking: false,
+        });
+        get().pushToast({
+          title: `Removido de #${ev.payload.roomName}`,
+          body: `${ev.payload.reason} (por ${ev.payload.byDisplayName})`,
+        });
+        break;
+      }
+
+      case 'admin:forceMuted': {
+        audioEngine.setLocalMuteAndDeafen(true, state.deafened);
+        const nextParticipants = state.participants.map((p) =>
+          p.peerId === state.myPeerId ? { ...p, micMuted: true, speaking: false } : p
+        );
+        set({
+          micMuted: true,
+          localSpeaking: false,
+          participants: nextParticipants,
+        });
+        syncDesktopOverlayParticipants(state.currentRoom?.name ?? null, nextParticipants);
+        get().pushToast({
+          title: 'Microfone silenciado pela moderação',
+          body: `Silenciado por ${ev.payload.byDisplayName}.`,
+        });
+        break;
+      }
+
+      case 'admin:accountBanned': {
+        realtimeSession.disconnect();
+        void api.logout();
+        syncDesktopOverlayParticipants(null, []);
+        set({
+          user: null,
+          currentRoom: null,
+          myPeerId: null,
+          participants: [],
+          activeStreams: [],
+          messages: [],
+          watchedStreams: {},
+          adminModalOpen: false,
+          settingsModalOpen: false,
+          viewMode: isDesktopClient() ? 'auth' : 'landing',
+        });
+        get().pushToast({
+          title: 'Conta suspensa pela administração',
+          body: ev.payload.reason,
+        });
+        break;
+      }
     }
   };
 
-  // Wire local microphone meter + speaking sync
+  // Wire local microphone meter + speaking sync (zero redundant Zustand re-renders during gameplay!)
   let lastReportedSpeaking = false;
   audioEngine.onMeterUpdate = (db, speaking) => {
     const state = get();
-    set({ localMicDb: db, localSpeaking: speaking });
+    const isWindowVisible = typeof document === 'undefined' || !document.hidden;
+    const shouldUpdateDb = state.settingsModalOpen && isWindowVisible;
+    const speakingChanged = speaking !== state.localSpeaking;
+
+    if (shouldUpdateDb && speakingChanged) {
+      set({ localMicDb: db, localSpeaking: speaking });
+    } else if (shouldUpdateDb) {
+      set({ localMicDb: db });
+    } else if (speakingChanged) {
+      set({ localSpeaking: speaking });
+    }
 
     if (speaking !== lastReportedSpeaking && state.currentRoom && state.myPeerId) {
       lastReportedSpeaking = speaking;
@@ -382,10 +509,15 @@ export const useAppStore = create<AppState>((set, get) => {
     }
   };
 
-  // Initial settings load
+  // Initial settings load + automatic background animation suspension when hidden/minimized
   const initialSettings = loadCachedSettings();
   if (typeof document !== 'undefined') {
     applyThemeAndDomSettings(initialSettings);
+    const syncVisibilityClass = () => {
+      document.documentElement.classList.toggle('window-hidden', document.hidden);
+    };
+    syncVisibilityClass();
+    document.addEventListener('visibilitychange', syncVisibilityClass);
   }
 
   return {
@@ -411,12 +543,14 @@ export const useAppStore = create<AppState>((set, get) => {
     watchedStreams: {},
     settingsModalOpen: false,
     settingsActiveTab: 'audio',
+    adminModalOpen: false,
     streamLauncherOpen: false,
     createRoomModalOpen: false,
     lightboxImageUrl: null,
     toasts: [],
 
     setViewMode: (mode) => set({ viewMode: mode }),
+    setAdminModalOpen: (open) => set({ adminModalOpen: open }),
 
     bootstrap: async () => {
       try {
@@ -427,16 +561,20 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         persistCachedSettings(restoredUser.settings);
         applyThemeAndDomSettings(restoredUser.settings);
-        void audioEngine.applyAudioSettings(restoredUser.settings.audio);
-        syncDesktopRuntimeSettings(restoredUser.settings);
+        if (isDesktopClient()) {
+          void audioEngine.applyAudioSettings(restoredUser.settings.audio);
+          syncDesktopRuntimeSettings(restoredUser.settings);
+        }
 
         set({
           user: restoredUser,
           settings: restoredUser.settings,
-          viewMode: 'app',
+          viewMode: isDesktopClient() ? 'app' : 'landing',
           bootstrapping: false,
         });
-        realtimeSession.connect();
+        if (isDesktopClient()) {
+          realtimeSession.connect();
+        }
       } catch {
         set({
           user: null,
@@ -450,20 +588,28 @@ export const useAppStore = create<AppState>((set, get) => {
       const { user } = await api.login(input);
       persistCachedSettings(user.settings);
       applyThemeAndDomSettings(user.settings);
-      void audioEngine.applyAudioSettings(user.settings.audio);
-      syncDesktopRuntimeSettings(user.settings);
-      set({ user, settings: user.settings, viewMode: 'app' });
-      realtimeSession.connect();
+      if (isDesktopClient()) {
+        void audioEngine.applyAudioSettings(user.settings.audio);
+        syncDesktopRuntimeSettings(user.settings);
+        set({ user, settings: user.settings, viewMode: 'app' });
+        realtimeSession.connect();
+      } else {
+        set({ user, settings: user.settings, viewMode: 'landing' });
+      }
     },
 
     register: async (input) => {
       const { user } = await api.register(input);
       persistCachedSettings(user.settings);
       applyThemeAndDomSettings(user.settings);
-      void audioEngine.applyAudioSettings(user.settings.audio);
-      syncDesktopRuntimeSettings(user.settings);
-      set({ user, settings: user.settings, viewMode: 'app' });
-      realtimeSession.connect();
+      if (isDesktopClient()) {
+        void audioEngine.applyAudioSettings(user.settings.audio);
+        syncDesktopRuntimeSettings(user.settings);
+        set({ user, settings: user.settings, viewMode: 'app' });
+        realtimeSession.connect();
+      } else {
+        set({ user, settings: user.settings, viewMode: 'landing' });
+      }
     },
 
     logout: async () => {
@@ -762,6 +908,28 @@ export const useAppStore = create<AppState>((set, get) => {
       set((s) => ({
         messages: s.messages.filter((m) => m.id !== messageId),
       }));
+    },
+
+    claimOwnerRole: async (masterKey) => {
+      const { user } = await api.claimOwner(masterKey);
+      set((s) => ({
+        user,
+        participants: s.participants.map((p) =>
+          p.user.id === user.id ? { ...p, user: { ...p.user, role: user.role } } : p
+        ),
+      }));
+    },
+
+    kickParticipant: async (peerId, reason) => {
+      await realtimeSession.adminKickParticipant(peerId, reason);
+    },
+
+    forceMuteParticipant: async (peerId) => {
+      await realtimeSession.adminForceMuteParticipant(peerId);
+    },
+
+    forceStopStream: async (streamId, reason) => {
+      await realtimeSession.adminForceStopStream(streamId, reason);
     },
   };
 });

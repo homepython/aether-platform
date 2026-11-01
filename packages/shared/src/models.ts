@@ -2,12 +2,29 @@ import { z } from 'zod';
 import { StreamFpsSchema, StreamResolutionSchema } from './media.js';
 import { UserSettingsSchema } from './settings.js';
 
+export const USER_ROLES = ['owner', 'admin', 'moderator', 'member'] as const;
+export type UserRole = (typeof USER_ROLES)[number];
+export const UserRoleSchema = z.enum(USER_ROLES);
+
+export const ROLE_RANK: Record<UserRole, number> = {
+  member: 0,
+  moderator: 10,
+  admin: 50,
+  owner: 100,
+};
+
+export function hasRoleAtLeast(role: UserRole | undefined | null, minRole: UserRole): boolean {
+  const current = role && role in ROLE_RANK ? ROLE_RANK[role] : 0;
+  return current >= ROLE_RANK[minRole];
+}
+
 export const UserPublicSchema = z.object({
   id: z.string(),
   username: z.string(),
   displayName: z.string(),
   avatarColor: z.string(),
   avatarUrl: z.string().nullable(),
+  role: UserRoleSchema.default('member'),
   createdAt: z.string(),
 });
 export type UserPublic = z.infer<typeof UserPublicSchema>;
@@ -75,6 +92,7 @@ export const ActiveStreamInfoSchema = z.object({
   broadcasterUsername: z.string(),
   broadcasterDisplayName: z.string(),
   broadcasterAvatarColor: z.string(),
+  broadcasterRole: UserRoleSchema.default('member'),
   title: z.string(),
   resolution: StreamResolutionSchema,
   fps: StreamFpsSchema,
@@ -89,6 +107,7 @@ export const ActiveStreamInfoSchema = z.object({
       username: z.string(),
       displayName: z.string(),
       avatarColor: z.string(),
+      role: UserRoleSchema.default('member'),
     })
   ),
   videoProducerId: z.string(),
@@ -127,6 +146,7 @@ export const RoomSummarySchema = z.object({
       userId: z.string(),
       displayName: z.string(),
       avatarColor: z.string(),
+      role: UserRoleSchema.default('member'),
       speaking: z.boolean(),
       isStreaming: z.boolean(),
     })
@@ -134,6 +154,51 @@ export const RoomSummarySchema = z.object({
   activeStreamCount: z.number().int().nonnegative(),
 });
 export type RoomSummary = z.infer<typeof RoomSummarySchema>;
+
+export const AdminUserRecordSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  displayName: z.string(),
+  avatarColor: z.string(),
+  avatarUrl: z.string().nullable(),
+  role: UserRoleSchema,
+  isBanned: z.boolean(),
+  banReason: z.string().nullable(),
+  isOnline: z.boolean(),
+  currentRoomId: z.string().nullable(),
+  createdAt: z.string(),
+});
+export type AdminUserRecord = z.infer<typeof AdminUserRecordSchema>;
+
+export const AdminAuditLogEntrySchema = z.object({
+  id: z.string(),
+  actorId: z.string(),
+  actorUsername: z.string(),
+  actorDisplayName: z.string(),
+  actorRole: UserRoleSchema,
+  action: z.string(),
+  targetUserId: z.string().nullable(),
+  targetUsername: z.string().nullable(),
+  details: z.string(),
+  createdAt: z.string(),
+});
+export type AdminAuditLogEntry = z.infer<typeof AdminAuditLogEntrySchema>;
+
+export const AdminClaimOwnerInputSchema = z.object({
+  masterKey: z.string().trim().min(8, 'Chave mestre muito curta').max(256),
+});
+export type AdminClaimOwnerInput = z.infer<typeof AdminClaimOwnerInputSchema>;
+
+export const AdminUpdateRoleInputSchema = z.object({
+  role: z.enum(['admin', 'moderator', 'member']),
+});
+export type AdminUpdateRoleInput = z.infer<typeof AdminUpdateRoleInputSchema>;
+
+export const AdminBanUserInputSchema = z.object({
+  banned: z.boolean(),
+  reason: z.string().trim().max(240).optional().nullable(),
+});
+export type AdminBanUserInput = z.infer<typeof AdminBanUserInputSchema>;
 
 export const CreateRoomInputSchema = z.object({
   name: z.string().trim().min(2, 'Nome da sala muito curto').max(48, 'Nome da sala muito longo'),

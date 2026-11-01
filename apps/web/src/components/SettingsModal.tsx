@@ -5,6 +5,7 @@ import {
   Mic,
   MonitorPlay,
   Palette,
+  ShieldCheck,
   Volume2,
   X,
 } from 'lucide-react';
@@ -35,6 +36,7 @@ export const SettingsModal: React.FC = () => {
   const activeTab = useAppStore((s) => s.settingsActiveTab);
   const openSettings = useAppStore((s) => s.openSettings);
   const closeSettings = useAppStore((s) => s.closeSettings);
+  const setAdminModalOpen = useAppStore((s) => s.setAdminModalOpen);
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const localMicDb = useAppStore((s) => s.localMicDb);
@@ -153,8 +155,27 @@ export const SettingsModal: React.FC = () => {
             })}
           </div>
 
-          <div className="px-3 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-            Aether v1.0.0 • Sincronização automática ativa
+          <div className="space-y-3">
+            <button
+              type="button"
+              onClick={() => {
+                closeSettings();
+                setAdminModalOpen(true);
+              }}
+              className="flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left text-xs font-semibold transition-all hover:opacity-90"
+              style={{
+                borderColor: 'var(--border-hairline)',
+                backgroundColor: 'var(--bg-surface)',
+                color: 'var(--text-secondary)',
+              }}
+              title="Central de Administração & Chave Mestre do Fundador"
+            >
+              <ShieldCheck className="h-4 w-4" style={{ color: 'var(--accent)' }} />
+              <span className="leading-tight">Administração &amp; Credencial Fundador</span>
+            </button>
+            <div className="px-3 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+              Aether v1.0.0 • Sincronização automática ativa
+            </div>
           </div>
         </div>
 

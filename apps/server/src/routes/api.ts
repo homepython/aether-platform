@@ -3,9 +3,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import {
+  AdminBanUserInputSchema,
+  AdminClaimOwnerInputSchema,
+  AdminUpdateRoleInputSchema,
   CreateRoomInputSchema,
+  hasRoleAtLeast,
   LoginInputSchema,
   RegisterInputSchema,
+  ROLE_RANK,
   UserSettingsSchema,
   type AuthUser,
 } from '@aether/shared';
@@ -25,6 +30,7 @@ import {
   signAccessToken,
   signRefreshToken,
   verifyAccessToken,
+  verifyAdminMasterKey,
   verifyDummyPassword,
   verifyPassword,
   verifyRefreshToken,
@@ -56,6 +62,14 @@ async function requireAuthUser(req: FastifyRequest, reply: FastifyReply, db: App
   const row = await db.findUserRowById(payload.sub);
   if (!row) {
     reply.code(401).send({ error: 'Conta não encontrada' });
+    return null;
+  }
+  if (Boolean(row.is_banned)) {
+    reply.code(403).send({
+      error: row.ban_reason
+        ? `Conta suspensa: ${row.ban_reason}`
+        : 'Sua conta foi suspensa pela administração.',
+    });
     return null;
   }
   return db.mapAuthUser(row);
@@ -203,6 +217,14 @@ export async function registerApiRoutes(
 
     authGuard.clearLoginFailures(req.ip, parsed.data.identifier);
 
+    if (Boolean(row.is_banned)) {
+      return reply.code(403).send({
+        error: row.ban_reason
+          ? `Conta suspensa: ${row.ban_reason}`
+          : 'Sua conta foi suspensa pela administração.',
+      });
+    }
+
     // Transparently upgrade legacy password hashes to scrypt2 + pepper
     if (needsPasswordRehash(row.password_hash)) {
       const upgradedHash = await hashPassword(parsed.data.password);
@@ -254,6 +276,15 @@ export async function registerApiRoutes(
     if (!row) {
       reply.header('Set-Cookie', serializeClearRefreshCookie(isSecureRequest(req)));
       return reply.code(401).send({ error: 'Usuário não encontrado' });
+    }
+    if (Boolean(row.is_banned)) {
+      await db.revokeAllUserRefreshTokens(row.id);
+      reply.header('Set-Cookie', serializeClearRefreshCookie(isSecureRequest(req)));
+      return reply.code(403).send({
+        error: row.ban_reason
+          ? `Conta suspensa: ${row.ban_reason}`
+          : 'Sua conta foi suspensa pela administração.',
+      });
     }
     const user = db.mapAuthUser(row);
     const tokens = await issueSessionTokens(db, user.id, user.username, consumed.familyId);
@@ -358,12 +389,191 @@ export async function registerApiRoutes(
     if (!room) {
       return reply.code(404).send({ error: 'Sala não encontrada' });
     }
-    if (room.owner_id !== user.id) {
-      return reply.code(403).send({ error: 'Somente o criador pode excluir esta sala' });
+    const isStaffAdmin = hasRoleAtLeast(user.role, 'admin');
+    if (room.owner_id !== user.id && !isStaffAdmin) {
+      return reply
+        .code(403)
+        .send({ error: 'Somente o criador ou um administrador pode excluir esta sala' });
     }
+    gateway.evictRoomParticipantsOnDelete(roomId, room.name, user.displayName);
     await db.deleteRoom(roomId);
+    if (room.owner_id !== user.id) {
+      await db.recordAdminAuditLog({
+        actorId: user.id,
+        actorRole: user.role,
+        action: 'room:delete',
+        details: `Sala "${room.name}" excluída pela administração`,
+      });
+    }
     await gateway.broadcastLobbyRoomsUpdate();
     return { deleted: true };
+  });
+
+  // Administration & RBAC Routes (Cloud-Authoritative across any PC)
+  app.post('/api/admin/claim-owner', async (req, reply) => {
+    const user = await requireAuthUser(req, reply, db);
+    if (!user) return;
+
+    const rl = authGuard.checkRateLimit(`claim-owner:${req.ip}:${user.id}`, 5, 15 * 60 * 1000);
+    if (!rl.allowed) {
+      reply.header('Retry-After', String(rl.retryAfterSec));
+      return reply.code(429).send({
+        error: `Muitas tentativas de verificação da chave mestre. Aguarde ${rl.retryAfterSec}s.`,
+      });
+    }
+
+    const parsed = AdminClaimOwnerInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: parsed.error.issues[0]?.message || 'Formato da chave mestre inválido',
+      });
+    }
+
+    if (!verifyAdminMasterKey(parsed.data.masterKey)) {
+      return reply.code(403).send({ error: 'Chave mestre administrativa incorreta' });
+    }
+
+    const updated = await db.setUserRole(user.id, 'owner');
+    if (!updated) {
+      return reply.code(404).send({ error: 'Conta não encontrada' });
+    }
+
+    await db.recordAdminAuditLog({
+      actorId: updated.id,
+      actorRole: 'owner',
+      action: 'role:claim_owner',
+      targetUserId: updated.id,
+      targetUsername: updated.username,
+      details: 'Credencial Fundador (Owner) ativada com Chave Mestre criptográfica',
+    });
+
+    await gateway.syncUserRoleEverywhere(updated);
+    return { user: updated };
+  });
+
+  app.get('/api/admin/users', async (req, reply) => {
+    const user = await requireAuthUser(req, reply, db);
+    if (!user) return;
+    if (!hasRoleAtLeast(user.role, 'admin')) {
+      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+    }
+    const users = await db.listAllUsersForAdmin(gateway.getOnlineUserMap());
+    return { users };
+  });
+
+  app.patch('/api/admin/users/:userId/role', async (req, reply) => {
+    const user = await requireAuthUser(req, reply, db);
+    if (!user) return;
+    if (!hasRoleAtLeast(user.role, 'admin')) {
+      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+    }
+
+    const { userId } = req.params as { userId: string };
+    if (userId === user.id) {
+      return reply.code(400).send({ error: 'Você não pode alterar seu próprio cargo' });
+    }
+
+    const parsed = AdminUpdateRoleInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Cargo informado é inválido' });
+    }
+
+    const targetRow = await db.findUserRowById(userId);
+    if (!targetRow) {
+      return reply.code(404).send({ error: 'Usuário não encontrado' });
+    }
+
+    const targetCurrentRole = db.parseUserRole(targetRow.role);
+    if (targetCurrentRole === 'owner') {
+      return reply.code(403).send({ error: 'O cargo de Fundador é soberano e não pode ser alterado' });
+    }
+
+    if (
+      (parsed.data.role === 'admin' || targetCurrentRole === 'admin') &&
+      user.role !== 'owner'
+    ) {
+      return reply.code(403).send({
+        error: 'Somente o Fundador pode promover ou revogar Administradores',
+      });
+    }
+
+    const updated = await db.setUserRole(userId, parsed.data.role);
+    if (!updated) {
+      return reply.code(404).send({ error: 'Falha ao atualizar cargo do usuário' });
+    }
+
+    await db.recordAdminAuditLog({
+      actorId: user.id,
+      actorRole: user.role,
+      action: 'role:update',
+      targetUserId: updated.id,
+      targetUsername: updated.username,
+      details: `Cargo alterado de "${targetCurrentRole}" para "${parsed.data.role}"`,
+    });
+
+    await gateway.syncUserRoleEverywhere(updated);
+    return { user: updated };
+  });
+
+  app.post('/api/admin/users/:userId/ban', async (req, reply) => {
+    const user = await requireAuthUser(req, reply, db);
+    if (!user) return;
+    if (!hasRoleAtLeast(user.role, 'admin')) {
+      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+    }
+
+    const { userId } = req.params as { userId: string };
+    if (userId === user.id) {
+      return reply.code(400).send({ error: 'Você não pode suspender sua própria conta' });
+    }
+
+    const parsed = AdminBanUserInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Parâmetros de suspensão inválidos' });
+    }
+
+    const targetRow = await db.findUserRowById(userId);
+    if (!targetRow) {
+      return reply.code(404).send({ error: 'Usuário não encontrado' });
+    }
+
+    const targetRole = db.parseUserRole(targetRow.role);
+    if (targetRole === 'owner' || (user.role !== 'owner' && ROLE_RANK[user.role] <= ROLE_RANK[targetRole])) {
+      return reply.code(403).send({
+        error: 'Hierarquia insuficiente para moderar esta conta',
+      });
+    }
+
+    const cleanReason = parsed.data.reason?.trim() || 'Violação das diretrizes da plataforma';
+    await db.setUserBanState(userId, parsed.data.banned, parsed.data.banned ? cleanReason : null);
+
+    if (parsed.data.banned) {
+      await db.revokeAllUserRefreshTokens(userId);
+      gateway.disconnectBannedUser(userId, cleanReason);
+    }
+
+    await db.recordAdminAuditLog({
+      actorId: user.id,
+      actorRole: user.role,
+      action: parsed.data.banned ? 'account:ban' : 'account:unban',
+      targetUserId: targetRow.id,
+      targetUsername: targetRow.username,
+      details: parsed.data.banned
+        ? `Conta suspensa (${cleanReason})`
+        : 'Suspensão de conta revogada',
+    });
+
+    return { ok: true, banned: parsed.data.banned };
+  });
+
+  app.get('/api/admin/audit-logs', async (req, reply) => {
+    const user = await requireAuthUser(req, reply, db);
+    if (!user) return;
+    if (!hasRoleAtLeast(user.role, 'admin')) {
+      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+    }
+    const logs = await db.listAdminAuditLogs(100);
+    return { logs };
   });
 
   // File & Clipboard Image Upload

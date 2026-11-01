@@ -4,13 +4,64 @@ import {
   Maximize2,
   Minimize2,
   Play,
+  ShieldAlert,
   Volume2,
   VolumeX,
   XCircle,
 } from 'lucide-react';
-import type { ActiveStreamInfo } from '@aether/shared';
+import { hasRoleAtLeast, ROLE_RANK, type ActiveStreamInfo } from '@aether/shared';
 import { useAppStore, type WatchedStreamViewState } from '../store/useAppStore.js';
 import { BroadcasterDeck } from './BroadcasterDeck.js';
+import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
+
+function useCanForceStop(info: ActiveStreamInfo): boolean {
+  const user = useAppStore((s) => s.user);
+  if (!user || user.id === info.broadcasterId) return false;
+  const myRole = user.role ?? 'member';
+  const targetRole = info.broadcasterRole ?? 'member';
+  return (
+    hasRoleAtLeast(myRole, 'moderator') &&
+    (myRole === 'owner' || ROLE_RANK[myRole] > ROLE_RANK[targetRole])
+  );
+}
+
+const ForceStopButton: React.FC<{ info: ActiveStreamInfo; variant: 'hud' | 'card' }> = ({
+  info,
+  variant,
+}) => {
+  const forceStopStream = useAppStore((s) => s.forceStopStream);
+  const pushToast = useAppStore((s) => s.pushToast);
+  const canForceStop = useCanForceStop(info);
+  if (!canForceStop) return null;
+
+  return (
+    <button
+      type="button"
+      onClick={() =>
+        void forceStopStream(info.streamId, 'Encerrada pela moderação').catch((err) =>
+          pushToast({
+            title: 'Falha ao encerrar live',
+            body: err instanceof Error ? err.message : 'Permissão insuficiente',
+          })
+        )
+      }
+      title="Encerrar transmissão (moderação)"
+      className={
+        variant === 'hud'
+          ? 'inline-flex h-8 items-center gap-1.5 rounded-lg bg-white/15 px-3 text-xs font-medium text-white backdrop-blur-md transition-colors hover:bg-red-600'
+          : 'inline-flex h-9 shrink-0 items-center gap-1.5 rounded-xl px-3 text-xs font-semibold transition-opacity hover:opacity-90'
+      }
+      style={
+        variant === 'card'
+          ? { backgroundColor: 'var(--live-red-soft)', color: 'var(--live-red)' }
+          : undefined
+      }
+    >
+      <ShieldAlert className="h-3.5 w-3.5" />
+      Encerrar Live (Mod)
+    </button>
+  );
+};
 
 const ActiveWatchedPlayer: React.FC<{
   info: ActiveStreamInfo;
@@ -82,7 +133,10 @@ const ActiveWatchedPlayer: React.FC<{
             <span className="live-dot h-1.5 w-1.5 rounded-full bg-white" />
             AO VIVO
           </span>
-          <span className="text-xs font-semibold drop-shadow">{info.broadcasterDisplayName}</span>
+          <span className="inline-flex items-center gap-1.5 text-xs font-semibold drop-shadow">
+            <StyledUserName name={info.broadcasterDisplayName} role={info.broadcasterRole} />
+            <UserRoleBadge role={info.broadcasterRole} compact />
+          </span>
           <span className="text-xs text-white/75">• {info.title}</span>
         </div>
 
@@ -139,6 +193,7 @@ const ActiveWatchedPlayer: React.FC<{
         </div>
 
         <div className="flex items-center gap-2">
+          <ForceStopButton info={info} variant="hud" />
           <button
             type="button"
             onClick={() => void unwatchStream(info.streamId)}
@@ -222,8 +277,9 @@ export const StreamStage: React.FC = () => {
                     <span className="live-dot h-1.5 w-1.5 rounded-full bg-current" />
                     AO VIVO
                   </span>
-                  <span className="truncate text-sm font-semibold">
-                    {st.broadcasterDisplayName}
+                  <span className="inline-flex min-w-0 items-center gap-1.5 text-sm font-semibold">
+                    <StyledUserName name={st.broadcasterDisplayName} role={st.broadcasterRole} />
+                    <UserRoleBadge role={st.broadcasterRole} compact />
                   </span>
                 </div>
                 <div
@@ -242,6 +298,8 @@ export const StreamStage: React.FC = () => {
                 </div>
               </div>
 
+              <div className="flex shrink-0 items-center gap-2">
+              <ForceStopButton info={st} variant="card" />
               <button
                 type="button"
                 onClick={() =>
@@ -258,6 +316,7 @@ export const StreamStage: React.FC = () => {
                 <Play className="h-3.5 w-3.5 fill-current" />
                 Assistir
               </button>
+              </div>
             </div>
           ))}
         </div>

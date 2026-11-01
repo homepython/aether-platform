@@ -69,4 +69,6 @@ contextBridge.exposeInMainWorld('aetherDesktop', {
   updateOverlayConfig: (settings: unknown) => ipcRenderer.invoke('overlay:updateConfig', settings),
 
   updateOverlayState: (state: unknown) => ipcRenderer.send('overlay:updateState', state),
+
+  setBroadcastActive: (active: boolean) => ipcRenderer.invoke('perf:setBroadcastActive', active),
 });

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Clock, Eye, Monitor, Music2, Square, Zap } from 'lucide-react';
 import type { ActiveStreamInfo } from '@aether/shared';
 import { useAppStore } from '../store/useAppStore.js';
+import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
 
 function formatElapsed(startedAtIso: string, nowMs: number): string {
   const diffSec = Math.max(0, Math.floor((nowMs - new Date(startedAtIso).getTime()) / 1000));
@@ -16,8 +17,22 @@ export const BroadcasterDeck: React.FC<{ stream: ActiveStreamInfo }> = ({ stream
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
+    const tick = () => {
+      if (!document.hidden) {
+        setNowMs(Date.now());
+      }
+    };
+    const onVisChange = () => {
+      if (!document.hidden) {
+        setNowMs(Date.now());
+      }
+    };
+    const id = window.setInterval(tick, 1000);
+    document.addEventListener('visibilitychange', onVisChange);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisChange);
+    };
   }, []);
 
   const audioStatusLabel = !stream.hasAudio
@@ -183,7 +198,8 @@ export const BroadcasterDeck: React.FC<{ stream: ActiveStreamInfo }> = ({ stream
               }}
             >
               <span className="h-2 w-2 rounded-full" style={{ backgroundColor: v.avatarColor }} />
-              {v.displayName}
+              <StyledUserName name={v.displayName} role={v.role} />
+              <UserRoleBadge role={v.role} compact />
             </span>
           ))}
         </div>

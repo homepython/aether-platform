@@ -1,4 +1,6 @@
 import type {
+  AdminAuditLogEntry,
+  AdminUserRecord,
   AuthUser,
   ChatAttachment,
   CreateRoomInput,
@@ -381,4 +383,31 @@ export const api = {
       sizeBytes: number | null;
       downloadUrl: string;
     }>('/api/releases/info', {}, false),
+
+  // Cloud Administration & Role System (RBAC)
+  claimOwner: (masterKey: string) =>
+    apiRequest<{ user: AuthUser }>('/api/admin/claim-owner', {
+      method: 'POST',
+      body: JSON.stringify({ masterKey }),
+    }),
+
+  listAdminUsers: () => apiRequest<{ users: AdminUserRecord[] }>('/api/admin/users'),
+
+  updateUserRole: (userId: string, role: 'admin' | 'moderator' | 'member') =>
+    apiRequest<{ user: AuthUser }>(`/api/admin/users/${encodeURIComponent(userId)}/role`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    }),
+
+  setUserBan: (userId: string, banned: boolean, reason?: string | null) =>
+    apiRequest<{ ok: boolean; banned: boolean }>(
+      `/api/admin/users/${encodeURIComponent(userId)}/ban`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ banned, reason: reason || null }),
+      }
+    ),
+
+  listAdminAuditLogs: () =>
+    apiRequest<{ logs: AdminAuditLogEntry[] }>('/api/admin/audit-logs'),
 };

@@ -3,11 +3,16 @@ import { DatabaseSync } from 'node:sqlite';
 import pg from 'pg';
 import {
   DEFAULT_USER_SETTINGS,
+  hasRoleAtLeast,
+  UserRoleSchema,
   UserSettingsSchema,
+  type AdminAuditLogEntry,
+  type AdminUserRecord,
   type AuthUser,
   type ChatAttachment,
   type ChatMessage,
   type UserPublic,
+  type UserRole,
   type UserSettings,
 } from '@aether/shared';
 import { config } from '../config.js';
@@ -28,6 +33,9 @@ export interface DbUserRow {
   password_hash: string;
   avatar_color: string;
   avatar_url: string | null;
+  role?: string | null;
+  is_banned?: number | boolean | null;
+  ban_reason?: string | null;
   settings_json: string;
   created_at: string;
 }
@@ -209,6 +217,9 @@ export class AppDatabase {
         password_hash TEXT NOT NULL,
         avatar_color TEXT NOT NULL,
         avatar_url TEXT,
+        role TEXT NOT NULL DEFAULT 'member',
+        is_banned ${boolType} NOT NULL DEFAULT ${boolFalse},
+        ban_reason TEXT,
         settings_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
@@ -270,12 +281,28 @@ export class AppDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+
+      CREATE TABLE IF NOT EXISTS admin_audit_logs (
+        id TEXT PRIMARY KEY,
+        actor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        actor_role TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        target_username TEXT,
+        details TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_logs(created_at DESC);
     `);
 
     // Safe idempotent schema upgrades for existing databases
     for (const alterSql of [
       'ALTER TABLE refresh_tokens ADD COLUMN token_hash TEXT',
       'ALTER TABLE refresh_tokens ADD COLUMN family_id TEXT',
+      "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'",
+      `ALTER TABLE users ADD COLUMN is_banned ${boolType} NOT NULL DEFAULT ${boolFalse}`,
+      'ALTER TABLE users ADD COLUMN ban_reason TEXT',
     ]) {
       try {
         await this.driver.exec(alterSql);
@@ -331,6 +358,11 @@ export class AppDatabase {
     await this.driver.close();
   }
 
+  public parseUserRole(raw?: string | null): UserRole {
+    const parsed = UserRoleSchema.safeParse(raw);
+    return parsed.success ? parsed.data : 'member';
+  }
+
   public mapUserPublic(row: DbUserRow): UserPublic {
     return {
       id: row.id,
@@ -338,6 +370,7 @@ export class AppDatabase {
       displayName: row.display_name,
       avatarColor: row.avatar_color,
       avatarUrl: row.avatar_url,
+      role: this.parseUserRole(row.role),
       createdAt: row.created_at,
     };
   }
@@ -718,12 +751,13 @@ export class AppDatabase {
       u_display_name: string;
       u_avatar_color: string;
       u_avatar_url: string | null;
+      u_role: string | null;
       u_created_at: string;
     }>(
       `SELECT
         m.id, m.room_id, m.author_id, m.content, m.mentions_json, m.created_at, m.edited_at, m.deleted,
         u.id as u_id, u.username as u_username, u.display_name as u_display_name,
-        u.avatar_color as u_avatar_color, u.avatar_url as u_avatar_url, u.created_at as u_created_at
+        u.avatar_color as u_avatar_color, u.avatar_url as u_avatar_url, u.role as u_role, u.created_at as u_created_at
        FROM messages m
        JOIN users u ON u.id = m.author_id
        WHERE m.id = $1`,
@@ -753,6 +787,7 @@ export class AppDatabase {
         displayName: row.u_display_name,
         avatarColor: row.u_avatar_color,
         avatarUrl: row.u_avatar_url,
+        role: this.parseUserRole(row.u_role),
         createdAt: row.u_created_at,
       },
       content: isDeleted ? '' : row.content,
@@ -810,11 +845,13 @@ export class AppDatabase {
   async softDeleteMessage(
     messageId: string,
     requesterId: string,
-    roomOwnerId: string | null
+    roomOwnerId: string | null,
+    requesterRole?: UserRole
   ): Promise<{ roomId: string; deleted: boolean } | null> {
     const existing = await this.getMessageById(messageId);
     if (!existing || existing.deleted) return null;
-    if (existing.author.id !== requesterId && roomOwnerId !== requesterId) {
+    const isStaffModerator = hasRoleAtLeast(requesterRole, 'moderator');
+    if (existing.author.id !== requesterId && roomOwnerId !== requesterId && !isStaffModerator) {
       return null;
     }
     await this.driver.query('UPDATE messages SET deleted = $1, content = $2 WHERE id = $3', [
@@ -823,6 +860,115 @@ export class AppDatabase {
       messageId,
     ]);
     return { roomId: existing.roomId, deleted: true };
+  }
+
+  // Administration & RBAC
+  async setUserRole(userId: string, role: UserRole): Promise<AuthUser | null> {
+    const validatedRole = UserRoleSchema.parse(role);
+    await this.driver.query('UPDATE users SET role = $1 WHERE id = $2', [validatedRole, userId]);
+    const updated = await this.findUserRowById(userId);
+    return updated ? this.mapAuthUser(updated) : null;
+  }
+
+  async setUserBanState(
+    userId: string,
+    isBanned: boolean,
+    reason: string | null
+  ): Promise<DbUserRow | null> {
+    await this.driver.query('UPDATE users SET is_banned = $1, ban_reason = $2 WHERE id = $3', [
+      isBanned,
+      isBanned ? reason : null,
+      userId,
+    ]);
+    return this.findUserRowById(userId);
+  }
+
+  async listAllUsersForAdmin(onlineUserMap: Map<string, string | null>): Promise<AdminUserRecord[]> {
+    const rows = await this.driver.query<DbUserRow>(
+      'SELECT * FROM users ORDER BY created_at ASC'
+    );
+    return rows.map((row) => {
+      const isOnline = onlineUserMap.has(row.id);
+      const currentRoomId = onlineUserMap.get(row.id) ?? null;
+      return {
+        id: row.id,
+        username: row.username,
+        displayName: row.display_name,
+        avatarColor: row.avatar_color,
+        avatarUrl: row.avatar_url,
+        role: this.parseUserRole(row.role),
+        isBanned: Boolean(row.is_banned),
+        banReason: row.ban_reason ?? null,
+        isOnline,
+        currentRoomId,
+        createdAt: row.created_at,
+      };
+    });
+  }
+
+  async recordAdminAuditLog(params: {
+    actorId: string;
+    actorRole: UserRole;
+    action: string;
+    targetUserId?: string | null;
+    targetUsername?: string | null;
+    details: string;
+  }): Promise<void> {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    await this.driver.query(
+      `INSERT INTO admin_audit_logs (
+        id, actor_id, actor_role, action, target_user_id, target_username, details, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        id,
+        params.actorId,
+        params.actorRole,
+        params.action,
+        params.targetUserId ?? null,
+        params.targetUsername ?? null,
+        params.details,
+        now,
+      ]
+    );
+  }
+
+  async listAdminAuditLogs(limit = 80): Promise<AdminAuditLogEntry[]> {
+    const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+    const rows = await this.driver.query<{
+      id: string;
+      actor_id: string;
+      actor_role: string;
+      action: string;
+      target_user_id: string | null;
+      target_username: string | null;
+      details: string;
+      created_at: string;
+      u_username: string;
+      u_display_name: string;
+    }>(
+      `SELECT
+        l.id, l.actor_id, l.actor_role, l.action, l.target_user_id, l.target_username, l.details, l.created_at,
+        u.username as u_username, u.display_name as u_display_name
+       FROM admin_audit_logs l
+       JOIN users u ON u.id = l.actor_id
+       ORDER BY l.created_at DESC
+       LIMIT $1`,
+      [safeLimit]
+    );
+
+    return rows.map((r) => ({
+      id: r.id,
+      actorId: r.actor_id,
+      actorUsername: r.u_username,
+      actorDisplayName: r.u_display_name,
+      actorRole: this.parseUserRole(r.actor_role),
+      action: r.action,
+      targetUserId: r.target_user_id,
+      targetUsername: r.target_username,
+      details: r.details,
+      createdAt: r.created_at,
+    }));
   }
 }
 

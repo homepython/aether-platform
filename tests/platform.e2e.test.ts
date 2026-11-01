@@ -22,6 +22,7 @@ import {
   type ServerRpcResponse,
 } from '@aether/shared';
 import { createServerApp, type ServerContext } from '../apps/server/src/app.js';
+import { config } from '../apps/server/src/config.js';
 
 class TestRealtimeClient {
   private ws!: WebSocket;
@@ -384,9 +385,18 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
       wsPedro.connect(`${wsBaseUrl}/ws?token=${pedroToken}`),
     ]);
 
+    // Desktop-Only Invariant: Web browsers can NEVER join voice rooms / live streams
+    await expect(
+      wsMarina.rpc('room:join', {
+        roomId: createdRoom.id,
+        password: 'segredo-squad',
+        clientPlatform: 'web',
+      })
+    ).rejects.toMatchObject({ code: 'DESKTOP_REQUIRED' });
+
     // Marina tries joining without password -> must fail with PASSWORD_REQUIRED
     await expect(
-      wsMarina.rpc('room:join', { roomId: createdRoom.id, clientPlatform: 'web' })
+      wsMarina.rpc('room:join', { roomId: createdRoom.id, clientPlatform: 'desktop' })
     ).rejects.toThrow(/senha/i);
 
     // Marina tries wrong password -> must fail
@@ -394,7 +404,7 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
       wsMarina.rpc('room:join', {
         roomId: createdRoom.id,
         password: 'errada',
-        clientPlatform: 'web',
+        clientPlatform: 'desktop',
       })
     ).rejects.toThrow(/incorreta/i);
 
@@ -406,7 +416,7 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     const joinMarina = await wsMarina.rpc<RoomJoinResult>('room:join', {
       roomId: createdRoom.id,
       password: 'segredo-squad',
-      clientPlatform: 'web',
+      clientPlatform: 'desktop',
     });
     const joinPedro = await wsPedro.rpc<RoomJoinResult>('room:join', {
       roomId: createdRoom.id,
@@ -656,6 +666,251 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     wsPedro.close();
   }, 20000);
 
+  it('enforces server-authoritative RBAC (Master Key owner claim, role promotion across any PC, real-time moderation, account bans and audit logs) without touching 720p/1080p/1440p media invariants', async () => {
+    const authJson = (token: string) => ({
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    });
+
+    const meOf = async (token: string) => {
+      const res = await fetch(`${baseUrl}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` } });
+      return { status: res.status, body: (await res.json()) as { user?: { id: string; role: string } } };
+    };
+
+    const pedroMe = await meOf(pedroToken);
+    expect(pedroMe.status).toBe(200);
+    const pedroId = pedroMe.body.user!.id;
+
+    // Every account starts as a plain member
+    expect((await meOf(lucasToken)).body.user?.role).toBe('member');
+    expect(pedroMe.body.user?.role).toBe('member');
+
+    // Members cannot reach admin endpoints
+    const forbiddenList = await fetch(`${baseUrl}/api/admin/users`, {
+      headers: { Authorization: `Bearer ${marinaToken}` },
+    });
+    expect(forbiddenList.status).toBe(403);
+
+    const wsLucas = new TestRealtimeClient();
+    const wsMarina = new TestRealtimeClient();
+    const wsPedro = new TestRealtimeClient();
+    await Promise.all([
+      wsLucas.connect(`${wsBaseUrl}/ws?token=${lucasToken}`),
+      wsMarina.connect(`${wsBaseUrl}/ws?token=${marinaToken}`),
+      wsPedro.connect(`${wsBaseUrl}/ws?token=${pedroToken}`),
+    ]);
+
+    // 1. Wrong Master Key -> 403, role unchanged
+    const wrongClaim = await fetch(`${baseUrl}/api/admin/claim-owner`, {
+      method: 'POST',
+      headers: authJson(lucasToken),
+      body: JSON.stringify({ masterKey: 'definitely-not-the-master-key' }),
+    });
+    expect(wrongClaim.status).toBe(403);
+    expect((await meOf(lucasToken)).body.user?.role).toBe('member');
+
+    // 2. Real Master Key -> Lucas becomes Fundador (owner) + real-time broadcast
+    expect(config.security.adminMasterKey.length).toBeGreaterThanOrEqual(8);
+    const claim = await fetch(`${baseUrl}/api/admin/claim-owner`, {
+      method: 'POST',
+      headers: authJson(lucasToken),
+      body: JSON.stringify({ masterKey: config.security.adminMasterKey }),
+    });
+    expect(claim.status).toBe(200);
+    expect(((await claim.json()) as { user: { role: string } }).user.role).toBe('owner');
+    const roleEv = await wsMarina.waitForEvent(
+      'user:roleUpdated',
+      (e) => e.payload.userId === lucasId && e.payload.role === 'owner'
+    );
+    expect(roleEv.payload.role).toBe('owner');
+
+    // 3. Owner promotes Marina to admin -> persisted in the cloud DB (works on any PC)
+    const promote = await fetch(`${baseUrl}/api/admin/users/${marinaId}/role`, {
+      method: 'PATCH',
+      headers: authJson(lucasToken),
+      body: JSON.stringify({ role: 'admin' }),
+    });
+    expect(promote.status).toBe(200);
+    expect((await meOf(marinaToken)).body.user?.role).toBe('admin');
+    await wsMarina.waitForEvent(
+      'user:roleUpdated',
+      (e) => e.payload.userId === marinaId && e.payload.role === 'admin'
+    );
+
+    // Admin cannot demote the owner, nor promote other admins
+    const demoteOwner = await fetch(`${baseUrl}/api/admin/users/${lucasId}/role`, {
+      method: 'PATCH',
+      headers: authJson(marinaToken),
+      body: JSON.stringify({ role: 'member' }),
+    });
+    expect(demoteOwner.status).toBe(403);
+    const adminPromotesAdmin = await fetch(`${baseUrl}/api/admin/users/${pedroId}/role`, {
+      method: 'PATCH',
+      headers: authJson(marinaToken),
+      body: JSON.stringify({ role: 'admin' }),
+    });
+    expect(adminPromotesAdmin.status).toBe(403);
+
+    // Admin can list users with roles
+    const usersRes = await fetch(`${baseUrl}/api/admin/users`, {
+      headers: { Authorization: `Bearer ${marinaToken}` },
+    });
+    expect(usersRes.status).toBe(200);
+    const usersBody = (await usersRes.json()) as { users: { id: string; role: string }[] };
+    expect(usersBody.users.find((u) => u.id === lucasId)?.role).toBe('owner');
+    expect(usersBody.users.find((u) => u.id === marinaId)?.role).toBe('admin');
+
+    // 4. Real-time room moderation inside a public desktop room
+    const roomRes = await fetch(`${baseUrl}/api/rooms`, {
+      method: 'POST',
+      headers: authJson(lucasToken),
+      body: JSON.stringify({ name: 'Moderacao Ao Vivo', description: '', isPrivate: false }),
+    });
+    expect(roomRes.status).toBe(201);
+    const { room: modRoom } = (await roomRes.json()) as { room: { id: string } };
+
+    await wsMarina.rpc<RoomJoinResult>('room:join', { roomId: modRoom.id, clientPlatform: 'desktop' });
+    const joinPedro = await wsPedro.rpc<RoomJoinResult>('room:join', {
+      roomId: modRoom.id,
+      clientPlatform: 'desktop',
+    });
+    const pedroPeer = joinPedro.participants.find((p) => p.user.id === pedroId);
+    const marinaPeer = joinPedro.participants.find((p) => p.user.id === marinaId);
+    expect(pedroPeer).toBeDefined();
+    expect(marinaPeer?.user.role).toBe('admin');
+
+    // A member cannot moderate an admin
+    await expect(
+      wsPedro.rpc('admin:forceMuteParticipant', { peerId: marinaPeer!.peerId })
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+
+    // Pedro starts a 1080p @ 60 FPS live (media invariants untouched by RBAC)
+    expect(resolveTargetBitrateKbps('720p', 60, null)).toBeGreaterThan(0);
+    expect(resolveTargetBitrateKbps('1080p', 60, null)).toBeGreaterThan(
+      resolveTargetBitrateKbps('720p', 60, null)
+    );
+    expect(resolveTargetBitrateKbps('1440p', 75, null)).toBe(26000);
+
+    const rtpCaps = joinPedro.routerRtpCapabilities as {
+      codecs: { mimeType: string; preferredPayloadType?: number; parameters?: Record<string, unknown> }[];
+    };
+    const h264 = rtpCaps.codecs.find(
+      (c) => c.mimeType === 'video/H264' && c.parameters?.['profile-level-id'] === '640034'
+    );
+    const pedroStreamSend = await wsPedro.rpc<{ id: string }>('sfu:createTransport', {
+      plane: 'stream',
+      direction: 'send',
+    });
+    const pedroVideo = await wsPedro.rpc<{ producerId: string }>('sfu:produceStreamTrack', {
+      transportId: pedroStreamSend.id,
+      kind: 'video',
+      rtpParameters: {
+        codecs: [
+          {
+            mimeType: 'video/H264',
+            payloadType: h264?.preferredPayloadType ?? 101,
+            clockRate: 90000,
+            parameters: {
+              'packetization-mode': 1,
+              'profile-level-id': '640034',
+              'level-asymmetry-allowed': 1,
+            },
+          },
+        ],
+        encodings: [{ ssrc: 44444444, maxBitrate: 12000000, maxFramerate: 60 }],
+      },
+    });
+    const pedroStream = await wsPedro.rpc<{ stream: ActiveStreamInfo }>('stream:start', {
+      transportId: pedroStreamSend.id,
+      title: 'Ranked 1080p 60',
+      resolution: '1080p',
+      fps: 60,
+      targetBitrateKbps: resolveTargetBitrateKbps('1080p', 60, null),
+      audioIsolationMode: 'none',
+      videoProducerId: pedroVideo.producerId,
+      audioProducerId: null,
+    });
+    expect(pedroStream.stream.resolution).toBe('1080p');
+    expect(pedroStream.stream.fps).toBe(60);
+    expect(pedroStream.stream.broadcasterRole).toBe('member');
+
+    // Admin force-stops the member's stream
+    const stopRes = await wsMarina.rpc<{ stopped: boolean }>('admin:forceStopStream', {
+      streamId: pedroStream.stream.streamId,
+      reason: 'Teste de moderação',
+    });
+    expect(stopRes.stopped).toBe(true);
+    await wsMarina.waitForEvent(
+      'room:streamStopped',
+      (e) => e.payload.streamId === pedroStream.stream.streamId
+    );
+
+    // Admin force-mutes the member -> target receives admin:forceMuted
+    const muteRes = await wsMarina.rpc<{ muted: boolean }>('admin:forceMuteParticipant', {
+      peerId: pedroPeer!.peerId,
+    });
+    expect(muteRes.muted).toBe(true);
+    await wsPedro.waitForEvent('admin:forceMuted', (e) => e.payload.roomId === modRoom.id);
+
+    // Admin kicks the member -> target receives admin:kickedFromRoom
+    const kickRes = await wsMarina.rpc<{ kicked: boolean }>('admin:kickParticipant', {
+      peerId: pedroPeer!.peerId,
+      reason: 'Teste de remoção',
+    });
+    expect(kickRes.kicked).toBe(true);
+    const kickedEv = await wsPedro.waitForEvent('admin:kickedFromRoom', (e) => e.payload.roomId === modRoom.id);
+    expect(kickedEv.payload.reason).toBe('Teste de remoção');
+
+    // 5. Account ban -> instant WS notification + API access revoked
+    const banRes = await fetch(`${baseUrl}/api/admin/users/${pedroId}/ban`, {
+      method: 'POST',
+      headers: authJson(marinaToken),
+      body: JSON.stringify({ banned: true, reason: 'Teste automatizado' }),
+    });
+    expect(banRes.status).toBe(200);
+    await wsPedro.waitForEvent('admin:accountBanned');
+    expect((await meOf(pedroToken)).status).toBe(403);
+
+    // Admin cannot ban the owner
+    const banOwner = await fetch(`${baseUrl}/api/admin/users/${lucasId}/ban`, {
+      method: 'POST',
+      headers: authJson(marinaToken),
+      body: JSON.stringify({ banned: true, reason: 'tentativa' }),
+    });
+    expect(banOwner.status).toBe(403);
+
+    // Unban restores access to the account record
+    const unbanRes = await fetch(`${baseUrl}/api/admin/users/${pedroId}/ban`, {
+      method: 'POST',
+      headers: authJson(lucasToken),
+      body: JSON.stringify({ banned: false }),
+    });
+    expect(unbanRes.status).toBe(200);
+
+    // 6. Audit logs record every privileged action
+    const logsRes = await fetch(`${baseUrl}/api/admin/audit-logs`, {
+      headers: { Authorization: `Bearer ${lucasToken}` },
+    });
+    expect(logsRes.status).toBe(200);
+    const { logs } = (await logsRes.json()) as { logs: { action: string }[] };
+    const actions = logs.map((l) => l.action);
+    for (const expected of [
+      'role:claim_owner',
+      'role:update',
+      'stream:force_stop',
+      'voice:force_mute',
+      'room:kick',
+      'account:ban',
+      'account:unban',
+    ]) {
+      expect(actions).toContain(expected);
+    }
+
+    wsLucas.close();
+    wsMarina.close();
+    wsPedro.close();
+  }, 20000);
+
   it('serves the Official Web Portal HTML, RNNoise SIMD WASM DSP assets, /api/health, and the real Windows NSIS installer', async () => {
     const healthRes = await fetch(`${baseUrl}/api/health`);
     expect(healthRes.status).toBe(200);
@@ -782,9 +1037,12 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
       path.resolve(process.cwd(), 'apps/web/src/rtc/RealtimeSession.ts'),
       'utf8'
     );
-    expect(rtcSessionSrc).toContain('echoCancellation: false');
-    expect(rtcSessionSrc).toContain('noiseSuppression: false');
-    expect(rtcSessionSrc).toContain('autoGainControl: false');
+    // Desktop-only capture: Chromium never touches stream audio (audio: false on WGC capture),
+    // stream audio comes exclusively from the .NET WASAPI process-isolated PCM bridge (zero DSP, zero ducking).
+    expect(rtcSessionSrc).toContain('audio: false');
+    expect(rtcSessionSrc).toContain('createNativeLoopbackTrack');
+    expect(rtcSessionSrc).toContain("audioIsolationMode = 'process-isolated'");
+    expect(rtcSessionSrc).toContain('isDesktopClient()');
     expect(rtcSessionSrc).toContain('maintain-resolution');
     expect(rtcSessionSrc).toContain('sfu:produceStreamTrack');
 

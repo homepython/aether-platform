@@ -12,11 +12,13 @@ import {
   Plus,
   Radio,
   Settings,
+  ShieldCheck,
   Trash2,
   Volume2,
 } from 'lucide-react';
-import type { RoomSummary } from '@aether/shared';
+import { hasRoleAtLeast, type RoomSummary } from '@aether/shared';
 import { useAppStore } from '../store/useAppStore.js';
+import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
 
 export const SidebarRooms: React.FC = () => {
   const user = useAppStore((s) => s.user);
@@ -36,6 +38,7 @@ export const SidebarRooms: React.FC = () => {
   const toggleMicMute = useAppStore((s) => s.toggleMicMute);
   const toggleDeafen = useAppStore((s) => s.toggleDeafen);
   const openSettings = useAppStore((s) => s.openSettings);
+  const setAdminModalOpen = useAppStore((s) => s.setAdminModalOpen);
   const setCreateRoomModalOpen = useAppStore((s) => s.setCreateRoomModalOpen);
   const setStreamLauncherOpen = useAppStore((s) => s.setStreamLauncherOpen);
   const stopBroadcast = useAppStore((s) => s.stopBroadcast);
@@ -164,14 +167,16 @@ export const SidebarRooms: React.FC = () => {
                     className="h-2 w-2 rounded-full"
                     style={{ backgroundColor: p.speaking ? 'var(--voice-green)' : p.avatarColor }}
                   />
-                  <span className="max-w-[96px] truncate">{p.displayName}</span>
+                  <span className="max-w-[96px] truncate">
+                    <StyledUserName name={p.displayName} role={p.role} />
+                  </span>
                 </div>
               ))}
             </div>
           )}
         </button>
 
-        {isOwner && (
+        {(isOwner || hasRoleAtLeast(user?.role, 'admin')) && (
           <button
             type="button"
             title="Excluir sala"
@@ -358,7 +363,10 @@ export const SidebarRooms: React.FC = () => {
               {user.displayName.slice(0, 2).toUpperCase()}
             </div>
             <div className="min-w-0">
-              <div className="truncate text-xs font-semibold">{user.displayName}</div>
+              <div className="flex min-w-0 items-center gap-1.5 text-xs">
+                <StyledUserName name={user.displayName} role={user.role} />
+                <UserRoleBadge role={user.role} compact />
+              </div>
               <div className="truncate text-[11px]" style={{ color: 'var(--text-muted)' }}>
                 @{user.username}
               </div>
@@ -401,6 +409,18 @@ export const SidebarRooms: React.FC = () => {
             >
               <Settings className="h-4 w-4" />
             </button>
+
+            {hasRoleAtLeast(user.role, 'moderator') && (
+              <button
+                type="button"
+                onClick={() => setAdminModalOpen(true)}
+                title="Central de Administração"
+                className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+                style={{ color: user.role === 'owner' ? '#fbbf24' : '#60a5fa' }}
+              >
+                <ShieldCheck className="h-4 w-4" />
+              </button>
+            )}
 
             <button
               type="button"

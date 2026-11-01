@@ -20,17 +20,22 @@ function detectDefaultLanIp(): string {
   return '127.0.0.1';
 }
 
-function resolvePersistentSecret(name: string, envValue: string | undefined, dataDir: string): string {
-  if (envValue && envValue.trim().length >= 24) {
+function resolvePersistentSecret(
+  name: string,
+  envValue: string | undefined,
+  dataDir: string,
+  minEnvLength = 24
+): string {
+  if (envValue && envValue.trim().length >= minEnvLength) {
     return envValue.trim();
   }
   fs.mkdirSync(dataDir, { recursive: true });
   const secretPath = path.join(dataDir, `.${name}.secret`);
   if (fs.existsSync(secretPath)) {
     const existing = fs.readFileSync(secretPath, 'utf8').trim();
-    if (existing.length >= 32) return existing;
+    if (existing.length >= minEnvLength) return existing;
   }
-  const generated = crypto.randomBytes(48).toString('hex');
+  const generated = crypto.randomBytes(32).toString('hex');
   fs.writeFileSync(secretPath, generated, { mode: 0o600 });
   return generated;
 }
@@ -89,6 +94,12 @@ export const config = {
       'data_encryption_key',
       process.env.DATA_ENCRYPTION_KEY,
       dataDir
+    ),
+    adminMasterKey: resolvePersistentSecret(
+      'admin_master_key',
+      process.env.ADMIN_MASTER_KEY,
+      dataDir,
+      12
     ),
   },
 

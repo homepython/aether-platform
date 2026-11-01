@@ -1,14 +1,19 @@
 import crypto from 'node:crypto';
 import type { WebSocket } from 'ws';
 import {
+  AdminForceMuteParticipantParamsSchema,
+  AdminForceStopStreamParamsSchema,
+  AdminKickParticipantParamsSchema,
   ChatDeleteParamsSchema,
   ChatEditParamsSchema,
   ChatHistoryParamsSchema,
   ChatSendParamsSchema,
   ClientRpcMethodSchema,
+  hasRoleAtLeast,
   P2pSignalParamsSchema,
   P2pStreamStartParamsSchema,
   P2pVoiceReadyParamsSchema,
+  ROLE_RANK,
   RoomJoinParamsSchema,
   SfuConnectTransportParamsSchema,
   SfuConsumeVoiceParamsSchema,
@@ -161,6 +166,10 @@ export class RealtimeGateway {
       socket.close(4001, 'Usuário não encontrado');
       return;
     }
+    if (Boolean(userRow.is_banned)) {
+      socket.close(4003, 'Conta suspensa pela administração');
+      return;
+    }
 
     const user = this.db.mapUserPublic(userRow);
     const peerId = crypto.randomUUID();
@@ -228,6 +237,7 @@ export class RealtimeGateway {
       username: u.username,
       displayName: u.displayName,
       avatarColor: u.avatarColor,
+      role: u.role ?? 'member',
     }));
     return {
       streamId: rec.streamId,
@@ -236,6 +246,7 @@ export class RealtimeGateway {
       broadcasterUsername: rec.broadcaster.username,
       broadcasterDisplayName: rec.broadcaster.displayName,
       broadcasterAvatarColor: rec.broadcaster.avatarColor,
+      broadcasterRole: rec.broadcaster.role ?? 'member',
       title: rec.title,
       resolution: rec.resolution,
       fps: rec.fps,
@@ -413,6 +424,7 @@ export class RealtimeGateway {
         userId: p.user.id,
         displayName: p.user.displayName,
         avatarColor: p.user.avatarColor,
+        role: p.user.role ?? 'member',
         speaking: p.speaking,
         isStreaming: p.isStreaming,
       })),
@@ -478,15 +490,34 @@ export class RealtimeGateway {
 
       case 'room:join': {
         const params = RoomJoinParamsSchema.parse(rawParams);
+        if (params.clientPlatform !== 'desktop') {
+          throw Object.assign(
+            new Error(
+              'Salas de voz e transmissões ao vivo são exclusivas do Aplicativo Desktop Aether.'
+            ),
+            { code: 'DESKTOP_REQUIRED' }
+          );
+        }
+
+        const freshUserRow = await this.db.findUserRowById(peer.user.id);
+        if (!freshUserRow || Boolean(freshUserRow.is_banned)) {
+          peer.socket.close(4003, 'Conta suspensa pela administração');
+          throw Object.assign(new Error('Sua conta foi suspensa pela administração.'), {
+            code: 'ACCOUNT_BANNED',
+          });
+        }
+        peer.user = this.db.mapUserPublic(freshUserRow);
+
         const roomRow = await this.db.getRoomById(params.roomId);
         if (!roomRow) {
           throw Object.assign(new Error('Sala não encontrada'), { code: 'ROOM_NOT_FOUND' });
         }
 
         const isOwner = roomRow.owner_id === peer.user.id;
+        const isStaffAdmin = hasRoleAtLeast(peer.user.role, 'admin');
         const alreadyUnlocked = await this.db.hasRoomAccess(roomRow.id, peer.user.id);
 
-        if (roomRow.password_hash && !isOwner && !alreadyUnlocked) {
+        if (roomRow.password_hash && !isOwner && !isStaffAdmin && !alreadyUnlocked) {
           if (!params.password) {
             throw Object.assign(new Error('Esta sala exige senha para entrar'), {
               code: 'PASSWORD_REQUIRED',
@@ -497,8 +528,12 @@ export class RealtimeGateway {
             throw Object.assign(new Error('Senha da sala incorreta'), { code: 'INVALID_PASSWORD' });
           }
           await this.db.grantRoomAccess(roomRow.id, peer.user.id);
-        } else if (Boolean(roomRow.is_private) && !roomRow.password_hash && !isOwner && !alreadyUnlocked) {
-          // Private room without password allows entry via direct Room ID invite and grants membership
+        } else if (
+          (Boolean(roomRow.is_private) || isStaffAdmin) &&
+          !isOwner &&
+          !alreadyUnlocked
+        ) {
+          // Private room without password or staff inspection grants room access
           await this.db.grantRoomAccess(roomRow.id, peer.user.id);
         }
 
@@ -1069,16 +1104,30 @@ export class RealtimeGateway {
 
       case 'chat:delete': {
         const params = ChatDeleteParamsSchema.parse(rawParams);
+        const freshRow = await this.db.findUserRowById(peer.user.id);
+        if (freshRow) peer.user = this.db.mapUserPublic(freshRow);
+
         const msg = await this.db.getMessageById(params.messageId);
         if (!msg) throw new Error('Mensagem não encontrada');
         const room = await this.db.getRoomById(msg.roomId);
         const deleted = await this.db.softDeleteMessage(
           params.messageId,
           peer.user.id,
-          room?.owner_id ?? null
+          room?.owner_id ?? null,
+          peer.user.role
         );
         if (!deleted) {
           throw new Error('Sem permissão para excluir esta mensagem');
+        }
+        if (msg.author.id !== peer.user.id && room?.owner_id !== peer.user.id) {
+          await this.db.recordAdminAuditLog({
+            actorId: peer.user.id,
+            actorRole: peer.user.role,
+            action: 'chat:delete',
+            targetUserId: msg.author.id,
+            targetUsername: msg.author.username,
+            details: `Mensagem removida na sala "${room?.name || msg.roomId}"`,
+          });
         }
         this.broadcastToRoom(deleted.roomId, {
           type: 'event',
@@ -1099,6 +1148,259 @@ export class RealtimeGateway {
           params.beforeCreatedAt
         );
         return { messages };
+      }
+
+      case 'admin:kickParticipant': {
+        const params = AdminKickParticipantParamsSchema.parse(rawParams);
+        const actor = await this.requireModeratorPeer(peer);
+        const target = this.peers.get(params.peerId);
+        if (!target || !target.roomId) {
+          throw new Error('Participante não está mais conectado em uma sala');
+        }
+        if (target.user.id === actor.id) {
+          throw new Error('Você não pode remover a si mesmo');
+        }
+        const targetFresh = await this.db.findUserRowById(target.user.id);
+        if (targetFresh) target.user = this.db.mapUserPublic(targetFresh);
+
+        if (actor.role !== 'owner' && ROLE_RANK[actor.role] <= ROLE_RANK[target.user.role]) {
+          throw Object.assign(
+            new Error('Hierarquia insuficiente para remover este participante'),
+            { code: 'FORBIDDEN' }
+          );
+        }
+
+        const roomId = target.roomId;
+        const room = await this.db.getRoomById(roomId);
+        const reason = params.reason?.trim() || 'Removido da sala pela moderação';
+
+        this.sendToPeer(target, {
+          type: 'event',
+          event: 'admin:kickedFromRoom',
+          payload: {
+            roomId,
+            roomName: room?.name || 'Sala',
+            reason,
+            byDisplayName: actor.displayName,
+          },
+        });
+        this.leaveCurrentRoom(target);
+
+        await this.db.recordAdminAuditLog({
+          actorId: actor.id,
+          actorRole: actor.role,
+          action: 'room:kick',
+          targetUserId: target.user.id,
+          targetUsername: target.user.username,
+          details: `Removido da sala "${room?.name || roomId}" (${reason})`,
+        });
+
+        return { kicked: true };
+      }
+
+      case 'admin:forceMuteParticipant': {
+        const params = AdminForceMuteParticipantParamsSchema.parse(rawParams);
+        const actor = await this.requireModeratorPeer(peer);
+        const target = this.peers.get(params.peerId);
+        if (!target || !target.roomId) {
+          throw new Error('Participante não está mais conectado em uma sala');
+        }
+        if (target.user.id === actor.id) {
+          throw new Error('Use o controle local para silenciar seu próprio microfone');
+        }
+        const targetFresh = await this.db.findUserRowById(target.user.id);
+        if (targetFresh) target.user = this.db.mapUserPublic(targetFresh);
+
+        if (actor.role !== 'owner' && ROLE_RANK[actor.role] <= ROLE_RANK[target.user.role]) {
+          throw Object.assign(
+            new Error('Hierarquia insuficiente para silenciar este participante'),
+            { code: 'FORBIDDEN' }
+          );
+        }
+
+        const roomId = target.roomId;
+        const hadP2pVoice = target.p2pVoiceReady;
+        target.micMuted = true;
+        target.speaking = false;
+        target.p2pVoiceReady = false;
+
+        const closedSfuVoice = this.sfu.closeVoice(target.peerId);
+        const closedProducerId =
+          closedSfuVoice || (hadP2pVoice ? `p2p-voice:${target.peerId}` : null);
+
+        if (closedProducerId) {
+          this.broadcastToRoom(roomId, {
+            type: 'event',
+            event: 'room:voiceProducerClosed',
+            payload: { roomId, peerId: target.peerId, producerId: closedProducerId },
+          });
+        }
+
+        this.broadcastToRoom(roomId, {
+          type: 'event',
+          event: 'room:participantUpdated',
+          payload: {
+            roomId,
+            peerId: target.peerId,
+            userId: target.user.id,
+            micMuted: true,
+            deafened: target.deafened,
+            speaking: false,
+            isStreaming: this.isPeerStreaming(target.peerId),
+            voiceProducerId: null,
+          },
+        });
+
+        this.sendToPeer(target, {
+          type: 'event',
+          event: 'admin:forceMuted',
+          payload: {
+            roomId,
+            byDisplayName: actor.displayName,
+          },
+        });
+
+        await this.db.recordAdminAuditLog({
+          actorId: actor.id,
+          actorRole: actor.role,
+          action: 'voice:force_mute',
+          targetUserId: target.user.id,
+          targetUsername: target.user.username,
+          details: `Microfone silenciado pela moderação na sala "${roomId}"`,
+        });
+
+        return { muted: true };
+      }
+
+      case 'admin:forceStopStream': {
+        const params = AdminForceStopStreamParamsSchema.parse(rawParams);
+        const actor = await this.requireModeratorPeer(peer);
+        const reason = params.reason?.trim() || 'Transmissão encerrada pela moderação';
+
+        const p2pRec = this.p2pStreams.get(params.streamId);
+        if (p2pRec) {
+          const targetRole = p2pRec.broadcaster.role ?? 'member';
+          if (
+            p2pRec.broadcaster.id !== actor.id &&
+            actor.role !== 'owner' &&
+            ROLE_RANK[actor.role] <= ROLE_RANK[targetRole]
+          ) {
+            throw Object.assign(
+              new Error('Hierarquia insuficiente para encerrar esta transmissão'),
+              { code: 'FORBIDDEN' }
+            );
+          }
+          this.p2pStreams.delete(params.streamId);
+          this.broadcastToRoom(p2pRec.roomId, {
+            type: 'event',
+            event: 'room:streamStopped',
+            payload: {
+              roomId: p2pRec.roomId,
+              streamId: p2pRec.streamId,
+              broadcasterId: p2pRec.broadcaster.id,
+            },
+          });
+          const bPeer = this.peers.get(p2pRec.broadcasterPeerId);
+          if (bPeer) {
+            this.broadcastToRoom(p2pRec.roomId, {
+              type: 'event',
+              event: 'room:participantUpdated',
+              payload: {
+                roomId: p2pRec.roomId,
+                peerId: bPeer.peerId,
+                userId: bPeer.user.id,
+                micMuted: bPeer.micMuted,
+                deafened: bPeer.deafened,
+                speaking: bPeer.speaking,
+                isStreaming: false,
+                voiceProducerId: this.getPeerVoiceId(bPeer),
+              },
+            });
+          }
+          await this.broadcastLobbyRoomsUpdate();
+          await this.db.recordAdminAuditLog({
+            actorId: actor.id,
+            actorRole: actor.role,
+            action: 'stream:force_stop',
+            targetUserId: p2pRec.broadcaster.id,
+            targetUsername: p2pRec.broadcaster.username,
+            details: `Transmissão "${p2pRec.title}" encerrada (${reason})`,
+          });
+          return { stopped: true };
+        }
+
+        // Check SFU streams across rooms
+        let sfuBroadcaster: { id: string; username: string; role: UserPublic['role']; title: string } | null =
+          null;
+        for (const r of await this.db.listAllRooms()) {
+          const match = this.sfu.listRoomStreams(r.id).find((s) => s.streamId === params.streamId);
+          if (match) {
+            sfuBroadcaster = {
+              id: match.broadcasterId,
+              username: match.broadcasterUsername,
+              role: match.broadcasterRole ?? 'member',
+              title: match.title,
+            };
+            break;
+          }
+        }
+
+        if (
+          sfuBroadcaster &&
+          sfuBroadcaster.id !== actor.id &&
+          actor.role !== 'owner' &&
+          ROLE_RANK[actor.role] <= ROLE_RANK[sfuBroadcaster.role]
+        ) {
+          throw Object.assign(
+            new Error('Hierarquia insuficiente para encerrar esta transmissão'),
+            { code: 'FORBIDDEN' }
+          );
+        }
+
+        const stoppedSfu = this.sfu.forceStopStream(params.streamId);
+        if (!stoppedSfu) {
+          throw new Error('Transmissão não encontrada ou já encerrada');
+        }
+
+        this.broadcastToRoom(stoppedSfu.roomId, {
+          type: 'event',
+          event: 'room:streamStopped',
+          payload: {
+            roomId: stoppedSfu.roomId,
+            streamId: stoppedSfu.streamId,
+            broadcasterId: stoppedSfu.broadcasterId,
+          },
+        });
+
+        const bPeer = this.peers.get(stoppedSfu.broadcasterPeerId);
+        if (bPeer) {
+          this.broadcastToRoom(stoppedSfu.roomId, {
+            type: 'event',
+            event: 'room:participantUpdated',
+            payload: {
+              roomId: stoppedSfu.roomId,
+              peerId: bPeer.peerId,
+              userId: bPeer.user.id,
+              micMuted: bPeer.micMuted,
+              deafened: bPeer.deafened,
+              speaking: bPeer.speaking,
+              isStreaming: false,
+              voiceProducerId: this.getPeerVoiceId(bPeer),
+            },
+          });
+        }
+
+        await this.broadcastLobbyRoomsUpdate();
+        await this.db.recordAdminAuditLog({
+          actorId: actor.id,
+          actorRole: actor.role,
+          action: 'stream:force_stop',
+          targetUserId: sfuBroadcaster?.id ?? stoppedSfu.broadcasterId,
+          targetUsername: sfuBroadcaster?.username ?? null,
+          details: `Transmissão "${sfuBroadcaster?.title || params.streamId}" encerrada (${reason})`,
+        });
+
+        return { stopped: true };
       }
 
       default:
@@ -1160,6 +1462,122 @@ export class RealtimeGateway {
     for (const peer of this.peers.values()) {
       if (peer.user.id === userId) {
         this.sendToPeer(peer, event);
+      }
+    }
+  }
+
+  private async requireModeratorPeer(peer: ConnectedPeer): Promise<UserPublic> {
+    const freshRow = await this.db.findUserRowById(peer.user.id);
+    if (!freshRow || Boolean(freshRow.is_banned)) {
+      peer.socket.close(4003, 'Conta suspensa');
+      throw Object.assign(new Error('Conta suspensa'), { code: 'FORBIDDEN' });
+    }
+    const freshUser = this.db.mapUserPublic(freshRow);
+    peer.user = freshUser;
+    if (!hasRoleAtLeast(freshUser.role, 'moderator')) {
+      throw Object.assign(new Error('Permissão administrativa necessária'), { code: 'FORBIDDEN' });
+    }
+    return freshUser;
+  }
+
+  public getOnlineUserMap(): Map<string, string | null> {
+    const map = new Map<string, string | null>();
+    for (const peer of this.peers.values()) {
+      const existing = map.get(peer.user.id);
+      if (existing === undefined || (existing === null && peer.roomId !== null)) {
+        map.set(peer.user.id, peer.roomId);
+      }
+    }
+    return map;
+  }
+
+  public async syncUserRoleEverywhere(updatedUser: UserPublic): Promise<void> {
+    let touchedRoom = false;
+    for (const peer of this.peers.values()) {
+      if (peer.user.id === updatedUser.id) {
+        peer.user = updatedUser;
+        if (peer.roomId) {
+          touchedRoom = true;
+        }
+      }
+    }
+
+    this.sfu.syncUserRole(updatedUser);
+
+    for (const rec of this.p2pStreams.values()) {
+      let changed = false;
+      if (rec.broadcaster.id === updatedUser.id) {
+        rec.broadcaster = updatedUser;
+        changed = true;
+      }
+      for (const [viewerPeerId, viewerUser] of rec.viewers.entries()) {
+        if (viewerUser.id === updatedUser.id) {
+          rec.viewers.set(viewerPeerId, updatedUser);
+          changed = true;
+        }
+      }
+      if (changed) {
+        this.broadcastToRoom(rec.roomId, {
+          type: 'event',
+          event: 'room:streamUpdated',
+          payload: { stream: this.serializeP2pStream(rec) },
+        });
+      }
+    }
+
+    this.broadcastAll({
+      type: 'event',
+      event: 'user:roleUpdated',
+      payload: {
+        userId: updatedUser.id,
+        username: updatedUser.username,
+        displayName: updatedUser.displayName,
+        role: updatedUser.role,
+      },
+    });
+
+    if (touchedRoom) {
+      await this.broadcastLobbyRoomsUpdate();
+    }
+  }
+
+  public disconnectBannedUser(userId: string, reason: string): void {
+    for (const [peerId, peer] of Array.from(this.peers.entries())) {
+      if (peer.user.id === userId) {
+        this.sendToPeer(peer, {
+          type: 'event',
+          event: 'admin:accountBanned',
+          payload: { reason },
+        });
+        this.leaveCurrentRoom(peer);
+        this.peers.delete(peerId);
+        try {
+          peer.socket.close(4003, 'Conta suspensa pela administração');
+        } catch {
+          // ignore socket close error
+        }
+      }
+    }
+  }
+
+  public evictRoomParticipantsOnDelete(
+    roomId: string,
+    roomName: string,
+    byDisplayName: string
+  ): void {
+    for (const peer of Array.from(this.peers.values())) {
+      if (peer.roomId === roomId) {
+        this.sendToPeer(peer, {
+          type: 'event',
+          event: 'admin:kickedFromRoom',
+          payload: {
+            roomId,
+            roomName,
+            reason: 'Sala encerrada pela administração',
+            byDisplayName,
+          },
+        });
+        this.leaveCurrentRoom(peer);
       }
     }
   }

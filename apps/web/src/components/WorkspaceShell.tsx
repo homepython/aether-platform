@@ -16,6 +16,7 @@ import { audioEngine } from '../audio/AudioEngine.js';
 import { getDesktopApi } from '../bridge/DesktopBridge.js';
 import { useAppStore } from '../store/useAppStore.js';
 import { ChatPanel } from './ChatPanel.js';
+import { AdminModal } from './AdminModal.js';
 import { CreateRoomModal } from './CreateRoomModal.js';
 import { ParticipantsDrawer } from './ParticipantsDrawer.js';
 import { SettingsModal } from './SettingsModal.js';
@@ -364,6 +365,7 @@ export const WorkspaceShell: React.FC = () => {
       <CreateRoomModal />
       <StreamLauncherModal />
       <SettingsModal />
+      <AdminModal />
 
       {/* Fullscreen Image Lightbox */}
       <AnimatePresence>

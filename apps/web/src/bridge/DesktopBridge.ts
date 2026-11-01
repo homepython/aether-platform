@@ -1,4 +1,4 @@
-import type { OverlaySettings, ShortcutSettings } from '@aether/shared';
+import type { OverlaySettings, ShortcutSettings, UserRole } from '@aether/shared';
 
 export interface DesktopCaptureSourceItem {
   id: string;
@@ -15,6 +15,7 @@ export interface OverlayParticipantState {
   userId: string;
   displayName: string;
   avatarColor: string;
+  role?: UserRole;
   speaking: boolean;
   micMuted: boolean;
   isStreaming: boolean;
@@ -70,6 +71,12 @@ export interface AetherDesktopApi {
     roomName: string | null;
     participants: OverlayParticipantState[];
   }) => void;
+  // Hardware Broadcast Priority & Anti-Background-Throttling Shield
+  setBroadcastActive: (active: boolean) => Promise<{
+    ok: boolean;
+    active?: boolean;
+    boostedCount?: number;
+  }>;
 }
 
 declare global {

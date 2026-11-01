@@ -353,6 +353,41 @@ export class RealtimeSession {
     return entry.pc;
   }
 
+  private applyHardwareVideoCodecPreferences(pc: RTCPeerConnection, sender: RTCRtpSender): void {
+    try {
+      if (typeof RTCRtpSender === 'undefined' || typeof RTCRtpSender.getCapabilities !== 'function') {
+        return;
+      }
+      const caps = RTCRtpSender.getCapabilities('video');
+      if (!caps?.codecs?.length) return;
+
+      const transceiver = pc.getTransceivers().find((t) => t.sender === sender);
+      if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+
+      const scoreCodec = (c: RTCRtpCodec): number => {
+        const mime = c.mimeType.toLowerCase();
+        const fmtp = (c.sdpFmtpLine || '').toLowerCase();
+        // Prioritize Hardware GPU H.264 (NVENC / AMD AMF / Intel QuickSync) -> ~0% CPU usage in games!
+        if (mime === 'video/h264') {
+          if (fmtp.includes('profile-level-id=6400')) return 1; // High Profile (L5.2 / L5.1 / L4.2)
+          if (fmtp.includes('profile-level-id=42e0')) return 2; // Constrained Baseline
+          if (fmtp.includes('packetization-mode=1')) return 3;
+          return 4;
+        }
+        if (mime === 'video/av1') return 10;
+        if (mime === 'video/vp9') return 20;
+        if (mime === 'video/vp8') return 30;
+        // Keep RTX / RED / ULPFEC / FlexFEC intact for zero-glitch packet recovery
+        return 40;
+      };
+
+      const ordered = [...caps.codecs].sort((a, b) => scoreCodec(a) - scoreCodec(b));
+      transceiver.setCodecPreferences(ordered);
+    } catch {
+      // Non-fatal if browser/driver rejects custom codec preference order
+    }
+  }
+
   private async handleP2pViewerJoined(streamId: string, viewerPeerId: string): Promise<void> {
     if (this.localStreamId !== streamId || !this.p2pBroadcastTracks) return;
     const prev = this.p2pStreamSenders.get(viewerPeerId);
@@ -374,6 +409,9 @@ export class RealtimeSession {
     };
 
     const videoSender = pc.addTrack(videoTrack);
+    // Force GPU Hardware H.264 (NVENC / AMF / QuickSync) instead of CPU-heavy libvpx VP8!
+    this.applyHardwareVideoCodecPreferences(pc, videoSender);
+
     const vParams = videoSender.getParameters();
     vParams.degradationPreference = 'maintain-resolution';
     if (!vParams.encodings || vParams.encodings.length === 0) {
@@ -382,6 +420,8 @@ export class RealtimeSession {
     vParams.encodings[0].maxBitrate = targetBitrateKbps * 1000;
     vParams.encodings[0].maxFramerate = fps;
     vParams.encodings[0].scaleResolutionDownBy = 1.0;
+    (vParams.encodings[0] as RTCRtpEncodingParameters & { priority?: string; networkPriority?: string }).priority = 'high';
+    (vParams.encodings[0] as RTCRtpEncodingParameters & { priority?: string; networkPriority?: string }).networkPriority = 'high';
     void videoSender.setParameters(vParams).catch(() => {});
 
     if (audioTrack && audioTrack.readyState === 'live') {
@@ -485,6 +525,11 @@ export class RealtimeSession {
     micMuted: boolean;
     deafened: boolean;
   }): Promise<RoomJoinResult> {
+    if (!isDesktopClient()) {
+      throw new Error(
+        'Salas de voz e transmissões ao vivo são exclusivas do Aplicativo Desktop Aether.'
+      );
+    }
     await audioEngine.resumeContexts();
     this.teardownRoomMedia();
 
@@ -718,24 +763,27 @@ export class RealtimeSession {
       throw new Error('Transporte de transmissão não inicializado');
     }
 
-    const h264High52 = this.device.rtpCapabilities.codecs?.find(
-      (c) =>
-        c.kind === 'video' &&
-        c.mimeType.toLowerCase() === 'video/h264' &&
-        String(c.parameters?.['profile-level-id'] || '').toLowerCase() === '640034'
+    const allH264 = (this.device.rtpCapabilities.codecs || []).filter(
+      (c) => c.kind === 'video' && c.mimeType.toLowerCase() === 'video/h264'
     );
-    const h264Base52 = this.device.rtpCapabilities.codecs?.find(
-      (c) =>
-        c.kind === 'video' &&
-        c.mimeType.toLowerCase() === 'video/h264' &&
-        String(c.parameters?.['profile-level-id'] || '').toLowerCase() === '42e034'
+    const h264High = allH264.find((c) =>
+      String(c.parameters?.['profile-level-id'] || '')
+        .toLowerCase()
+        .startsWith('6400')
     );
+    const h264Base = allH264.find((c) =>
+      String(c.parameters?.['profile-level-id'] || '')
+        .toLowerCase()
+        .startsWith('42e0')
+    );
+    const h264AnyOther = allH264.find((c) => c !== h264High && c !== h264Base);
 
     const codecCandidates: (mediasoupTypes.RtpCodecCapability | undefined)[] = [
-      h264High52,
-      h264Base52,
-      undefined, // Default WebRTC codec (VP9 / AV1 / VP8) guaranteed to work on every GPU/CPU
-    ];
+      h264High,
+      h264Base,
+      h264AnyOther,
+      undefined, // Default WebRTC codec (AV1 / VP9 / VP8) fallback
+    ].filter((c, idx, arr) => c !== undefined || idx === arr.length - 1);
 
     let lastErr: unknown = null;
     for (const codecCandidate of codecCandidates) {
@@ -814,127 +862,89 @@ export class RealtimeSession {
         'none';
 
       const desktopApi = getDesktopApi();
-      if (desktopApi && options.desktopSource) {
-        // 1. Unified Modern Windows Graphics Capture (WGC) via Electron setDisplayMediaRequestHandler
-        let mediaStream: MediaStream | null = null;
-        try {
-          await desktopApi.prepareDisplayMedia(options.desktopSource.id);
-          mediaStream = await this.withStageTimeout(
-            navigator.mediaDevices.getDisplayMedia({
-              video: {
-                width: { ideal: spec.width, max: spec.width },
-                height: { ideal: spec.height, max: spec.height },
-                frameRate: { ideal: options.fps, max: options.fps },
-              } as MediaTrackConstraints,
-              audio: false,
-            }),
-            10000,
-            'captura de tela Desktop'
-          );
-        } catch {
-          // Resilient fallback to non-rigid Chromium desktop source constraints
-          const fallbackConstraints = {
-            audio: false,
+      if (!desktopApi || !options.desktopSource) {
+        throw new Error(
+          'Selecione uma janela ou tela no Aplicativo Desktop Aether para iniciar a transmissão.'
+        );
+      }
+
+      // Activate OS Anti-Background-Throttling Shield (PowerSaveBlocker + EcoQoS Off + AboveNormal Priority + 1ms Timer)
+      await desktopApi.setBroadcastActive(true).catch(() => {});
+
+      // 1. Unified Modern Windows Graphics Capture (WGC) via Electron setDisplayMediaRequestHandler
+      let mediaStream: MediaStream | null = null;
+      try {
+        await desktopApi.prepareDisplayMedia(options.desktopSource.id);
+        mediaStream = await this.withStageTimeout(
+          navigator.mediaDevices.getDisplayMedia({
             video: {
-              mandatory: {
-                chromeMediaSource: 'desktop',
-                chromeMediaSourceId: options.desktopSource.id,
-                maxWidth: spec.width,
-                maxHeight: spec.height,
-                minFrameRate: 1,
-                maxFrameRate: options.fps,
-              },
-            },
-          } as unknown as MediaStreamConstraints;
-          mediaStream = await this.withStageTimeout(
-            navigator.mediaDevices.getUserMedia(fallbackConstraints),
-            10000,
-            'captura de janela Desktop'
-          );
-        }
-
-        this.localDisplayStream = mediaStream;
-        videoTrack = mediaStream.getVideoTracks()[0];
-
-        if (options.shareAudio) {
-          // Use .NET 8 WASAPI Process-Isolated Loopback (EXCLUDE_TARGET_PROCESS_TREE or INCLUDE_TARGET_PROCESS_TREE)
-          // Guarantees 0.0% of spectators' voices are looped back into the live stream!
-          try {
-            const loopbackMode =
-              options.desktopSource.kind === 'window' && options.desktopSource.pid
-                ? 'include-process'
-                : 'exclude-self';
-            const nativeRes = await desktopApi.startProcessLoopback({
-              mode: loopbackMode,
-              targetPid: options.desktopSource.pid,
-              targetHwnd: options.desktopSource.hwnd,
-            });
-
-            if (nativeRes.ok) {
-              const bridge = await this.withStageTimeout(
-                audioEngine.createNativeLoopbackTrack(),
-                8000,
-                'ponte de áudio WASAPI'
-              );
-              this.localNativeAudioCleanup = bridge.dispose;
-              this.localDesktopPcmUnsub = desktopApi.onLoopbackPcm((buf) => {
-                const floatView = new Float32Array(buf);
-                bridge.pushInterleavedPcm(floatView);
-              });
-              audioTrack = bridge.track;
-              audioIsolationMode = 'process-isolated';
-            }
-          } catch (audioErr) {
-            console.warn(
-              '[Desktop Audio Loopback] Falha não-bloqueante ao iniciar áudio isolado; prosseguindo com vídeo:',
-              audioErr
-            );
-          }
-        }
-      } else {
-        // Official Web Browser Display Capture
-        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+              width: { ideal: spec.width, max: spec.width },
+              height: { ideal: spec.height, max: spec.height },
+              frameRate: { ideal: options.fps, max: options.fps },
+            } as MediaTrackConstraints,
+            audio: false,
+          }),
+          10000,
+          'captura de tela Desktop'
+        );
+      } catch {
+        // Resilient fallback to non-rigid Chromium desktop source constraints with anti-drop minFrameRate
+        const fallbackConstraints = {
+          audio: false,
           video: {
-            width: { ideal: spec.width, max: spec.width },
-            height: { ideal: spec.height, max: spec.height },
-            frameRate: { ideal: options.fps, max: options.fps },
-            cursor: 'always',
-          } as MediaTrackConstraints,
-          audio: options.shareAudio
-            ? ({
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false,
-                googEchoCancellation: false,
-                googAutoGainControl: false,
-                googNoiseSuppression: false,
-                googHighpassFilter: false,
-                channelCount: 2,
-                sampleRate: 48000,
-                suppressLocalAudioPlayback: false,
-              } as MediaTrackConstraints)
-            : false,
-        });
+            mandatory: {
+              chromeMediaSource: 'desktop',
+              chromeMediaSourceId: options.desktopSource.id,
+              maxWidth: spec.width,
+              maxHeight: spec.height,
+              minFrameRate: Math.min(30, options.fps),
+              maxFrameRate: options.fps,
+            },
+          },
+        } as unknown as MediaStreamConstraints;
+        mediaStream = await this.withStageTimeout(
+          navigator.mediaDevices.getUserMedia(fallbackConstraints),
+          10000,
+          'captura de janela Desktop'
+        );
+      }
 
-        this.localDisplayStream = displayStream;
-        videoTrack = displayStream.getVideoTracks()[0];
-        const capturedAudio = displayStream.getAudioTracks()[0] || null;
-        if (capturedAudio && options.shareAudio) {
-          await capturedAudio
-            .applyConstraints({
-              echoCancellation: false,
-              noiseSuppression: false,
-              autoGainControl: false,
-              channelCount: 2,
-              sampleRate: 48000,
-            })
-            .catch(() => {});
-          audioTrack = capturedAudio;
-          const vidSettings = videoTrack.getSettings() as MediaTrackSettings & {
-            displaySurface?: string;
-          };
-          audioIsolationMode =
-            vidSettings.displaySurface === 'browser' ? 'tab-isolated' : 'system-direct';
+      this.localDisplayStream = mediaStream;
+      videoTrack = mediaStream.getVideoTracks()[0];
+
+      if (options.shareAudio) {
+        // Use .NET 8 WASAPI Process-Isolated Loopback (EXCLUDE_TARGET_PROCESS_TREE or INCLUDE_TARGET_PROCESS_TREE)
+        // Guarantees 0.0% of spectators' voices are looped back into the live stream!
+        try {
+          const loopbackMode =
+            options.desktopSource.kind === 'window' && options.desktopSource.pid
+              ? 'include-process'
+              : 'exclude-self';
+          const nativeRes = await desktopApi.startProcessLoopback({
+            mode: loopbackMode,
+            targetPid: options.desktopSource.pid,
+            targetHwnd: options.desktopSource.hwnd,
+          });
+
+          if (nativeRes.ok) {
+            const bridge = await this.withStageTimeout(
+              audioEngine.createNativeLoopbackTrack(),
+              8000,
+              'ponte de áudio WASAPI'
+            );
+            this.localNativeAudioCleanup = bridge.dispose;
+            this.localDesktopPcmUnsub = desktopApi.onLoopbackPcm((buf) => {
+              const floatView = new Float32Array(buf);
+              bridge.pushInterleavedPcm(floatView);
+            });
+            audioTrack = bridge.track;
+            audioIsolationMode = 'process-isolated';
+          }
+        } catch (audioErr) {
+          console.warn(
+            '[Desktop Audio Loopback] Falha não-bloqueante ao iniciar áudio isolado; prosseguindo com vídeo:',
+            audioErr
+          );
         }
       }
 
@@ -1122,6 +1132,7 @@ export class RealtimeSession {
     const desktopApi = getDesktopApi();
     if (desktopApi) {
       await desktopApi.stopProcessLoopback().catch(() => {});
+      await desktopApi.setBroadcastActive(false).catch(() => {});
     }
     if (this.localNativeAudioCleanup) {
       this.localNativeAudioCleanup();
@@ -1474,6 +1485,19 @@ export class RealtimeSession {
 
   public listRoomsRpc() {
     return this.rpc<{ rooms: RoomSummary[] }>('lobby:listRooms', {});
+  }
+
+  // Real-Time Moderation & Administration RPCs
+  public adminKickParticipant(peerId: string, reason?: string) {
+    return this.rpc<{ kicked: boolean }>('admin:kickParticipant', { peerId, reason });
+  }
+
+  public adminForceMuteParticipant(peerId: string) {
+    return this.rpc<{ muted: boolean }>('admin:forceMuteParticipant', { peerId });
+  }
+
+  public adminForceStopStream(streamId: string, reason?: string) {
+    return this.rpc<{ stopped: boolean }>('admin:forceStopStream', { streamId, reason });
   }
 }
 

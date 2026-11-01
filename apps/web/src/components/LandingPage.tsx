@@ -3,24 +3,33 @@ import { motion } from 'framer-motion';
 import {
   ArrowRight,
   Download,
+  ExternalLink,
   Headphones,
   Layers,
+  LogOut,
   Mic,
   MonitorPlay,
   Moon,
   ShieldCheck,
   Sun,
+  UserCheck,
   Volume2,
   Zap,
 } from 'lucide-react';
 import { api, resolveServerAssetUrl } from '../api/httpClient.js';
+import { isDesktopClient } from '../bridge/DesktopBridge.js';
 import { useAppStore } from '../store/useAppStore.js';
+import { AdminModal } from './AdminModal.js';
+import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
 
 export const LandingPage: React.FC = () => {
   const user = useAppStore((s) => s.user);
   const setViewMode = useAppStore((s) => s.setViewMode);
+  const setAdminModalOpen = useAppStore((s) => s.setAdminModalOpen);
+  const logout = useAppStore((s) => s.logout);
   const theme = useAppStore((s) => s.settings.interface.theme);
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const desktop = isDesktopClient();
 
   const [release, setRelease] = useState<{
     version: string;
@@ -100,15 +109,87 @@ export const LandingPage: React.FC = () => {
               {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </button>
 
-            <button
-              type="button"
-              onClick={() => setViewMode(user ? 'app' : 'auth')}
-              className="inline-flex h-9 items-center gap-2 rounded-xl px-4 text-sm font-medium text-white transition-all hover:opacity-95"
-              style={{ backgroundColor: 'var(--accent)' }}
-            >
-              {user ? 'Abrir Plataforma' : 'Entrar na Web'}
-              <ArrowRight className="h-3.5 w-3.5" />
-            </button>
+            {user ? (
+              <>
+                <div
+                  className="hidden items-center gap-2 rounded-xl border px-3 py-1.5 text-sm sm:inline-flex"
+                  style={{
+                    borderColor: 'var(--border-hairline)',
+                    backgroundColor: 'var(--bg-surface)',
+                  }}
+                >
+                  <UserCheck className="h-3.5 w-3.5" style={{ color: 'var(--voice-green)' }} />
+                  <StyledUserName name={user.displayName} role={user.role} className="max-w-[160px]" />
+                  <UserRoleBadge role={user.role} compact />
+                </div>
+
+                {desktop && (
+                  <button
+                    type="button"
+                    onClick={() => setViewMode('app')}
+                    className="inline-flex h-9 items-center gap-2 rounded-xl px-4 text-sm font-medium text-white transition-all hover:opacity-95"
+                    style={{ backgroundColor: 'var(--accent)' }}
+                  >
+                    Abrir Salas
+                    <ArrowRight className="h-3.5 w-3.5" />
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setAdminModalOpen(true)}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-xl border px-3 text-sm font-medium transition-colors"
+                  style={{
+                    borderColor: 'var(--border-hairline)',
+                    backgroundColor: 'var(--bg-surface)',
+                    color: 'var(--text-secondary)',
+                  }}
+                  title="Central de Administração"
+                >
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  <span className="hidden md:inline">Administração</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void logout()}
+                  className="flex h-9 w-9 items-center justify-center rounded-xl border transition-colors"
+                  style={{
+                    borderColor: 'var(--border-hairline)',
+                    backgroundColor: 'var(--bg-surface)',
+                    color: 'var(--text-muted)',
+                  }}
+                  title="Sair da conta"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setViewMode('auth')}
+                className="inline-flex h-9 items-center gap-2 rounded-xl border px-4 text-sm font-medium transition-colors"
+                style={{
+                  borderColor: 'var(--border-strong)',
+                  backgroundColor: 'var(--bg-surface)',
+                  color: 'var(--text-primary)',
+                }}
+              >
+                Entrar na Conta
+              </button>
+            )}
+
+            {!desktop && (
+              <a
+                href={resolveServerAssetUrl(release?.downloadUrl || '/api/releases/desktop/windows')}
+                download
+                className="inline-flex h-9 items-center gap-2 rounded-xl px-4 text-sm font-medium text-white transition-all hover:opacity-95"
+                style={{ backgroundColor: 'var(--accent)' }}
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Baixar Desktop</span>
+              </a>
+            )}
           </div>
         </div>
       </nav>
@@ -164,28 +245,44 @@ export const LandingPage: React.FC = () => {
             >
               <Download className="h-4 w-4" />
               <span>
-                Baixar para Windows
+                Baixar Aether Desktop para Windows
                 {release?.available ? formatMb(release.sizeBytes) : ' (64-bit)'}
               </span>
             </a>
 
-            <button
-              type="button"
-              onClick={() => setViewMode(user ? 'app' : 'auth')}
-              className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl border px-7 text-sm font-semibold transition-colors sm:w-auto"
-              style={{
-                borderColor: 'var(--border-strong)',
-                backgroundColor: 'var(--bg-surface)',
-                color: 'var(--text-primary)',
-              }}
-            >
-              Abrir Aether no Navegador
-              <ArrowRight className="h-4 w-4" />
-            </button>
+            {desktop ? (
+              <button
+                type="button"
+                onClick={() => setViewMode(user ? 'app' : 'auth')}
+                className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl border px-7 text-sm font-semibold transition-colors sm:w-auto"
+                style={{
+                  borderColor: 'var(--border-strong)',
+                  backgroundColor: 'var(--bg-surface)',
+                  color: 'var(--text-primary)',
+                }}
+              >
+                {user ? 'Abrir Salas' : 'Entrar na Conta'}
+                <ArrowRight className="h-4 w-4" />
+              </button>
+            ) : (
+              <a
+                href="aether-app://open"
+                className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl border px-7 text-sm font-semibold transition-colors sm:w-auto"
+                style={{
+                  borderColor: 'var(--border-strong)',
+                  backgroundColor: 'var(--bg-surface)',
+                  color: 'var(--text-primary)',
+                }}
+              >
+                Já instalou? Abrir Aplicativo Desktop
+                <ExternalLink className="h-4 w-4" />
+              </a>
+            )}
           </div>
 
-          <p className="mt-3 text-xs" style={{ color: 'var(--text-muted)' }}>
-            Mesma conta, salas, voz e transmissões sincronizadas entre Desktop e Web.
+          <p className="mx-auto mt-4 max-w-xl text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+            Comunicação por voz, salas e transmissões ao vivo funcionam exclusivamente no Aplicativo
+            Desktop Windows para máxima performance de GPU e áudio isolado sem eco.
           </p>
         </motion.div>
 
@@ -274,10 +371,12 @@ export const LandingPage: React.FC = () => {
             <span>Controle individual de volume (0–200%) e filtro individual de ruído por participante</span>
           </div>
           <div className="font-medium tabular-nums">
-            Arquitetura Cloud Multi-Core SFU • Windows 10/11 & Web Moderna
+            Arquitetura Cloud Multi-Core SFU • Aplicativo Desktop Windows 10/11
           </div>
         </div>
       </main>
+
+      {user && <AdminModal />}
     </div>
   );
 };

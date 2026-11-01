@@ -11,6 +11,7 @@ import type {
   IceServerConfig,
   RoomParticipant,
   RoomSummary,
+  UserRole,
 } from './models.js';
 
 export const ClientRpcMethodSchema = z.enum([
@@ -42,6 +43,9 @@ export const ClientRpcMethodSchema = z.enum([
   'chat:edit',
   'chat:delete',
   'chat:history',
+  'admin:kickParticipant',
+  'admin:forceMuteParticipant',
+  'admin:forceStopStream',
 ]);
 export type ClientRpcMethod = z.infer<typeof ClientRpcMethodSchema>;
 
@@ -176,6 +180,20 @@ export const ChatHistoryParamsSchema = z.object({
   limit: z.number().int().min(1).max(100).default(50),
 });
 
+export const AdminKickParticipantParamsSchema = z.object({
+  peerId: z.string().min(1),
+  reason: z.string().trim().max(200).optional(),
+});
+
+export const AdminForceMuteParticipantParamsSchema = z.object({
+  peerId: z.string().min(1),
+});
+
+export const AdminForceStopStreamParamsSchema = z.object({
+  streamId: z.string().min(1),
+  reason: z.string().trim().max(200).optional(),
+});
+
 export interface ClientRpcRequest {
   type: 'rpc:req';
   reqId: string;
@@ -293,5 +311,40 @@ export type ServerPushEvent =
       type: 'event';
       event: 'p2p:viewerLeft';
       payload: { streamId: string; viewerPeerId: string };
+    }
+  | {
+      type: 'event';
+      event: 'user:roleUpdated';
+      payload: {
+        userId: string;
+        username: string;
+        displayName: string;
+        role: UserRole;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'admin:kickedFromRoom';
+      payload: {
+        roomId: string;
+        roomName: string;
+        reason: string;
+        byDisplayName: string;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'admin:forceMuted';
+      payload: {
+        roomId: string;
+        byDisplayName: string;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'admin:accountBanned';
+      payload: {
+        reason: string;
+      };
     };
 

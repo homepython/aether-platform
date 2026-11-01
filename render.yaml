@@ -30,6 +30,8 @@ services:
         generateValue: true
       - key: DATA_ENCRYPTION_KEY
         generateValue: true
+      - key: ADMIN_MASTER_KEY
+        sync: false
 
 databases:
   - name: aether-postgres

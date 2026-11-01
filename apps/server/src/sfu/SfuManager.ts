@@ -568,7 +568,9 @@ export class SfuManager {
     return this.forceCloseStreamRecord(streamId);
   }
 
-  private forceCloseStreamRecord(streamId: string): { roomId: string; broadcasterId: string } | null {
+  private forceCloseStreamRecord(
+    streamId: string
+  ): { roomId: string; broadcasterId: string; broadcasterPeerId: string } | null {
     const record = this.streams.get(streamId);
     if (!record) return null;
     this.streams.delete(streamId);
@@ -587,7 +589,11 @@ export class SfuManager {
     if (!record.videoProducer.closed) record.videoProducer.close();
     if (record.audioProducer && !record.audioProducer.closed) record.audioProducer.close();
 
-    return { roomId: record.roomId, broadcasterId: record.broadcaster.id };
+    return {
+      roomId: record.roomId,
+      broadcasterId: record.broadcaster.id,
+      broadcasterPeerId: record.broadcasterPeerId,
+    };
   }
 
   async watchStream(
@@ -742,40 +748,92 @@ export class SfuManager {
     return Boolean(this.peers.get(peerId)?.activeStreamId);
   }
 
+  forceStopStream(
+    streamId: string
+  ): { roomId: string; streamId: string; broadcasterId: string; broadcasterPeerId: string } | null {
+    const closed = this.forceCloseStreamRecord(streamId);
+    if (!closed) return null;
+    return {
+      roomId: closed.roomId,
+      streamId,
+      broadcasterId: closed.broadcasterId,
+      broadcasterPeerId: closed.broadcasterPeerId,
+    };
+  }
+
+  syncUserRole(updatedUser: UserPublic): void {
+    for (const peer of this.peers.values()) {
+      if (peer.user.id === updatedUser.id) {
+        peer.user = updatedUser;
+      }
+    }
+    for (const record of this.streams.values()) {
+      let changed = false;
+      if (record.broadcaster.id === updatedUser.id) {
+        record.broadcaster = updatedUser;
+        changed = true;
+      }
+      for (const viewer of record.viewers.values()) {
+        if (viewer.user.id === updatedUser.id) {
+          viewer.user = updatedUser;
+          changed = true;
+        }
+      }
+      if (changed) {
+        this.onStreamUpdated?.(this.serializeStream(record));
+      }
+    }
+  }
+
   cleanupPeer(peerId: string): {
     closedVoiceProducerId: string | null;
     stoppedStream: { roomId: string; streamId: string; broadcasterId: string } | null;
   } {
     const peer = this.peers.get(peerId);
-    if (!peer) return { closedVoiceProducerId: null, stoppedStream: null };
+    if (!peer) {
+      return { closedVoiceProducerId: null, stoppedStream: null };
+    }
+    this.peers.delete(peerId);
 
-    // Remove peer from any streams they were watching so real viewer count decrements immediately
-    for (const record of this.streams.values()) {
-      this.removeViewerInternal(record, peerId, true);
+    let closedVoiceProducerId: string | null = null;
+    if (peer.voiceProducer) {
+      closedVoiceProducerId = peer.voiceProducer.id;
+      if (!peer.voiceProducer.closed) peer.voiceProducer.close();
+      peer.voiceProducer = null;
     }
 
     let stoppedStream: { roomId: string; streamId: string; broadcasterId: string } | null = null;
     if (peer.activeStreamId) {
-      const sId = peer.activeStreamId;
-      const closed = this.forceCloseStreamRecord(sId);
+      const activeId = peer.activeStreamId;
+      const closed = this.forceCloseStreamRecord(activeId);
       if (closed) {
-        stoppedStream = { roomId: closed.roomId, streamId: sId, broadcasterId: closed.broadcasterId };
+        stoppedStream = {
+          roomId: closed.roomId,
+          streamId: activeId,
+          broadcasterId: closed.broadcasterId,
+        };
       }
     }
 
-    const closedVoiceProducerId = peer.voiceProducer ? peer.voiceProducer.id : null;
-    if (peer.voiceProducer && !peer.voiceProducer.closed) {
-      peer.voiceProducer.close();
+    for (const record of this.streams.values()) {
+      this.removeViewerInternal(record, peerId, true);
     }
 
-    for (const consumer of peer.consumers.values()) {
-      if (!consumer.closed) consumer.close();
+    for (const prod of peer.pendingStreamProducers.values()) {
+      if (!prod.closed) prod.close();
     }
-    for (const { transport } of peer.transports.values()) {
-      if (!transport.closed) transport.close();
-    }
+    peer.pendingStreamProducers.clear();
 
-    this.peers.delete(peerId);
+    for (const cons of peer.consumers.values()) {
+      if (!cons.closed) cons.close();
+    }
+    peer.consumers.clear();
+
+    for (const entry of peer.transports.values()) {
+      if (!entry.transport.closed) entry.transport.close();
+    }
+    peer.transports.clear();
+
     return { closedVoiceProducerId, stoppedStream };
   }
 
@@ -783,7 +841,13 @@ export class SfuManager {
     // Deduplicate unique real authenticated users watching this live stream
     const uniqueUsers = new Map<
       string,
-      { id: string; username: string; displayName: string; avatarColor: string }
+      {
+        id: string;
+        username: string;
+        displayName: string;
+        avatarColor: string;
+        role: ActiveStreamInfo['broadcasterRole'];
+      }
     >();
     for (const v of record.viewers.values()) {
       if (!uniqueUsers.has(v.user.id)) {
@@ -792,6 +856,7 @@ export class SfuManager {
           username: v.user.username,
           displayName: v.user.displayName,
           avatarColor: v.user.avatarColor,
+          role: v.user.role ?? 'member',
         });
       }
     }
@@ -804,6 +869,7 @@ export class SfuManager {
       broadcasterUsername: record.broadcaster.username,
       broadcasterDisplayName: record.broadcaster.displayName,
       broadcasterAvatarColor: record.broadcaster.avatarColor,
+      broadcasterRole: record.broadcaster.role ?? 'member',
       title: record.title,
       resolution: record.resolution,
       fps: record.fps,

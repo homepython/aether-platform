@@ -10,9 +10,10 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import type { ChatAttachment, ChatMessage } from '@aether/shared';
+import { hasRoleAtLeast, type ChatAttachment, type ChatMessage } from '@aether/shared';
 import { api, resolveServerAssetUrl } from '../api/httpClient.js';
 import { useAppStore } from '../store/useAppStore.js';
+import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
 
 function formatTime(iso: string): string {
   const d = new Date(iso);
@@ -233,7 +234,10 @@ export const ChatPanel: React.FC = () => {
         ) : (
           messages.map((msg) => {
             const isAuthor = user?.id === msg.author.id;
-            const canDelete = isAuthor || user?.id === currentRoom.ownerId;
+            const canDelete =
+              isAuthor ||
+              user?.id === currentRoom.ownerId ||
+              hasRoleAtLeast(user?.role, 'moderator');
             const mentionsMe = Boolean(user && msg.mentions.includes(user.id));
 
             return (
@@ -253,8 +257,13 @@ export const ChatPanel: React.FC = () => {
                 </div>
 
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2">
-                    <span className="text-sm font-semibold">{msg.author.displayName}</span>
+                  <div className="flex items-center gap-2">
+                    <StyledUserName
+                      name={msg.author.displayName}
+                      role={msg.author.role}
+                      className="text-sm font-semibold"
+                    />
+                    <UserRoleBadge role={msg.author.role} compact />
                     <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
                       @{msg.author.username}
                     </span>
