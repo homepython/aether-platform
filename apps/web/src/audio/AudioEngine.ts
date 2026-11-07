@@ -19,8 +19,8 @@ interface RemoteVoiceChain {
 
 interface StreamAudioChain {
   streamId: string;
-  keepAliveAudio: HTMLAudioElement;
-  sourceNode: MediaStreamAudioSourceNode;
+  keepAliveAudio: HTMLAudioElement | null;
+  sourceNode: MediaStreamAudioSourceNode | MediaElementAudioSourceNode;
   gainNode: GainNode;
   volume: number; // 0..200
   muted: boolean;
@@ -33,7 +33,7 @@ export class AudioEngine {
   private voiceWorkletsLoaded = false;
   private streamWorkletsLoaded = false;
 
-  // Sender Mic Chain
+  // Sender Mic Chain (Discord-Grade Studio Pipeline)
   private rawMicStream: MediaStream | null = null;
   private micSource: MediaStreamAudioSourceNode | null = null;
   private highPassFilter: BiquadFilterNode | null = null;
@@ -43,6 +43,8 @@ export class AudioEngine {
   private senderDryGain: GainNode | null = null;
   private senderWetGain: GainNode | null = null;
   private gateWorkletNode: AudioWorkletNode | null = null;
+  private vocalShelfFilter: BiquadFilterNode | null = null;
+  private vocalCompressor: DynamicsCompressorNode | null = null;
   private processedMicDest: MediaStreamAudioDestinationNode | null = null;
   private loopbackTestGain: GainNode | null = null;
 
@@ -62,6 +64,7 @@ export class AudioEngine {
   private localDeafened = false;
   private pttPressed = false;
   private pttReleaseTimer: number | null = null;
+  private meterActive = false;
 
   public onMeterUpdate?: (db: number, speaking: boolean) => void;
 
@@ -75,7 +78,6 @@ export class AudioEngine {
       await ctx.audioWorklet.addModule(primaryUrl);
       return;
     } catch {
-      // Fallback: load script text from server or local bundle and register via Blob URL
       const fallbackUrl = resolveServerAssetUrl(`/dsp/${filename}`);
       const res = await fetch(fallbackUrl);
       if (!res.ok) {
@@ -165,6 +167,17 @@ export class AudioEngine {
     if (this.streamCtx?.state === 'suspended') await this.streamCtx.resume().catch(() => {});
   }
 
+  /**
+   * Enables 50 Hz dB meter updates ONLY when Audio Settings UI is open;
+   * during gameplay, only speaking edge transitions cross the AudioWorklet thread!
+   */
+  public setMeterActive(active: boolean): void {
+    this.meterActive = active;
+    if (this.gateWorkletNode) {
+      this.gateWorkletNode.port.postMessage({ meterActive: active });
+    }
+  }
+
   public async startMicrophone(settings: AudioSettings): Promise<MediaStreamTrack> {
     this.currentSettings = settings;
     const ctx = await this.ensureVoiceContext();
@@ -186,16 +199,16 @@ export class AudioEngine {
     this.rawMicStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
     this.micSource = ctx.createMediaStreamSource(this.rawMicStream);
 
-    // 80 Hz 2nd-order Butterworth High-Pass Filter (eliminates desk rumble, plosives & AC hum)
+    // 1. 85 Hz 2nd-order Butterworth High-Pass Filter (eliminates desk rumble, plosives & AC hum)
     this.highPassFilter = ctx.createBiquadFilter();
     this.highPassFilter.type = 'highpass';
-    this.highPassFilter.frequency.value = 80;
+    this.highPassFilter.frequency.value = 85;
     this.highPassFilter.Q.value = 0.707;
 
     this.inputGainNode = ctx.createGain();
     this.inputGainNode.gain.value = settings.inputVolume / 100;
 
-    // Phase-coherent Dry/Wet Neural Noise Suppression (10ms = 480 samples RNNoise frame alignment)
+    // 2. Phase-coherent Dry/Wet Neural Noise Suppression (10ms = 480 samples RNNoise frame alignment)
     this.senderDryDelay = ctx.createDelay(0.05);
     this.senderDryDelay.delayTime.value = wasm ? 0.01 : 0;
 
@@ -209,6 +222,7 @@ export class AudioEngine {
       });
     }
 
+    // 3. 5ms Lookahead Voice Gate + Mechanical Keyboard Transient Click Suppressor
     this.gateWorkletNode = new AudioWorkletNode(ctx, 'aether-voice-gate-processor', {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -221,13 +235,27 @@ export class AudioEngine {
       }
     };
 
+    // 4. Vocal Clarity Presence Shelf (+2.2 dB @ 3.2 kHz for crisp consonant intelligibility)
+    this.vocalShelfFilter = ctx.createBiquadFilter();
+    this.vocalShelfFilter.type = 'highshelf';
+    this.vocalShelfFilter.frequency.value = 3200;
+    this.vocalShelfFilter.gain.value = settings.vocalClarityEnhancer !== false ? 2.2 : 0;
+
+    // 5. Broadcast Soft-Knee Vocal Leveler (prevents loud shouts clipping while keeping quiet voice clear)
+    this.vocalCompressor = ctx.createDynamicsCompressor();
+    this.vocalCompressor.threshold.value = -20;
+    this.vocalCompressor.knee.value = 18;
+    this.vocalCompressor.ratio.value = 3.0;
+    this.vocalCompressor.attack.value = 0.004;
+    this.vocalCompressor.release.value = 0.18;
+
     this.processedMicDest = ctx.createMediaStreamDestination();
 
     // Optional mic test loopback (STRICTLY 0 gain unless user enables "Testar Microfone" in Settings)
     this.loopbackTestGain = ctx.createGain();
     this.loopbackTestGain.gain.value = 0;
 
-    // Connect Sender DSP Graph
+    // Connect Sender Studio DSP Graph
     this.micSource.connect(this.highPassFilter);
     this.highPassFilter.connect(this.inputGainNode);
 
@@ -241,8 +269,11 @@ export class AudioEngine {
       this.senderWetGain.connect(this.gateWorkletNode);
     }
 
-    this.gateWorkletNode.connect(this.processedMicDest);
-    this.gateWorkletNode.connect(this.loopbackTestGain);
+    this.gateWorkletNode.connect(this.vocalShelfFilter);
+    this.vocalShelfFilter.connect(this.vocalCompressor);
+    this.vocalCompressor.connect(this.processedMicDest);
+    this.vocalCompressor.connect(this.loopbackTestGain);
+
     if (this.masterVoiceOutGain) {
       this.loopbackTestGain.connect(this.masterVoiceOutGain);
     }
@@ -268,6 +299,8 @@ export class AudioEngine {
         this.senderRnnoise.destroy();
       }
       this.gateWorkletNode?.disconnect();
+      this.vocalShelfFilter?.disconnect();
+      this.vocalCompressor?.disconnect();
       this.loopbackTestGain?.disconnect();
     } catch {
       // Ignore disconnect errors on already torn-down nodes
@@ -279,6 +312,8 @@ export class AudioEngine {
     this.micSource = null;
     this.senderRnnoise = null;
     this.gateWorkletNode = null;
+    this.vocalShelfFilter = null;
+    this.vocalCompressor = null;
     this.processedMicDest = null;
   }
 
@@ -323,6 +358,8 @@ export class AudioEngine {
       noiseGateThresholdDb: this.currentSettings.noiseGateThresholdDb,
       voiceMode: this.currentSettings.voiceMode,
       vadSensitivityDb: this.currentSettings.vadSensitivityDb,
+      keyboardSuppressionEnabled: this.currentSettings.keyboardSuppressionEnabled !== false,
+      meterActive: this.meterActive,
       pttActive: this.pttPressed,
       muted: this.localMicMuted,
     });
@@ -341,6 +378,11 @@ export class AudioEngine {
 
     if (this.inputGainNode && this.voiceCtx) {
       this.inputGainNode.gain.setTargetAtTime(settings.inputVolume / 100, this.voiceCtx.currentTime, 0.01);
+    }
+
+    if (this.vocalShelfFilter && this.voiceCtx) {
+      const targetGainDb = settings.vocalClarityEnhancer !== false ? 2.2 : 0;
+      this.vocalShelfFilter.gain.setTargetAtTime(targetGainDb, this.voiceCtx.currentTime, 0.015);
     }
 
     // Sender Neural Suppression Dry/Wet Mix
@@ -428,7 +470,6 @@ export class AudioEngine {
     const wasm = await this.ensureWasmBinary();
 
     const stream = new MediaStream([track]);
-    // Hidden muted audio element required by Chromium to pump WebRTC RTP packets into WebAudio
     const keepAliveAudio = document.createElement('audio');
     keepAliveAudio.srcObject = stream;
     keepAliveAudio.muted = true;
@@ -569,6 +610,41 @@ export class AudioEngine {
     });
   }
 
+  /**
+   * Routes an MSE Cloud Relay <video> element's audio into the isolated Stream AudioContext
+   * (0..200% boost + SinkId output routing + ZERO ducking when anyone speaks).
+   */
+  public async attachStreamMediaElement(
+    streamId: string,
+    mediaEl: HTMLMediaElement,
+    initialVolume = 100
+  ): Promise<void> {
+    this.detachStreamAudio(streamId);
+    const ctx = await this.ensureStreamContext();
+    if (this.currentSettings?.outputDeviceId) {
+      await this.applySinkId(ctx, this.currentSettings.outputDeviceId);
+    }
+
+    mediaEl.muted = false;
+    mediaEl.volume = 1.0;
+
+    const sourceNode = ctx.createMediaElementSource(mediaEl);
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = initialVolume / 100;
+
+    sourceNode.connect(gainNode);
+    gainNode.connect(ctx.destination);
+
+    this.streamAudioChains.set(streamId, {
+      streamId,
+      keepAliveAudio: null,
+      sourceNode,
+      gainNode,
+      volume: initialVolume,
+      muted: false,
+    });
+  }
+
   public setStreamVolume(streamId: string, volumePercent: number, muted: boolean): void {
     const chain = this.streamAudioChains.get(streamId);
     if (!chain || !this.streamCtx) return;
@@ -587,8 +663,10 @@ export class AudioEngine {
     if (!chain) return;
     this.streamAudioChains.delete(streamId);
     try {
-      chain.keepAliveAudio.pause();
-      chain.keepAliveAudio.srcObject = null;
+      if (chain.keepAliveAudio) {
+        chain.keepAliveAudio.pause();
+        chain.keepAliveAudio.srcObject = null;
+      }
       chain.sourceNode.disconnect();
       chain.gainNode.disconnect();
     } catch {
@@ -598,7 +676,7 @@ export class AudioEngine {
 
   /**
    * Creates a 48kHz Stereo MediaStreamTrack fed by our Desktop .NET 8 WASAPI Process-Loopback Helper
-   * (EXCLUDE_TARGET_PROCESS_TREE / INCLUDE_TARGET_PROCESS_TREE -> mathematically 0% voice echo!).
+   * (EXCLUDE_TARGET_PROCESS_TREE / INCLUDE_TARGET_PROCESS_TREE / MultiProcessLoopbackMixer -> mathematically 0% voice echo!).
    */
   public async createNativeLoopbackTrack(): Promise<{
     track: MediaStreamTrack;

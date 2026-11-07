@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { WebSocket } from 'ws';
+import type { RawData, WebSocket } from 'ws';
 import {
   AdminForceMuteParticipantParamsSchema,
   AdminForceStopStreamParamsSchema,
@@ -9,6 +9,16 @@ import {
   ChatHistoryParamsSchema,
   ChatSendParamsSchema,
   ClientRpcMethodSchema,
+  DmDeleteParamsSchema,
+  DmEditParamsSchema,
+  DmHistoryParamsSchema,
+  DmMarkReadParamsSchema,
+  DmSendParamsSchema,
+  DmTypingParamsSchema,
+  FriendInviteToRoomParamsSchema,
+  FriendRemoveParamsSchema,
+  FriendRequestParamsSchema,
+  FriendRespondParamsSchema,
   hasRoleAtLeast,
   P2pSignalParamsSchema,
   P2pStreamStartParamsSchema,
@@ -21,6 +31,8 @@ import {
   SfuProduceStreamTrackParamsSchema,
   SfuProduceVoiceParamsSchema,
   SfuResumeConsumerParamsSchema,
+  StreamRelayInitParamsSchema,
+  StreamRelayStartParamsSchema,
   StreamStartParamsSchema,
   StreamStopOrUnwatchParamsSchema,
   StreamTelemetryParamsSchema,
@@ -28,13 +40,17 @@ import {
   StreamWatchParamsSchema,
   VoiceStateParamsSchema,
   type ActiveStreamInfo,
+  type AudioIsolationMode,
   type ClientRpcRequest,
+  type FriendEntry,
   type RoomJoinResult,
   type RoomParticipant,
   type RoomSummary,
   type ServerPushEvent,
   type ServerRpcResponse,
+  type StreamConnectionMode,
   type StreamFps,
+  type StreamPrivacyMode,
   type StreamResolution,
   type UserPublic,
 } from '@aether/shared';
@@ -60,7 +76,7 @@ interface ConnectedPeer {
   speaking: boolean;
   p2pVoiceReady: boolean;
   clientPlatform: 'web' | 'desktop';
-  isAlive: boolean;
+  missedPongs: number;
 }
 
 interface P2pStreamRecord {
@@ -72,8 +88,14 @@ interface P2pStreamRecord {
   resolution: StreamResolution;
   fps: StreamFps;
   targetBitrateKbps: number;
+  audioBitrateKbps: number;
+  privacy: StreamPrivacyMode;
+  allowedUserIds: Set<string>;
+  viewerLimit: number | null;
+  connectionMode: StreamConnectionMode;
+  relayActive: boolean;
   hasAudio: boolean;
-  audioIsolationMode: 'process-isolated' | 'tab-isolated' | 'system-direct' | 'none';
+  audioIsolationMode: AudioIsolationMode;
   startedAt: string;
   viewers: Map<string, UserPublic>; // viewerPeerId -> UserPublic
   verifiedWidth?: number;
@@ -82,9 +104,26 @@ interface P2pStreamRecord {
   verifiedBitrateKbps?: number;
 }
 
+interface RelaySessionState {
+  streamId: string;
+  roomId: string;
+  broadcasterPeerId: string;
+  broadcasterId: string;
+  active: boolean;
+  mimeType: string;
+  base64Init: string | null;
+  viewers: Set<string>; // viewerPeerIds receiving binary chunks
+}
+
+const RELAY_FRAME_VERSION = 1;
+const RELAY_STREAM_ID_BYTES = 36;
+const RELAY_HEADER_BYTES = 1 + RELAY_STREAM_ID_BYTES;
+
 export class RealtimeGateway {
   private peers = new Map<string, ConnectedPeer>();
   private p2pStreams = new Map<string, P2pStreamRecord>();
+  private relaySessions = new Map<string, RelaySessionState>();
+  private roomNameCache = new Map<string, string>();
   private heartbeatTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -102,12 +141,14 @@ export class RealtimeGateway {
     };
 
     this.sfu.onStreamStopped = (roomId: string, streamId: string, broadcasterId: string) => {
+      this.relaySessions.delete(streamId);
       this.broadcastToRoom(roomId, {
         type: 'event',
         event: 'room:streamStopped',
         payload: { roomId, streamId, broadcasterId },
       });
       void this.broadcastLobbyRoomsUpdate();
+      void this.notifyFriendsPresenceChanged(broadcasterId, 'stream:stopped');
     };
 
     this.cluster.onRemoteEvent((envelope) => {
@@ -120,21 +161,26 @@ export class RealtimeGateway {
       }
     });
 
+    // Tolerant 30s ping with 2-miss grace (60s total) so heavy DX12 map loads never drop presence
     this.heartbeatTimer = setInterval(() => {
       for (const [peerId, peer] of this.peers.entries()) {
-        if (!peer.isAlive) {
-          peer.socket.terminate();
+        if (peer.missedPongs >= 2) {
+          try {
+            peer.socket.terminate();
+          } catch {
+            // ignore
+          }
           this.handleDisconnect(peerId);
           continue;
         }
-        peer.isAlive = false;
+        peer.missedPongs += 1;
         try {
           peer.socket.ping();
         } catch {
           this.handleDisconnect(peerId);
         }
       }
-    }, 25000);
+    }, 30000);
   }
 
   async handleConnection(
@@ -172,6 +218,7 @@ export class RealtimeGateway {
     }
 
     const user = this.db.mapUserPublic(userRow);
+    const wasOnlineBefore = this.isUserOnline(user.id);
     const peerId = crypto.randomUUID();
     const peer: ConnectedPeer = {
       peerId,
@@ -184,17 +231,21 @@ export class RealtimeGateway {
       speaking: false,
       p2pVoiceReady: false,
       clientPlatform: 'web',
-      isAlive: true,
+      missedPongs: 0,
     };
 
     this.peers.set(peerId, peer);
 
     socket.on('pong', () => {
-      peer.isAlive = true;
+      peer.missedPongs = 0;
     });
 
-    socket.on('message', (rawData) => {
-      peer.isAlive = true;
+    socket.on('message', (rawData: RawData, isBinary: boolean) => {
+      peer.missedPongs = 0;
+      if (isBinary) {
+        this.handleBinaryRelayFrame(peer, rawData);
+        return;
+      }
       void this.handleRawMessage(peer, rawData.toString());
     });
 
@@ -218,13 +269,115 @@ export class RealtimeGateway {
       event: 'lobby:roomsUpdated',
       payload: { rooms },
     });
+
+    if (!wasOnlineBefore) {
+      void this.notifyFriendsPresenceChanged(user.id, 'user:online');
+    }
+  }
+
+  private handleBinaryRelayFrame(senderPeer: ConnectedPeer, rawData: RawData): void {
+    let buf: Buffer;
+    if (Buffer.isBuffer(rawData)) {
+      buf = rawData;
+    } else if (Array.isArray(rawData)) {
+      buf = Buffer.concat(rawData);
+    } else {
+      buf = Buffer.from(rawData as ArrayBuffer);
+    }
+
+    if (buf.length <= RELAY_HEADER_BYTES || buf[0] !== RELAY_FRAME_VERSION) {
+      return;
+    }
+
+    const streamId = buf.toString('ascii', 1, RELAY_HEADER_BYTES);
+    const session = this.relaySessions.get(streamId);
+    if (!session || session.broadcasterPeerId !== senderPeer.peerId) {
+      return;
+    }
+
+    for (const viewerPeerId of Array.from(session.viewers)) {
+      const viewerPeer = this.peers.get(viewerPeerId);
+      if (!viewerPeer || viewerPeer.roomId !== session.roomId || viewerPeer.socket.readyState !== 1) {
+        session.viewers.delete(viewerPeerId);
+        continue;
+      }
+      // Backpressure guard (6 MB max queued per viewer socket) so slow connections never bloat server RAM
+      if (viewerPeer.socket.bufferedAmount < 6 * 1024 * 1024) {
+        viewerPeer.socket.send(buf, { binary: true });
+      }
+    }
   }
 
   private handleDisconnect(peerId: string): void {
     const peer = this.peers.get(peerId);
     if (!peer) return;
+    const userId = peer.user.id;
     this.leaveCurrentRoom(peer);
     this.peers.delete(peerId);
+
+    if (!this.isUserOnline(userId)) {
+      void this.notifyFriendsPresenceChanged(userId, 'user:offline');
+    }
+  }
+
+  private isUserOnline(userId: string): boolean {
+    for (const p of this.peers.values()) {
+      if (p.user.id === userId) return true;
+    }
+    return false;
+  }
+
+  private resolveLiveFriendState(friendUser: UserPublic): {
+    isOnline: boolean;
+    currentRoomId: string | null;
+    currentRoomName: string | null;
+    isStreaming: boolean;
+  } {
+    let isOnline = false;
+    let currentRoomId: string | null = null;
+    let isStreaming = false;
+
+    for (const p of this.peers.values()) {
+      if (p.user.id === friendUser.id) {
+        isOnline = true;
+        if (p.roomId) {
+          currentRoomId = p.roomId;
+          if (this.isPeerStreaming(p.peerId)) {
+            isStreaming = true;
+          }
+        }
+      }
+    }
+
+    const currentRoomName = currentRoomId ? (this.roomNameCache.get(currentRoomId) ?? null) : null;
+    return { isOnline, currentRoomId, currentRoomName, isStreaming };
+  }
+
+  public async buildFriendsListForUser(userId: string): Promise<FriendEntry[]> {
+    if (this.roomNameCache.size === 0) {
+      const rooms = await this.db.listAllRooms();
+      for (const r of rooms) {
+        this.roomNameCache.set(r.id, r.name);
+      }
+    }
+    return this.db.listFriendsForUser(userId, (u) => this.resolveLiveFriendState(u));
+  }
+
+  public async notifyFriendsPresenceChanged(userId: string, reason: string): Promise<void> {
+    try {
+      const friendIds = await this.db.listAcceptedFriendUserIds(userId);
+      for (const friendId of friendIds) {
+        if (this.isUserOnline(friendId)) {
+          this.sendToUser(friendId, {
+            type: 'event',
+            event: 'friends:updated',
+            payload: { reason },
+          });
+        }
+      }
+    } catch {
+      // ignore transient notification errors
+    }
   }
 
   private serializeP2pStream(rec: P2pStreamRecord): ActiveStreamInfo {
@@ -232,11 +385,21 @@ export class RealtimeGateway {
     for (const u of rec.viewers.values()) {
       uniqueUsers.set(u.id, u);
     }
+    const relay = this.relaySessions.get(rec.streamId);
+    if (relay) {
+      for (const vPeerId of relay.viewers) {
+        const vp = this.peers.get(vPeerId);
+        if (vp && vp.user.id !== rec.broadcaster.id) {
+          uniqueUsers.set(vp.user.id, vp.user);
+        }
+      }
+    }
     const viewerUsers = Array.from(uniqueUsers.values()).map((u) => ({
       id: u.id,
       username: u.username,
       displayName: u.displayName,
       avatarColor: u.avatarColor,
+      avatarUrl: u.avatarUrl ?? null,
       role: u.role ?? 'member',
     }));
     return {
@@ -246,11 +409,17 @@ export class RealtimeGateway {
       broadcasterUsername: rec.broadcaster.username,
       broadcasterDisplayName: rec.broadcaster.displayName,
       broadcasterAvatarColor: rec.broadcaster.avatarColor,
+      broadcasterAvatarUrl: rec.broadcaster.avatarUrl ?? null,
       broadcasterRole: rec.broadcaster.role ?? 'member',
       title: rec.title,
       resolution: rec.resolution,
       fps: rec.fps,
       targetBitrateKbps: rec.targetBitrateKbps,
+      audioBitrateKbps: rec.audioBitrateKbps,
+      privacy: rec.privacy,
+      viewerLimit: rec.viewerLimit,
+      connectionMode: rec.connectionMode,
+      relayActive: rec.relayActive || Boolean(relay?.active),
       hasAudio: rec.hasAudio,
       audioIsolationMode: rec.audioIsolationMode,
       startedAt: rec.startedAt,
@@ -288,6 +457,92 @@ export class RealtimeGateway {
     return list;
   }
 
+  private async assertViewerStreamAccess(
+    meta: {
+      broadcasterId: string;
+      privacy: StreamPrivacyMode;
+      allowedUserIds: Set<string>;
+      viewerLimit: number | null;
+      uniqueViewerIds: Set<string>;
+    },
+    viewerUser: UserPublic
+  ): Promise<void> {
+    const isStaffAdmin = hasRoleAtLeast(viewerUser.role, 'admin');
+
+    if (meta.privacy === 'friends' && !isStaffAdmin) {
+      const friends = await this.db.areUsersFriends(meta.broadcasterId, viewerUser.id);
+      if (!friends) {
+        throw Object.assign(
+          new Error('Esta transmissão é restrita aos amigos do transmissor.'),
+          { code: 'STREAM_FRIENDS_ONLY' }
+        );
+      }
+    } else if (meta.privacy === 'private' && !isStaffAdmin) {
+      if (!meta.allowedUserIds.has(viewerUser.id)) {
+        throw Object.assign(
+          new Error('Esta transmissão é privada para convidados selecionados.'),
+          { code: 'STREAM_PRIVATE' }
+        );
+      }
+    }
+
+    if (
+      meta.viewerLimit !== null &&
+      !meta.uniqueViewerIds.has(viewerUser.id) &&
+      meta.uniqueViewerIds.size >= meta.viewerLimit
+    ) {
+      throw Object.assign(
+        new Error(`Limite de ${meta.viewerLimit} espectadores simultâneos atingido nesta transmissão.`),
+        { code: 'VIEWER_LIMIT_REACHED' }
+      );
+    }
+  }
+
+  private getCombinedStreamAccessMeta(streamId: string): {
+    roomId: string;
+    broadcasterId: string;
+    broadcasterPeerId: string;
+    privacy: StreamPrivacyMode;
+    allowedUserIds: Set<string>;
+    viewerLimit: number | null;
+    uniqueViewerIds: Set<string>;
+  } | null {
+    const p2p = this.p2pStreams.get(streamId);
+    if (p2p) {
+      const uniqueViewerIds = new Set<string>();
+      for (const u of p2p.viewers.values()) uniqueViewerIds.add(u.id);
+      const relay = this.relaySessions.get(streamId);
+      if (relay) {
+        for (const vpId of relay.viewers) {
+          const vp = this.peers.get(vpId);
+          if (vp) uniqueViewerIds.add(vp.user.id);
+        }
+      }
+      return {
+        roomId: p2p.roomId,
+        broadcasterId: p2p.broadcaster.id,
+        broadcasterPeerId: p2p.broadcasterPeerId,
+        privacy: p2p.privacy,
+        allowedUserIds: p2p.allowedUserIds,
+        viewerLimit: p2p.viewerLimit,
+        uniqueViewerIds,
+      };
+    }
+
+    const sfuMeta = this.sfu.getStreamAccessMeta(streamId);
+    if (sfuMeta) {
+      const relay = this.relaySessions.get(streamId);
+      if (relay) {
+        for (const vpId of relay.viewers) {
+          const vp = this.peers.get(vpId);
+          if (vp) sfuMeta.uniqueViewerIds.add(vp.user.id);
+        }
+      }
+      return sfuMeta;
+    }
+    return null;
+  }
+
   private leaveCurrentRoom(peer: ConnectedPeer): void {
     const previousRoomId = peer.roomId;
     if (!previousRoomId) return;
@@ -319,6 +574,7 @@ export class RealtimeGateway {
     }
 
     if (stoppedStream) {
+      this.relaySessions.delete(stoppedStream.streamId);
       this.broadcastToRoom(
         previousRoomId,
         {
@@ -334,10 +590,20 @@ export class RealtimeGateway {
       );
     }
 
+    // Cleanup any relay viewer or broadcaster session owned by this peer
+    for (const [sid, relay] of Array.from(this.relaySessions.entries())) {
+      if (relay.broadcasterPeerId === peer.peerId) {
+        this.relaySessions.delete(sid);
+      } else {
+        relay.viewers.delete(peer.peerId);
+      }
+    }
+
     // Cleanup any P2P broadcast or P2P viewer membership for this peer
     for (const [sid, rec] of Array.from(this.p2pStreams.entries())) {
       if (rec.broadcasterPeerId === peer.peerId) {
         this.p2pStreams.delete(sid);
+        this.relaySessions.delete(sid);
         this.broadcastToRoom(
           previousRoomId,
           {
@@ -383,6 +649,7 @@ export class RealtimeGateway {
     );
 
     void this.broadcastLobbyRoomsUpdate();
+    void this.notifyFriendsPresenceChanged(peer.user.id, 'room:left');
   }
 
   private serializeParticipant(peer: ConnectedPeer): RoomParticipant {
@@ -399,17 +666,21 @@ export class RealtimeGateway {
     };
   }
 
+  /**
+   * Lists participants in a room, enforcing 1 user = 1 active participant (zero clones).
+   */
   private listRoomParticipants(roomId: string): RoomParticipant[] {
-    const list: RoomParticipant[] = [];
+    const byUserId = new Map<string, RoomParticipant>();
     for (const peer of this.peers.values()) {
       if (peer.roomId === roomId) {
-        list.push(this.serializeParticipant(peer));
+        byUserId.set(peer.user.id, this.serializeParticipant(peer));
       }
     }
-    return list;
+    return Array.from(byUserId.values());
   }
 
   public mapRoomSummary(row: DbRoomRow): RoomSummary {
+    this.roomNameCache.set(row.id, row.name);
     const participants = this.listRoomParticipants(row.id);
     return {
       id: row.id,
@@ -424,6 +695,7 @@ export class RealtimeGateway {
         userId: p.user.id,
         displayName: p.user.displayName,
         avatarColor: p.user.avatarColor,
+        avatarUrl: p.user.avatarUrl ?? null,
         role: p.user.role ?? 'member',
         speaking: p.speaking,
         isStreaming: p.isStreaming,
@@ -533,11 +805,28 @@ export class RealtimeGateway {
           !isOwner &&
           !alreadyUnlocked
         ) {
-          // Private room without password or staff inspection grants room access
           await this.db.grantRoomAccess(roomRow.id, peer.user.id);
         }
 
-        // Fast switch if currently in another room
+        // ATOMIC PRESENCE GUARANTEE (ZERO CLONES / ZERO GHOSTS):
+        // Evict any stale or duplicate room connection belonging to this same user.id BEFORE joining!
+        for (const [otherPeerId, otherPeer] of Array.from(this.peers.entries())) {
+          if (
+            otherPeerId !== peer.peerId &&
+            otherPeer.user.id === peer.user.id &&
+            otherPeer.roomId !== null
+          ) {
+            this.leaveCurrentRoom(otherPeer);
+            this.peers.delete(otherPeerId);
+            try {
+              otherPeer.socket.close(4009, 'Sessão substituída por nova conexão na sala');
+            } catch {
+              // ignore stale socket error
+            }
+          }
+        }
+
+        // Fast switch if this socket was already in a room
         if (peer.roomId) {
           this.leaveCurrentRoom(peer);
         }
@@ -568,6 +857,7 @@ export class RealtimeGateway {
         );
 
         await this.broadcastLobbyRoomsUpdate();
+        void this.notifyFriendsPresenceChanged(peer.user.id, 'room:joined');
 
         const result: RoomJoinResult = {
           peerId: peer.peerId,
@@ -585,6 +875,36 @@ export class RealtimeGateway {
       case 'room:leave': {
         this.leaveCurrentRoom(peer);
         return { left: true };
+      }
+
+      case 'room:syncState': {
+        if (!peer.roomId) {
+          return {
+            peerId: peer.peerId,
+            inRoom: false,
+            room: null,
+            participants: [],
+            activeStreams: [],
+          };
+        }
+        const roomRow = await this.db.getRoomById(peer.roomId);
+        if (!roomRow) {
+          this.leaveCurrentRoom(peer);
+          return {
+            peerId: peer.peerId,
+            inRoom: false,
+            room: null,
+            participants: [],
+            activeStreams: [],
+          };
+        }
+        return {
+          peerId: peer.peerId,
+          inRoom: true,
+          room: this.mapRoomSummary(roomRow),
+          participants: this.listRoomParticipants(roomRow.id),
+          activeStreams: this.listCombinedRoomStreams(roomRow.id),
+        };
       }
 
       case 'voice:updateState': {
@@ -701,6 +1021,11 @@ export class RealtimeGateway {
           resolution: params.resolution,
           fps: params.fps,
           targetBitrateKbps: params.targetBitrateKbps,
+          audioBitrateKbps: params.audioBitrateKbps,
+          privacy: params.privacy,
+          allowedUserIds: params.allowedUserIds,
+          viewerLimit: params.viewerLimit,
+          connectionMode: params.connectionMode,
           audioIsolationMode: params.audioIsolationMode,
           videoProducerId: params.videoProducerId,
           audioProducerId: params.audioProducerId,
@@ -728,18 +1053,37 @@ export class RealtimeGateway {
           },
         });
         await this.broadcastLobbyRoomsUpdate();
+        void this.notifyFriendsPresenceChanged(peer.user.id, 'stream:started');
         return { stream };
       }
 
       case 'stream:updateMeta': {
         const params = StreamUpdateMetaParamsSchema.parse(rawParams);
-        const updated = this.sfu.updateStreamMeta(
-          peer.peerId,
-          params.streamId,
-          params.resolution,
-          params.fps,
-          params.targetBitrateKbps
-        );
+        const p2pRec = this.p2pStreams.get(params.streamId);
+        if (p2pRec && p2pRec.broadcasterPeerId === peer.peerId) {
+          if (params.resolution !== undefined) p2pRec.resolution = params.resolution;
+          if (params.fps !== undefined) p2pRec.fps = params.fps;
+          if (params.targetBitrateKbps !== undefined) p2pRec.targetBitrateKbps = params.targetBitrateKbps;
+          if (params.audioBitrateKbps !== undefined) p2pRec.audioBitrateKbps = params.audioBitrateKbps;
+          if (params.privacy !== undefined) p2pRec.privacy = params.privacy;
+          if (params.viewerLimit !== undefined) p2pRec.viewerLimit = params.viewerLimit;
+          const serialized = this.serializeP2pStream(p2pRec);
+          this.broadcastToRoom(p2pRec.roomId, {
+            type: 'event',
+            event: 'room:streamUpdated',
+            payload: { stream: serialized },
+          });
+          return { stream: serialized };
+        }
+
+        const updated = this.sfu.updateStreamMeta(peer.peerId, params.streamId, {
+          resolution: params.resolution,
+          fps: params.fps,
+          targetBitrateKbps: params.targetBitrateKbps,
+          audioBitrateKbps: params.audioBitrateKbps,
+          privacy: params.privacy,
+          viewerLimit: params.viewerLimit,
+        });
         if (updated) {
           this.broadcastToRoom(updated.roomId, {
             type: 'event',
@@ -756,8 +1100,8 @@ export class RealtimeGateway {
         if (p2pRec && p2pRec.broadcasterPeerId === peer.peerId) {
           p2pRec.verifiedWidth = params.verifiedWidth;
           p2pRec.verifiedHeight = params.verifiedHeight;
-          p2pRec.verifiedFps = params.verifiedFps;
-          p2pRec.verifiedBitrateKbps = params.verifiedBitrateKbps;
+          p2pRec.verifiedFps = Math.round(params.verifiedFps * 10) / 10;
+          p2pRec.verifiedBitrateKbps = Math.round(params.verifiedBitrateKbps);
           this.broadcastToRoom(p2pRec.roomId, {
             type: 'event',
             event: 'room:streamUpdated',
@@ -784,6 +1128,7 @@ export class RealtimeGateway {
 
       case 'stream:stop': {
         const params = StreamStopOrUnwatchParamsSchema.parse(rawParams);
+        this.relaySessions.delete(params.streamId);
         const stopped = this.sfu.stopStream(peer.peerId, params.streamId);
         if (stopped) {
           this.broadcastToRoom(stopped.roomId, {
@@ -810,18 +1155,24 @@ export class RealtimeGateway {
             },
           });
           await this.broadcastLobbyRoomsUpdate();
+          void this.notifyFriendsPresenceChanged(peer.user.id, 'stream:stopped');
         }
         return { stopped: Boolean(stopped) };
       }
 
       case 'stream:watch': {
         const params = StreamWatchParamsSchema.parse(rawParams);
+        const accessMeta = this.sfu.getStreamAccessMeta(params.streamId);
+        if (!accessMeta || accessMeta.roomId !== peer.roomId) {
+          throw new Error('Transmissão não está ativa nesta sala');
+        }
+        await this.assertViewerStreamAccess(accessMeta, peer.user);
+
         const watchData = await this.sfu.watchStream(
           peer.peerId,
           params.streamId,
           params.rtpCapabilities
         );
-        // Broadcast exact updated real viewer count to everyone in the room including broadcaster
         this.broadcastToRoom(watchData.stream.roomId, {
           type: 'event',
           event: 'room:streamUpdated',
@@ -903,10 +1254,10 @@ export class RealtimeGateway {
         if (!peer.roomId) throw new Error('Entre em uma sala para iniciar transmissão');
         const params = P2pStreamStartParamsSchema.parse(rawParams);
 
-        // Close any previous P2P stream owned by this peer
         for (const [sid, existing] of Array.from(this.p2pStreams.entries())) {
           if (existing.broadcasterPeerId === peer.peerId) {
             this.p2pStreams.delete(sid);
+            this.relaySessions.delete(sid);
           }
         }
 
@@ -920,6 +1271,12 @@ export class RealtimeGateway {
           resolution: params.resolution,
           fps: params.fps,
           targetBitrateKbps: params.targetBitrateKbps,
+          audioBitrateKbps: params.audioBitrateKbps,
+          privacy: params.privacy,
+          allowedUserIds: new Set(params.allowedUserIds),
+          viewerLimit: params.viewerLimit,
+          connectionMode: params.connectionMode,
+          relayActive: false,
           hasAudio: params.hasAudio,
           audioIsolationMode: params.hasAudio ? params.audioIsolationMode : 'none',
           startedAt: new Date().toISOString(),
@@ -948,11 +1305,13 @@ export class RealtimeGateway {
           },
         });
         await this.broadcastLobbyRoomsUpdate();
+        void this.notifyFriendsPresenceChanged(peer.user.id, 'stream:started');
         return { stream };
       }
 
       case 'p2p:streamStop': {
         const params = StreamStopOrUnwatchParamsSchema.parse(rawParams);
+        this.relaySessions.delete(params.streamId);
         const rec = this.p2pStreams.get(params.streamId);
         if (rec && rec.broadcasterPeerId === peer.peerId) {
           this.p2pStreams.delete(params.streamId);
@@ -980,6 +1339,7 @@ export class RealtimeGateway {
             },
           });
           await this.broadcastLobbyRoomsUpdate();
+          void this.notifyFriendsPresenceChanged(peer.user.id, 'stream:stopped');
           return { stopped: true };
         }
         return { stopped: false };
@@ -994,6 +1354,12 @@ export class RealtimeGateway {
         if (rec.broadcasterPeerId === peer.peerId || rec.broadcaster.id === peer.user.id) {
           throw new Error('Não é permitido assistir à própria transmissão');
         }
+
+        const accessMeta = this.getCombinedStreamAccessMeta(params.streamId);
+        if (accessMeta) {
+          await this.assertViewerStreamAccess(accessMeta, peer.user);
+        }
+
         rec.viewers.set(peer.peerId, peer.user);
         const stream = this.serializeP2pStream(rec);
 
@@ -1016,6 +1382,9 @@ export class RealtimeGateway {
 
       case 'p2p:streamUnwatch': {
         const params = StreamStopOrUnwatchParamsSchema.parse(rawParams);
+        const relay = this.relaySessions.get(params.streamId);
+        if (relay) relay.viewers.delete(peer.peerId);
+
         const rec = this.p2pStreams.get(params.streamId);
         if (rec && rec.viewers.delete(peer.peerId)) {
           const broadcasterPeer = this.peers.get(rec.broadcasterPeerId);
@@ -1037,6 +1406,181 @@ export class RealtimeGateway {
         return { stream: rec ? this.serializeP2pStream(rec) : null };
       }
 
+      // Built-in Cloud WSS Binary Media Relay (100% Anti-Black-Screen Symmetric CGNAT / Firewall Fallback)
+      case 'stream:relayStart': {
+        if (!peer.roomId) throw new Error('Entre em uma sala antes de ativar o relay');
+        const params = StreamRelayStartParamsSchema.parse(rawParams);
+        const accessMeta = this.getCombinedStreamAccessMeta(params.streamId);
+        if (!accessMeta || accessMeta.broadcasterPeerId !== peer.peerId) {
+          throw new Error('Transmissão não pertence a esta sessão');
+        }
+
+        let session = this.relaySessions.get(params.streamId);
+        if (!session) {
+          session = {
+            streamId: params.streamId,
+            roomId: accessMeta.roomId,
+            broadcasterPeerId: peer.peerId,
+            broadcasterId: peer.user.id,
+            active: true,
+            mimeType: params.mimeType,
+            base64Init: null,
+            viewers: new Set(),
+          };
+          this.relaySessions.set(params.streamId, session);
+        } else {
+          session.active = true;
+          session.mimeType = params.mimeType;
+          session.base64Init = null;
+        }
+
+        const p2pRec = this.p2pStreams.get(params.streamId);
+        if (p2pRec) {
+          p2pRec.relayActive = true;
+          this.broadcastToRoom(p2pRec.roomId, {
+            type: 'event',
+            event: 'room:streamUpdated',
+            payload: { stream: this.serializeP2pStream(p2pRec) },
+          });
+        } else {
+          const updatedSfu = this.sfu.setStreamRelayActive(params.streamId, true);
+          if (updatedSfu) {
+            this.broadcastToRoom(updatedSfu.roomId, {
+              type: 'event',
+              event: 'room:streamUpdated',
+              payload: { stream: updatedSfu },
+            });
+          }
+        }
+
+        for (const viewerPeerId of session.viewers) {
+          const vp = this.peers.get(viewerPeerId);
+          if (vp) {
+            this.sendToPeer(vp, {
+              type: 'event',
+              event: 'stream:relayReady',
+              payload: {
+                streamId: params.streamId,
+                mimeType: session.mimeType,
+                base64Init: session.base64Init,
+              },
+            });
+          }
+        }
+        return { started: true };
+      }
+
+      case 'stream:relayInitSegment': {
+        const params = StreamRelayInitParamsSchema.parse(rawParams);
+        const session = this.relaySessions.get(params.streamId);
+        if (!session || session.broadcasterPeerId !== peer.peerId) {
+          return { cached: false };
+        }
+        session.base64Init = params.base64Init;
+        for (const viewerPeerId of session.viewers) {
+          const vp = this.peers.get(viewerPeerId);
+          if (vp) {
+            this.sendToPeer(vp, {
+              type: 'event',
+              event: 'stream:relayReady',
+              payload: {
+                streamId: params.streamId,
+                mimeType: session.mimeType,
+                base64Init: session.base64Init,
+              },
+            });
+          }
+        }
+        return { cached: true };
+      }
+
+      case 'stream:relayStop': {
+        const params = StreamStopOrUnwatchParamsSchema.parse(rawParams);
+        const session = this.relaySessions.get(params.streamId);
+        if (session && session.broadcasterPeerId === peer.peerId) {
+          this.relaySessions.delete(params.streamId);
+          const p2pRec = this.p2pStreams.get(params.streamId);
+          if (p2pRec) p2pRec.relayActive = false;
+          this.sfu.setStreamRelayActive(params.streamId, false);
+        }
+        return { stopped: true };
+      }
+
+      case 'stream:relayWatch': {
+        if (!peer.roomId) throw new Error('Entre em uma sala para assistir');
+        const params = StreamStopOrUnwatchParamsSchema.parse(rawParams);
+        const accessMeta = this.getCombinedStreamAccessMeta(params.streamId);
+        if (!accessMeta || accessMeta.roomId !== peer.roomId) {
+          throw new Error('Transmissão não encontrada nesta sala');
+        }
+        if (accessMeta.broadcasterId === peer.user.id || accessMeta.broadcasterPeerId === peer.peerId) {
+          throw new Error('O transmissor não consome a própria transmissão');
+        }
+        await this.assertViewerStreamAccess(accessMeta, peer.user);
+
+        let session = this.relaySessions.get(params.streamId);
+        if (!session) {
+          session = {
+            streamId: params.streamId,
+            roomId: accessMeta.roomId,
+            broadcasterPeerId: accessMeta.broadcasterPeerId,
+            broadcasterId: accessMeta.broadcasterId,
+            active: false,
+            mimeType: 'video/webm;codecs=vp8,opus',
+            base64Init: null,
+            viewers: new Set(),
+          };
+          this.relaySessions.set(params.streamId, session);
+        }
+
+        session.viewers.add(peer.peerId);
+
+        const p2pRec = this.p2pStreams.get(params.streamId);
+        if (p2pRec) {
+          p2pRec.viewers.set(peer.peerId, peer.user);
+          this.broadcastToRoom(p2pRec.roomId, {
+            type: 'event',
+            event: 'room:streamUpdated',
+            payload: { stream: this.serializeP2pStream(p2pRec) },
+          });
+        }
+
+        // Notify broadcaster to start or refresh relay keyframe stream on demand
+        const broadcasterPeer = this.peers.get(accessMeta.broadcasterPeerId);
+        if (broadcasterPeer) {
+          this.sendToPeer(broadcasterPeer, {
+            type: 'event',
+            event: 'stream:relayViewerNeeded',
+            payload: { streamId: params.streamId },
+          });
+        }
+
+        return {
+          ok: true,
+          active: session.active,
+          mimeType: session.mimeType,
+          base64Init: session.base64Init,
+        };
+      }
+
+      case 'stream:relayUnwatch': {
+        const params = StreamStopOrUnwatchParamsSchema.parse(rawParams);
+        const session = this.relaySessions.get(params.streamId);
+        if (session) {
+          session.viewers.delete(peer.peerId);
+        }
+        const p2pRec = this.p2pStreams.get(params.streamId);
+        if (p2pRec) {
+          this.broadcastToRoom(p2pRec.roomId, {
+            type: 'event',
+            event: 'room:streamUpdated',
+            payload: { stream: this.serializeP2pStream(p2pRec) },
+          });
+        }
+        return { ok: true };
+      }
+
+      // Room Chat
       case 'chat:send': {
         const params = ChatSendParamsSchema.parse(rawParams);
         if (peer.roomId !== params.roomId) {
@@ -1150,6 +1694,234 @@ export class RealtimeGateway {
         return { messages };
       }
 
+      // Friends System RPCs
+      case 'friends:list': {
+        const friends = await this.buildFriendsListForUser(peer.user.id);
+        return { friends };
+      }
+
+      case 'friends:request': {
+        const params = FriendRequestParamsSchema.parse(rawParams);
+        const res = await this.db.sendFriendRequest(peer.user.id, params.username);
+        const myFriends = await this.buildFriendsListForUser(peer.user.id);
+        this.sendToUser(res.targetUser.id, {
+          type: 'event',
+          event: 'friends:updated',
+          payload: {
+            reason: res.autoAccepted ? 'friend:accepted' : 'friend:incoming_request',
+          },
+        });
+        return {
+          friendshipId: res.friendshipId,
+          targetUser: res.targetUser,
+          autoAccepted: res.autoAccepted,
+          friends: myFriends,
+        };
+      }
+
+      case 'friends:respond': {
+        const params = FriendRespondParamsSchema.parse(rawParams);
+        const res = await this.db.respondFriendRequest(params.friendshipId, peer.user.id, params.accept);
+        const otherId = res.requesterId === peer.user.id ? res.addresseeId : res.requesterId;
+        this.sendToUser(otherId, {
+          type: 'event',
+          event: 'friends:updated',
+          payload: {
+            reason: res.accepted ? 'friend:accepted' : 'friend:declined',
+          },
+        });
+        const myFriends = await this.buildFriendsListForUser(peer.user.id);
+        return { accepted: res.accepted, friends: myFriends };
+      }
+
+      case 'friends:remove': {
+        const params = FriendRemoveParamsSchema.parse(rawParams);
+        const res = await this.db.removeFriendship(params.friendshipId, peer.user.id);
+        this.sendToUser(res.otherUserId, {
+          type: 'event',
+          event: 'friends:updated',
+          payload: { reason: 'friend:removed' },
+        });
+        const myFriends = await this.buildFriendsListForUser(peer.user.id);
+        return { removed: true, friends: myFriends };
+      }
+
+      case 'friends:inviteToRoom': {
+        const params = FriendInviteToRoomParamsSchema.parse(rawParams);
+        const roomRow = await this.db.getRoomById(params.roomId);
+        if (!roomRow) {
+          throw new Error('Sala não encontrada');
+        }
+        const areFriends = await this.db.areUsersFriends(peer.user.id, params.targetUserId);
+        if (!areFriends && !hasRoleAtLeast(peer.user.role, 'moderator')) {
+          throw new Error('Você só pode enviar convites diretos para amigos');
+        }
+        // Grant access if room is private/password-protected and inviter is in room or owner
+        if (peer.roomId === roomRow.id || roomRow.owner_id === peer.user.id) {
+          await this.db.grantRoomAccess(roomRow.id, params.targetUserId);
+        }
+
+        const dm = await this.db.createDirectMessage({
+          senderId: peer.user.id,
+          recipientId: params.targetUserId,
+          content: `Convite para entrar na sala de voz **${roomRow.name}**`,
+          mentionUserIds: [params.targetUserId],
+          attachmentIds: [],
+          roomInvite: { roomId: roomRow.id, roomName: roomRow.name },
+        });
+
+        this.sendToUser(params.targetUserId, {
+          type: 'event',
+          event: 'friends:roomInvite',
+          payload: {
+            fromUser: peer.user,
+            roomId: roomRow.id,
+            roomName: roomRow.name,
+          },
+        });
+        this.sendToUser(params.targetUserId, {
+          type: 'event',
+          event: 'dm:messageCreated',
+          payload: { message: dm },
+        });
+        this.sendToUser(peer.user.id, {
+          type: 'event',
+          event: 'dm:messageCreated',
+          payload: { message: dm },
+        });
+        return { invited: true, message: dm };
+      }
+
+      // Direct Messages (DMs) RPCs
+      case 'dm:history': {
+        const params = DmHistoryParamsSchema.parse(rawParams);
+        const messages = await this.db.listDirectMessages(
+          peer.user.id,
+          params.peerUserId,
+          params.limit,
+          params.beforeCreatedAt
+        );
+        return { messages };
+      }
+
+      case 'dm:send': {
+        const params = DmSendParamsSchema.parse(rawParams);
+        if (params.recipientId === peer.user.id) {
+          throw new Error('Não é possível enviar mensagem direta para si mesmo');
+        }
+        const targetRow = await this.db.findUserRowById(params.recipientId);
+        if (!targetRow) {
+          throw new Error('Destinatário não encontrado');
+        }
+        const trimmed = params.content.trim();
+        if (!trimmed && params.attachmentIds.length === 0 && !params.roomInvite) {
+          throw new Error('Mensagem vazia');
+        }
+
+        const mentionedUsernames = extractMentionedUsernames(trimmed);
+        const mentionedUsers = await this.db.findUsersByUsernames(mentionedUsernames);
+
+        const dm = await this.db.createDirectMessage({
+          senderId: peer.user.id,
+          recipientId: params.recipientId,
+          content: trimmed,
+          mentionUserIds: mentionedUsers.map((u) => u.id),
+          attachmentIds: params.attachmentIds,
+          roomInvite: params.roomInvite ?? null,
+        });
+
+        this.sendToUser(params.recipientId, {
+          type: 'event',
+          event: 'dm:messageCreated',
+          payload: { message: dm },
+        });
+        this.sendToUser(peer.user.id, {
+          type: 'event',
+          event: 'dm:messageCreated',
+          payload: { message: dm },
+        });
+        return { message: dm };
+      }
+
+      case 'dm:edit': {
+        const params = DmEditParamsSchema.parse(rawParams);
+        const mentionedUsernames = extractMentionedUsernames(params.content);
+        const mentionedUsers = await this.db.findUsersByUsernames(mentionedUsernames);
+        const updated = await this.db.editDirectMessage(
+          params.messageId,
+          peer.user.id,
+          params.content.trim(),
+          mentionedUsers.map((u) => u.id)
+        );
+        if (!updated) {
+          throw new Error('Não foi possível editar esta mensagem direta');
+        }
+        this.sendToUser(updated.recipientId, {
+          type: 'event',
+          event: 'dm:messageUpdated',
+          payload: { message: updated },
+        });
+        this.sendToUser(updated.sender.id, {
+          type: 'event',
+          event: 'dm:messageUpdated',
+          payload: { message: updated },
+        });
+        return { message: updated };
+      }
+
+      case 'dm:delete': {
+        const params = DmDeleteParamsSchema.parse(rawParams);
+        const deleted = await this.db.softDeleteDirectMessage(params.messageId, peer.user.id);
+        if (!deleted) {
+          throw new Error('Não foi possível excluir esta mensagem direta');
+        }
+        this.sendToUser(deleted.recipientId, {
+          type: 'event',
+          event: 'dm:messageDeleted',
+          payload: {
+            messageId: params.messageId,
+            conversationKey: deleted.conversationKey,
+          },
+        });
+        this.sendToUser(deleted.senderId, {
+          type: 'event',
+          event: 'dm:messageDeleted',
+          payload: {
+            messageId: params.messageId,
+            conversationKey: deleted.conversationKey,
+          },
+        });
+        return { deleted: true };
+      }
+
+      case 'dm:typing': {
+        const params = DmTypingParamsSchema.parse(rawParams);
+        this.sendToUser(params.recipientId, {
+          type: 'event',
+          event: 'dm:typing',
+          payload: {
+            fromUserId: peer.user.id,
+            typing: params.typing,
+          },
+        });
+        return { ok: true };
+      }
+
+      case 'dm:markRead': {
+        const params = DmMarkReadParamsSchema.parse(rawParams);
+        const { readAt } = await this.db.markDirectMessagesRead(peer.user.id, params.peerUserId);
+        this.sendToUser(params.peerUserId, {
+          type: 'event',
+          event: 'dm:read',
+          payload: {
+            byUserId: peer.user.id,
+            readAt,
+          },
+        });
+        return { readAt };
+      }
+
+      // Moderation & Administration RPCs
       case 'admin:kickParticipant': {
         const params = AdminKickParticipantParamsSchema.parse(rawParams);
         const actor = await this.requireModeratorPeer(peer);
@@ -1291,6 +2063,7 @@ export class RealtimeGateway {
             );
           }
           this.p2pStreams.delete(params.streamId);
+          this.relaySessions.delete(params.streamId);
           this.broadcastToRoom(p2pRec.roomId, {
             type: 'event',
             event: 'room:streamStopped',
@@ -1329,7 +2102,6 @@ export class RealtimeGateway {
           return { stopped: true };
         }
 
-        // Check SFU streams across rooms
         let sfuBroadcaster: { id: string; username: string; role: UserPublic['role']; title: string } | null =
           null;
         for (const r of await this.db.listAllRooms()) {
@@ -1357,6 +2129,7 @@ export class RealtimeGateway {
           );
         }
 
+        this.relaySessions.delete(params.streamId);
         const stoppedSfu = this.sfu.forceStopStream(params.streamId);
         if (!stoppedSfu) {
           throw new Error('Transmissão não encontrada ou já encerrada');
@@ -1491,14 +2264,12 @@ export class RealtimeGateway {
     return map;
   }
 
-  public async syncUserRoleEverywhere(updatedUser: UserPublic): Promise<void> {
+  private updateInMemoryUserRecords(updatedUser: UserPublic): boolean {
     let touchedRoom = false;
     for (const peer of this.peers.values()) {
       if (peer.user.id === updatedUser.id) {
         peer.user = updatedUser;
-        if (peer.roomId) {
-          touchedRoom = true;
-        }
+        if (peer.roomId) touchedRoom = true;
       }
     }
 
@@ -1525,6 +2296,12 @@ export class RealtimeGateway {
       }
     }
 
+    return touchedRoom;
+  }
+
+  public async syncUserRoleEverywhere(updatedUser: UserPublic): Promise<void> {
+    const touchedRoom = this.updateInMemoryUserRecords(updatedUser);
+
     this.broadcastAll({
       type: 'event',
       event: 'user:roleUpdated',
@@ -1536,9 +2313,31 @@ export class RealtimeGateway {
       },
     });
 
+    this.broadcastAll({
+      type: 'event',
+      event: 'user:profileUpdated',
+      payload: { user: updatedUser },
+    });
+
     if (touchedRoom) {
       await this.broadcastLobbyRoomsUpdate();
     }
+    void this.notifyFriendsPresenceChanged(updatedUser.id, 'user:role_updated');
+  }
+
+  public async syncUserProfileEverywhere(updatedUser: UserPublic): Promise<void> {
+    const touchedRoom = this.updateInMemoryUserRecords(updatedUser);
+
+    this.broadcastAll({
+      type: 'event',
+      event: 'user:profileUpdated',
+      payload: { user: updatedUser },
+    });
+
+    if (touchedRoom) {
+      await this.broadcastLobbyRoomsUpdate();
+    }
+    void this.notifyFriendsPresenceChanged(updatedUser.id, 'user:profile_updated');
   }
 
   public disconnectBannedUser(userId: string, reason: string): void {
@@ -1565,6 +2364,7 @@ export class RealtimeGateway {
     roomName: string,
     byDisplayName: string
   ): void {
+    this.roomNameCache.delete(roomId);
     for (const peer of Array.from(this.peers.values())) {
       if (peer.roomId === roomId) {
         this.sendToPeer(peer, {
@@ -1592,6 +2392,6 @@ export class RealtimeGateway {
       peer.socket.close(1001, 'Servidor reiniciando');
     }
     this.peers.clear();
+    this.relaySessions.clear();
   }
 }
-

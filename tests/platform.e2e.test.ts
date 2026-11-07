@@ -27,6 +27,7 @@ import { config } from '../apps/server/src/config.js';
 class TestRealtimeClient {
   private ws!: WebSocket;
   public events: ServerPushEvent[] = [];
+  public binaryFrames: Buffer[] = [];
   private pending = new Map<
     string,
     { resolve: (data: unknown) => void; reject: (err: Error) => void }
@@ -34,7 +35,16 @@ class TestRealtimeClient {
 
   async connect(url: string): Promise<void> {
     this.ws = new WebSocket(url);
-    this.ws.on('message', (raw) => {
+    this.ws.on('message', (raw, isBinary) => {
+      if (isBinary) {
+        const buf = Buffer.isBuffer(raw)
+          ? raw
+          : Array.isArray(raw)
+            ? Buffer.concat(raw)
+            : Buffer.from(raw as ArrayBuffer);
+        this.binaryFrames.push(buf);
+        return;
+      }
       const msg = JSON.parse(raw.toString()) as ServerRpcResponse | ServerPushEvent;
       if (msg.type === 'rpc:res') {
         const entry = this.pending.get(msg.reqId);
@@ -52,6 +62,23 @@ class TestRealtimeClient {
       this.ws.once('error', (err) => reject(err));
       this.ws.once('close', (code) => reject(new Error(`WS closed early with code ${code}`)));
     });
+  }
+
+  sendBinary(buf: Buffer): void {
+    this.ws.send(buf, { binary: true });
+  }
+
+  async waitForBinaryFrame(
+    predicate?: (buf: Buffer) => boolean,
+    timeoutMs = 4000
+  ): Promise<Buffer> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const match = this.binaryFrames.find((b) => !predicate || predicate(b));
+      if (match) return match;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error('Timeout waiting for binary WS relay frame');
   }
 
   rpc<T = unknown>(method: string, params: unknown = {}): Promise<T> {
@@ -149,20 +176,25 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     }
   });
 
-  it('enforces strict stream resolutions (720p, 1080p, 1440p ONLY) and FPS (30, 60, 75 ONLY)', () => {
-    expect(STREAM_RESOLUTIONS).toEqual(['720p', '1080p', '1440p']);
-    expect(STREAM_FPS_OPTIONS).toEqual([30, 60, 75]);
+  it('enforces Studio & Quick stream resolutions (360p..original), FPS (5..144), and manual/auto bitrates', () => {
+    expect(STREAM_RESOLUTIONS).toEqual(['360p', '480p', '720p', '1080p', '1440p', 'original']);
+    expect(STREAM_FPS_OPTIONS).toEqual([5, 30, 60, 75, 100, 120, 144]);
 
     expect(StreamResolutionSchema.safeParse('1440p').success).toBe(true);
-    expect(StreamResolutionSchema.safeParse('480p').success).toBe(false);
+    expect(StreamResolutionSchema.safeParse('480p').success).toBe(true);
+    expect(StreamResolutionSchema.safeParse('original').success).toBe(true);
     expect(StreamResolutionSchema.safeParse('2160p').success).toBe(false);
 
     expect(StreamFpsSchema.safeParse(75).success).toBe(true);
+    expect(StreamFpsSchema.safeParse(144).success).toBe(true);
+    expect(StreamFpsSchema.safeParse(5).success).toBe(true);
     expect(StreamFpsSchema.safeParse(24).success).toBe(false);
-    expect(StreamFpsSchema.safeParse(120).success).toBe(false);
 
-    // Verify 1440p @ 75fps gets high-clarity 26 Mbps target bitrate
+    // Verify 1440p @ 75fps gets high-clarity 26 Mbps target bitrate & Studio manual bitrates work cleanly
     expect(resolveTargetBitrateKbps('1440p', 75, null)).toBe(26000);
+    expect(resolveTargetBitrateKbps('1080p', 60, 18500)).toBe(18500);
+    expect(resolveTargetBitrateKbps('720p', 60, 999999)).toBe(60000);
+    expect(resolveTargetBitrateKbps('360p', 30, 50)).toBe(300);
   });
 
   it('registers real users, enforces strong passwords, encrypts sensitive fields at rest (AES-256-GCM + scrypt2 + SHA-256 RT), detects token replay, issues single-use WS tickets, and persists complete settings', async () => {
@@ -440,7 +472,7 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     expect(h264High52).toBeDefined();
 
     const opusCodec = rtpCaps.codecs.find((c) => c.mimeType === 'audio/opus');
-    expect(opusCodec?.parameters?.maxaveragebitrate).toBe(320000);
+    expect(opusCodec?.parameters?.maxaveragebitrate).toBe(510000);
 
     // Create Dual-Plane SFU Transports (Voice Plane isolated from Stream Plane)
     const lucasVoiceSend = await wsLucas.rpc<{ id: string }>('sfu:createTransport', {
@@ -911,11 +943,17 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     wsPedro.close();
   }, 20000);
 
-  it('serves the Official Web Portal HTML, RNNoise SIMD WASM DSP assets, /api/health, and the real Windows NSIS installer', async () => {
+  it('serves the Official Web Portal HTML, RNNoise SIMD WASM + Aether Worklet DSP assets, /api/health v1.1.0, and the real Windows NSIS installer', async () => {
     const healthRes = await fetch(`${baseUrl}/api/health`);
     expect(healthRes.status).toBe(200);
-    const health = (await healthRes.json()) as { status: string };
+    const health = (await healthRes.json()) as {
+      status: string;
+      version: string;
+      maxUploadBytes: number;
+    };
     expect(health.status).toBe('ok');
+    expect(health.version).toBe('1.1.0');
+    expect(health.maxUploadBytes).toBe(550 * 1024 * 1024);
 
     const portalRes = await fetch(`${baseUrl}/`);
     expect(portalRes.status).toBe(200);
@@ -926,16 +964,20 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     const wasmRes = await fetch(`${baseUrl}/dsp/rnnoise_simd.wasm`);
     expect(wasmRes.status).toBe(200);
 
+    const workletRes = await fetch(`${baseUrl}/dsp/aetherWorklet.js`);
+    expect(workletRes.status).toBe(200);
+
     const infoRes = await fetch(`${baseUrl}/api/releases/info`);
     expect(infoRes.status).toBe(200);
     const info = (await infoRes.json()) as {
       available: boolean;
+      version: string;
       filename: string;
       sizeBytes: number;
       downloadUrl: string;
     };
     expect(info.available).toBe(true);
-    expect(info.filename).toBe('Aether-Setup-1.0.0.exe');
+    expect(info.filename).toBe('Aether-Setup-1.1.0.exe');
     expect(info.sizeBytes).toBeGreaterThan(50 * 1024 * 1024);
 
     // Stream first bytes of the real NSIS installer and verify Windows PE 'MZ' header
@@ -950,7 +992,7 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     await reader!.cancel();
   });
 
-  it('starts the compiled .NET 8 Native Helper (WASAPI Anti-Ducking + Process Loopback + Global Hooks), connects TCP PCM bridge, and enforces Dual-Bus Zero Ducking invariants', async () => {
+  it('starts the compiled .NET 8 Native Helper (WASAPI Anti-Ducking + Multi-App Loopback + Audio Session Discovery + Global Hooks), connects TCP PCM bridge, and enforces Dual-Bus Zero Ducking invariants', async () => {
     const helperBin = path.resolve(
       process.cwd(),
       'apps/desktop/resources/bin/aether-native-helper.exe'
@@ -997,6 +1039,12 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     });
     tcpSocket.destroy();
 
+    // Verify real WASAPI Per-Application Audio Session Enumeration (listAudioSessions)
+    child.stdin.write(JSON.stringify({ cmd: 'listAudioSessions', reqId: 'test-sessions-1' }) + '\n');
+    const sessRes = await waitForJson((m) => m.type === 'res' && m.reqId === 'test-sessions-1');
+    expect(sessRes.ok).toBe(true);
+    expect(Array.isArray(sessRes.sessions)).toBe(true);
+
     // Verify JSON-RPC configureShortcuts (including Mouse4 PTT) & stopLoopback
     child.stdin.write(
       JSON.stringify({
@@ -1032,19 +1080,24 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     expect(audioEngineSrc).toContain('private streamCtx: AudioContext | null = null;');
     expect(audioEngineSrc).toContain('RnnoiseWorkletNode');
     expect(audioEngineSrc).toContain('aether-pcm-bridge-processor');
+    expect(audioEngineSrc).toContain('aether-voice-gate-processor');
 
     const rtcSessionSrc = fs.readFileSync(
       path.resolve(process.cwd(), 'apps/web/src/rtc/RealtimeSession.ts'),
       'utf8'
     );
     // Desktop-only capture: Chromium never touches stream audio (audio: false on WGC capture),
-    // stream audio comes exclusively from the .NET WASAPI process-isolated PCM bridge (zero DSP, zero ducking).
+    // stream audio comes exclusively from the .NET WASAPI process-isolated / multi-process PCM bridge.
     expect(rtcSessionSrc).toContain('audio: false');
     expect(rtcSessionSrc).toContain('createNativeLoopbackTrack');
     expect(rtcSessionSrc).toContain("audioIsolationMode = 'process-isolated'");
+    expect(rtcSessionSrc).toContain("'multi-process'");
     expect(rtcSessionSrc).toContain('isDesktopClient()');
+    expect(rtcSessionSrc).toContain('maintain-framerate');
     expect(rtcSessionSrc).toContain('maintain-resolution');
+    expect(rtcSessionSrc).toContain('profile-level-id=42e0');
     expect(rtcSessionSrc).toContain('sfu:produceStreamTrack');
+    expect(rtcSessionSrc).toContain('stream:relayWatch');
 
     const desktopMainSrc = fs.readFileSync(
       path.resolve(process.cwd(), 'apps/desktop/src/main.ts'),
@@ -1055,5 +1108,365 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     expect(desktopMainSrc).toContain('aether://app/index.html');
     expect(desktopMainSrc).toContain('setDisplayMediaRequestHandler');
     expect(desktopMainSrc).toContain('safeStorage.encryptString');
+    expect(desktopMainSrc).toContain('autoUpdater');
   }, 15000);
+
+  it('verifies v1.1.0 Zero Clones, Cloud WSS Binary Media Relay, Studio Privacy/ViewerLimit/LiveBitrate, Animated GIF Avatars, 3x/24h @username Rate Limit, Friends, Private Room Invites, DMs, and Moderator Panel Access', async () => {
+    const authJson = (token: string) => ({
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    });
+
+    // Register two dedicated v1.1.0 users: Clara & Diego
+    const regClara = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'clara',
+        displayName: 'Clara Martins',
+        email: 'clara@aether.test',
+        password: 'StrongPassword123!',
+      }),
+    });
+    expect(regClara.status).toBe(201);
+    const claraBody = (await regClara.json()) as {
+      user: { id: string; username: string };
+      accessToken: string;
+    };
+    const claraId = claraBody.user.id;
+    const claraToken = claraBody.accessToken;
+
+    const regDiego = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'diego',
+        displayName: 'Diego Ferreira',
+        email: 'diego@aether.test',
+        password: 'StrongPassword123!',
+      }),
+    });
+    expect(regDiego.status).toBe(201);
+    const diegoBody = (await regDiego.json()) as {
+      user: { id: string; username: string };
+      accessToken: string;
+    };
+    const diegoId = diegoBody.user.id;
+    const diegoToken = diegoBody.accessToken;
+
+    // 1. Editable Profile + Multi-Frame Animated GIF89a Upload (100% Byte-Preserved) + 3x/24h @username Rate Limit
+    const animatedGifBytes = Buffer.from([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+      0x02, 0x00, 0x02, 0x00, // width=2, height=2
+      0x80, 0x00, 0x00, // GCT flag
+      0x00, 0x00, 0x00, 0xff, 0xff, 0xff, // 2-color palette
+      0x21, 0xff, 0x0b, 0x4e, 0x45, 0x54, 0x53, 0x43, 0x41, 0x50, 0x45, 0x32, 0x2e, 0x30, 0x03, 0x01, 0x00, 0x00, 0x00, // NETSCAPE2.0 loop
+      0x21, 0xf9, 0x04, 0x00, 0x08, 0x00, 0x00, 0x00, // Frame 1 GCE
+      0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x02, 0x02, 0x4c, 0x01, 0x00,
+      0x21, 0xf9, 0x04, 0x00, 0x08, 0x00, 0x00, 0x00, // Frame 2 GCE
+      0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
+      0x3b, // Trailer
+    ]);
+
+    const avatarForm = new FormData();
+    avatarForm.append(
+      'file',
+      new Blob([new Uint8Array(animatedGifBytes)], { type: 'image/gif' }),
+      'animated-profile.gif'
+    );
+    const avatarRes = await fetch(`${baseUrl}/api/users/me/avatar`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claraToken}` },
+      body: avatarForm,
+    });
+    expect(avatarRes.status).toBe(200);
+    const avatarBody = (await avatarRes.json()) as { avatarUrl: string };
+    expect(avatarBody.avatarUrl).toContain('.gif');
+
+    // Fetch uploaded GIF back and verify every single byte (both animation frames) was preserved intact
+    const servedGifRes = await fetch(`${baseUrl}${avatarBody.avatarUrl}`);
+    expect(servedGifRes.status).toBe(200);
+    expect(servedGifRes.headers.get('content-type')).toContain('image/gif');
+    const servedGifBuf = Buffer.from(await servedGifRes.arrayBuffer());
+    expect(servedGifBuf.equals(animatedGifBytes)).toBe(true);
+
+    // Updating bio & presenceStatus does NOT consume @username quota
+    const bioRes = await fetch(`${baseUrl}/api/users/me/profile`, {
+      method: 'PATCH',
+      headers: authJson(claraToken),
+      body: JSON.stringify({
+        displayName: 'Clara Studio 144Hz',
+        bio: 'Streaming Fortnite RTX 2060',
+        presenceStatus: 'busy',
+      }),
+    });
+    expect(bioRes.status).toBe(200);
+    const bioJson = (await bioRes.json()) as {
+      user: { bio: string; presenceStatus: string; nicknameChangesLast24h: number };
+    };
+    expect(bioJson.user.bio).toBe('Streaming Fortnite RTX 2060');
+    expect(bioJson.user.presenceStatus).toBe('busy');
+    expect(bioJson.user.nicknameChangesLast24h).toBe(0);
+
+    // Change @username 3 times within 24h -> allowed (nicknameChangesLast24h goes 1 -> 2 -> 3)
+    for (const [idx, nextUsername] of ['clara_v1', 'clara_v2', 'clara_live'].entries()) {
+      const uRes = await fetch(`${baseUrl}/api/users/me/profile`, {
+        method: 'PATCH',
+        headers: authJson(claraToken),
+        body: JSON.stringify({ username: nextUsername }),
+      });
+      expect(uRes.status).toBe(200);
+      const uJson = (await uRes.json()) as {
+        user: { username: string; nicknameChangesLast24h: number; nicknameLockedUntil: string | null };
+      };
+      expect(uJson.user.username).toBe(nextUsername);
+      expect(uJson.user.nicknameChangesLast24h).toBe(idx + 1);
+      if (idx === 2) {
+        expect(uJson.user.nicknameLockedUntil).toBeTruthy();
+      }
+    }
+
+    // 4th @username change within 24h MUST be blocked with HTTP 429 + NICKNAME_RATE_LIMIT + lockedUntil
+    const fourthUsernameRes = await fetch(`${baseUrl}/api/users/me/profile`, {
+      method: 'PATCH',
+      headers: authJson(claraToken),
+      body: JSON.stringify({ username: 'clara_blocked' }),
+    });
+    expect(fourthUsernameRes.status).toBe(429);
+    const fourthBody = (await fourthUsernameRes.json()) as { code: string; lockedUntil: string };
+    expect(fourthBody.code).toBe('NICKNAME_RATE_LIMIT');
+    expect(fourthBody.lockedUntil).toBeTruthy();
+
+    // 2. Zero Clones Invariant + room:syncState + Studio Stream Privacy, Viewer Limit & Cloud WSS Binary Relay
+    const studioRoomRes = await fetch(`${baseUrl}/api/rooms`, {
+      method: 'POST',
+      headers: authJson(claraToken),
+      body: JSON.stringify({
+        name: 'Estudio Anti-Black-Screen',
+        description: 'Sala privada com convite e relay',
+        isPrivate: true,
+        password: 'studio-secret',
+      }),
+    });
+    expect(studioRoomRes.status).toBe(201);
+    const { room: studioRoom } = (await studioRoomRes.json()) as { room: { id: string } };
+
+    const wsClaraOld = new TestRealtimeClient();
+    const wsClaraNew = new TestRealtimeClient();
+    const wsDiego = new TestRealtimeClient();
+    const wsPedro = new TestRealtimeClient();
+
+    await Promise.all([
+      wsClaraOld.connect(`${wsBaseUrl}/ws?token=${claraToken}`),
+      wsClaraNew.connect(`${wsBaseUrl}/ws?token=${claraToken}`),
+      wsDiego.connect(`${wsBaseUrl}/ws?token=${diegoToken}`),
+      wsPedro.connect(`${wsBaseUrl}/ws?token=${pedroToken}`),
+    ]);
+
+    // First connection joins room
+    const firstJoin = await wsClaraOld.rpc<RoomJoinResult>('room:join', {
+      roomId: studioRoom.id,
+      clientPlatform: 'desktop',
+    });
+    expect(firstJoin.participants.filter((p) => p.user.id === claraId).length).toBe(1);
+
+    // Second connection for the SAME user joins room -> evicts stale peer cleanly (ZERO CLONES!)
+    const secondJoin = await wsClaraNew.rpc<RoomJoinResult>('room:join', {
+      roomId: studioRoom.id,
+      clientPlatform: 'desktop',
+    });
+    expect(secondJoin.participants.filter((p) => p.user.id === claraId).length).toBe(1);
+    expect(secondJoin.participants.length).toBe(1);
+
+    const syncedState = await wsClaraNew.rpc<{
+      inRoom: boolean;
+      participants: { user: { id: string } }[];
+    }>('room:syncState', {});
+    expect(syncedState.inRoom).toBe(true);
+    expect(syncedState.participants.length).toBe(1);
+
+    // 3. Friends Request + Accept + Direct Room Invite Granting Passwordless Private Room Access + DMs
+    const friendReq = await wsClaraNew.rpc<{ friendshipId: string }>('friends:request', {
+      username: 'diego',
+    });
+    expect(friendReq.friendshipId).toBeTruthy();
+    await wsDiego.waitForEvent('friends:updated');
+
+    const acceptRes = await wsDiego.rpc<{
+      accepted: boolean;
+      friends: { user: { id: string }; isOnline: boolean; currentRoomId: string | null }[];
+    }>('friends:respond', {
+      friendshipId: friendReq.friendshipId,
+      accept: true,
+    });
+    expect(acceptRes.accepted).toBe(true);
+    const claraFriendEntry = acceptRes.friends.find((f) => f.user.id === claraId);
+    expect(claraFriendEntry?.isOnline).toBe(true);
+    expect(claraFriendEntry?.currentRoomId).toBe(studioRoom.id);
+
+    // Clara invites Diego to the password-protected private room -> grants room access automatically!
+    const inviteRes = await wsClaraNew.rpc<{ invited: boolean }>('friends:inviteToRoom', {
+      targetUserId: diegoId,
+      roomId: studioRoom.id,
+    });
+    expect(inviteRes.invited).toBe(true);
+    await wsDiego.waitForEvent('friends:roomInvite', (e) => e.payload.roomId === studioRoom.id);
+
+    // Diego joins private room WITHOUT typing password thanks to room invite grant
+    const diegoJoin = await wsDiego.rpc<RoomJoinResult>('room:join', {
+      roomId: studioRoom.id,
+      clientPlatform: 'desktop',
+    });
+    expect(diegoJoin.participants.length).toBe(2);
+
+    // Pedro (regular member, not invited) joins with room password to test STREAM_PRIVATE & STREAM_FULL
+    await wsPedro.rpc<RoomJoinResult>('room:join', {
+      roomId: studioRoom.id,
+      password: 'studio-secret',
+      clientPlatform: 'desktop',
+    });
+
+    // 4. Studio Custom Stream (Original @ 120 FPS, Multi-Process Audio, Private -> Public, ViewerLimit=1, Binary WSS Relay)
+    const p2pStart = await wsClaraNew.rpc<{ stream: ActiveStreamInfo }>('p2p:streamStart', {
+      title: 'Fortnite DX12 120FPS + Spotify',
+      resolution: 'original',
+      fps: 120,
+      targetBitrateKbps: 18000,
+      audioBitrateKbps: 192,
+      privacy: 'private',
+      allowedUserIds: [],
+      viewerLimit: 1,
+      connectionMode: 'compatibility',
+      hasAudio: true,
+      audioIsolationMode: 'multi-process',
+    });
+    const studioStreamId = p2pStart.stream.streamId;
+    expect(p2pStart.stream.resolution).toBe('original');
+    expect(p2pStart.stream.fps).toBe(120);
+    expect(p2pStart.stream.audioIsolationMode).toBe('multi-process');
+
+    // Non-invited regular member blocked on private stream
+    await expect(
+      wsPedro.rpc('p2p:streamWatch', { streamId: studioStreamId })
+    ).rejects.toMatchObject({ code: 'STREAM_PRIVATE' });
+
+    // Live Studio settings update: open stream to public + bump bitrate to 22000 Kbps (keep viewerLimit=1)
+    const metaUpd = await wsClaraNew.rpc<{ stream: ActiveStreamInfo }>('stream:updateMeta', {
+      streamId: studioStreamId,
+      privacy: 'public',
+      targetBitrateKbps: 22000,
+      viewerLimit: 1,
+    });
+    expect(metaUpd.stream.privacy).toBe('public');
+    expect(metaUpd.stream.targetBitrateKbps).toBe(22000);
+
+    // Cloud WSS Binary Media Relay: Clara starts relay + caches WebM EBML init segment
+    await wsClaraNew.rpc('stream:relayStart', {
+      streamId: studioStreamId,
+      mimeType: 'video/webm;codecs=vp8,opus',
+    });
+    const fakeEbmlInit = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81, 0x01]);
+    const initCacheRes = await wsClaraNew.rpc<{ cached: boolean }>('stream:relayInitSegment', {
+      streamId: studioStreamId,
+      base64Init: fakeEbmlInit.toString('base64'),
+    });
+    expect(initCacheRes.cached).toBe(true);
+
+    // Diego watches via Cloud WSS Relay -> immediately receives cached EBML init segment
+    const relayWatch = await wsDiego.rpc<{
+      ok: boolean;
+      active: boolean;
+      mimeType: string;
+      base64Init: string | null;
+    }>('stream:relayWatch', { streamId: studioStreamId });
+    expect(relayWatch.ok).toBe(true);
+    expect(relayWatch.active).toBe(true);
+    expect(relayWatch.base64Init).toBe(fakeEbmlInit.toString('base64'));
+
+    // Pedro tries watching while viewerLimit === 1 and Diego is already watching -> VIEWER_LIMIT_REACHED
+    await expect(
+      wsPedro.rpc('p2p:streamWatch', { streamId: studioStreamId })
+    ).rejects.toMatchObject({ code: 'VIEWER_LIMIT_REACHED' });
+
+    // Clara sends binary relay frame [0x01][36-byte ASCII UUID][WebM Cluster payload]
+    const clusterChunk = Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0xde, 0xad, 0xbe, 0xef]);
+    const binaryRelayPacket = Buffer.concat([
+      Buffer.from([0x01]),
+      Buffer.from(studioStreamId, 'ascii'),
+      clusterChunk,
+    ]);
+    wsClaraNew.sendBinary(binaryRelayPacket);
+
+    const receivedRelayPacket = await wsDiego.waitForBinaryFrame(
+      (b) => b.length === binaryRelayPacket.length && b[0] === 0x01
+    );
+    expect(receivedRelayPacket.toString('ascii', 1, 37)).toBe(studioStreamId);
+    expect(receivedRelayPacket.subarray(37).equals(clusterChunk)).toBe(true);
+
+    // 5. Direct Messages (Send, Edit, Read Receipt, History & Delete)
+    const dmSent = await wsDiego.rpc<{ message: { id: string; content: string } }>('dm:send', {
+      recipientId: claraId,
+      content: 'Live lisinha em 120 FPS sem tela preta @clara_live!',
+      attachmentIds: [],
+    });
+    expect(dmSent.message.id).toBeTruthy();
+    await wsClaraNew.waitForEvent('dm:messageCreated', (e) => e.payload.message.id === dmSent.message.id);
+
+    const dmEdited = await wsDiego.rpc<{ message: { id: string; editedAt: string | null } }>('dm:edit', {
+      messageId: dmSent.message.id,
+      content: 'Live lisinha via Cloud Relay 120 FPS!',
+    });
+    expect(dmEdited.message.editedAt).toBeTruthy();
+
+    const dmRead = await wsClaraNew.rpc<{ readAt: string }>('dm:markRead', {
+      peerUserId: diegoId,
+    });
+    expect(dmRead.readAt).toBeTruthy();
+    await wsDiego.waitForEvent('dm:read', (e) => e.payload.byUserId === claraId);
+
+    const dmHist = await wsClaraNew.rpc<{ messages: { id: string }[] }>('dm:history', {
+      peerUserId: diegoId,
+      limit: 30,
+    });
+    expect(dmHist.messages.some((m) => m.id === dmSent.message.id)).toBe(true);
+
+    const dmDel = await wsDiego.rpc<{ deleted: boolean }>('dm:delete', {
+      messageId: dmSent.message.id,
+    });
+    expect(dmDel.deleted).toBe(true);
+
+    // 6. Moderator Panel Visibility: Owner promotes Diego to 'moderator' -> can read users & audit logs (200), cannot ban or change roles (403)
+    const promoteModRes = await fetch(`${baseUrl}/api/admin/users/${diegoId}/role`, {
+      method: 'PATCH',
+      headers: authJson(lucasToken),
+      body: JSON.stringify({ role: 'moderator' }),
+    });
+    expect(promoteModRes.status).toBe(200);
+    await wsDiego.waitForEvent(
+      'user:roleUpdated',
+      (e) => e.payload.userId === diegoId && e.payload.role === 'moderator'
+    );
+
+    const modUsersRes = await fetch(`${baseUrl}/api/admin/users`, {
+      headers: { Authorization: `Bearer ${diegoToken}` },
+    });
+    expect(modUsersRes.status).toBe(200);
+
+    const modLogsRes = await fetch(`${baseUrl}/api/admin/audit-logs`, {
+      headers: { Authorization: `Bearer ${diegoToken}` },
+    });
+    expect(modLogsRes.status).toBe(200);
+
+    const modPromoteForbidden = await fetch(`${baseUrl}/api/admin/users/${claraId}/role`, {
+      method: 'PATCH',
+      headers: authJson(diegoToken),
+      body: JSON.stringify({ role: 'moderator' }),
+    });
+    expect(modPromoteForbidden.status).toBe(403);
+
+    wsClaraOld.close();
+    wsClaraNew.close();
+    wsDiego.close();
+    wsPedro.close();
+  }, 25000);
 });

@@ -4,6 +4,7 @@ import pg from 'pg';
 import {
   DEFAULT_USER_SETTINGS,
   hasRoleAtLeast,
+  USERNAME_MAX_CHANGES_PER_24H,
   UserRoleSchema,
   UserSettingsSchema,
   type AdminAuditLogEntry,
@@ -11,6 +12,11 @@ import {
   type AuthUser,
   type ChatAttachment,
   type ChatMessage,
+  type DirectMessage,
+  type FriendEntry,
+  type FriendshipStatus,
+  type UpdateProfileInput,
+  type UserPresenceStatus,
   type UserPublic,
   type UserRole,
   type UserSettings,
@@ -33,6 +39,8 @@ export interface DbUserRow {
   password_hash: string;
   avatar_color: string;
   avatar_url: string | null;
+  bio?: string | null;
+  presence_status?: string | null;
   role?: string | null;
   is_banned?: number | boolean | null;
   ban_reason?: string | null;
@@ -53,6 +61,7 @@ export interface DbRoomRow {
 export interface DbAttachmentRow {
   id: string;
   message_id: string | null;
+  dm_message_id?: string | null;
   room_id: string | null;
   uploader_id: string;
   filename: string;
@@ -188,6 +197,10 @@ class PostgresDriver implements SqlDriver {
   }
 }
 
+export function makeConversationKey(userA: string, userB: string): string {
+  return userA < userB ? `${userA}:${userB}` : `${userB}:${userA}`;
+}
+
 export class AppDatabase {
   private driver: SqlDriver;
   public readonly isPostgres: boolean;
@@ -217,12 +230,24 @@ export class AppDatabase {
         password_hash TEXT NOT NULL,
         avatar_color TEXT NOT NULL,
         avatar_url TEXT,
+        bio TEXT NOT NULL DEFAULT '',
+        presence_status TEXT NOT NULL DEFAULT 'online',
         role TEXT NOT NULL DEFAULT 'member',
         is_banned ${boolType} NOT NULL DEFAULT ${boolFalse},
         ban_reason TEXT,
         settings_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS username_change_logs (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        old_username TEXT NOT NULL,
+        new_username TEXT NOT NULL,
+        changed_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_username_changes_user_time ON username_change_logs(user_id, changed_at DESC);
 
       CREATE TABLE IF NOT EXISTS refresh_tokens (
         id TEXT PRIMARY KEY,
@@ -264,14 +289,45 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);
 
+      CREATE TABLE IF NOT EXISTS friendships (
+        id TEXT PRIMARY KEY,
+        requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        addressee_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(requester_id, addressee_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_friendships_req ON friendships(requester_id, status);
+      CREATE INDEX IF NOT EXISTS idx_friendships_addr ON friendships(addressee_id, status);
+
+      CREATE TABLE IF NOT EXISTS direct_messages (
+        id TEXT PRIMARY KEY,
+        conversation_key TEXT NOT NULL,
+        sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        mentions_json TEXT NOT NULL DEFAULT '[]',
+        room_invite_json TEXT,
+        created_at TEXT NOT NULL,
+        edited_at TEXT,
+        read_at TEXT,
+        deleted ${boolType} NOT NULL DEFAULT ${boolFalse}
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_dm_conv_created ON direct_messages(conversation_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_dm_recipient_unread ON direct_messages(recipient_id, read_at);
+
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
         message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+        dm_message_id TEXT,
         room_id TEXT REFERENCES rooms(id) ON DELETE CASCADE,
         uploader_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         filename TEXT NOT NULL,
         mime_type TEXT NOT NULL,
-        size_bytes INTEGER NOT NULL,
+        size_bytes BIGINT NOT NULL,
         storage_key TEXT NOT NULL,
         url_path TEXT NOT NULL,
         is_image ${boolType} NOT NULL DEFAULT ${boolFalse},
@@ -303,11 +359,15 @@ export class AppDatabase {
       "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'",
       `ALTER TABLE users ADD COLUMN is_banned ${boolType} NOT NULL DEFAULT ${boolFalse}`,
       'ALTER TABLE users ADD COLUMN ban_reason TEXT',
+      "ALTER TABLE users ADD COLUMN bio TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE users ADD COLUMN presence_status TEXT NOT NULL DEFAULT 'online'",
+      'ALTER TABLE attachments ADD COLUMN dm_message_id TEXT',
+      'CREATE INDEX IF NOT EXISTS idx_attachments_dm_message ON attachments(dm_message_id)',
     ]) {
       try {
         await this.driver.exec(alterSql);
       } catch {
-        // Column already exists
+        // Column or index already exists
       }
     }
 
@@ -344,7 +404,7 @@ export class AppDatabase {
         [
           'room-cinema-jogos',
           'Jogos & Cinema 2K',
-          'Sala otimizada para lives em 1080p e 1440p a 60/75 FPS com áudio estéreo integral',
+          'Sala otimizada para lives em 1080p, 1440p e Original até 144 FPS com áudio estéreo',
           false,
           null,
           null,
@@ -363,6 +423,12 @@ export class AppDatabase {
     return parsed.success ? parsed.data : 'member';
   }
 
+  public parsePresenceStatus(raw?: string | null): UserPresenceStatus {
+    if (raw === 'busy') return 'busy';
+    if (raw === 'offline') return 'offline';
+    return 'online';
+  }
+
   public mapUserPublic(row: DbUserRow): UserPublic {
     return {
       id: row.id,
@@ -370,12 +436,39 @@ export class AppDatabase {
       displayName: row.display_name,
       avatarColor: row.avatar_color,
       avatarUrl: row.avatar_url,
+      bio: row.bio ?? '',
+      presenceStatus: this.parsePresenceStatus(row.presence_status),
       role: this.parseUserRole(row.role),
       createdAt: row.created_at,
     };
   }
 
-  public mapAuthUser(row: DbUserRow): AuthUser {
+  public async getNicknameRateLimitState(userId: string): Promise<{
+    changesLast24h: number;
+    lockedUntil: string | null;
+  }> {
+    const cutoffIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const rows = await this.driver.query<{ changed_at: string }>(
+      `SELECT changed_at FROM username_change_logs
+       WHERE user_id = $1 AND changed_at > $2
+       ORDER BY changed_at ASC`,
+      [userId, cutoffIso]
+    );
+    const changesLast24h = rows.length;
+    if (changesLast24h >= USERNAME_MAX_CHANGES_PER_24H && rows[0]) {
+      const unlockMs = new Date(rows[0].changed_at).getTime() + 24 * 60 * 60 * 1000;
+      return {
+        changesLast24h,
+        lockedUntil: new Date(unlockMs).toISOString(),
+      };
+    }
+    return { changesLast24h, lockedUntil: null };
+  }
+
+  public mapAuthUser(
+    row: DbUserRow,
+    nicknameMeta?: { changesLast24h: number; lockedUntil: string | null }
+  ): AuthUser {
     let parsedSettings: UserSettings = DEFAULT_USER_SETTINGS;
     try {
       parsedSettings = UserSettingsSchema.parse(JSON.parse(row.settings_json));
@@ -392,7 +485,14 @@ export class AppDatabase {
       ...this.mapUserPublic(row),
       email: decryptedEmail,
       settings: parsedSettings,
+      nicknameChangesLast24h: nicknameMeta?.changesLast24h ?? 0,
+      nicknameLockedUntil: nicknameMeta?.lockedUntil ?? null,
     };
+  }
+
+  public async enrichAuthUser(row: DbUserRow): Promise<AuthUser> {
+    const nicknameMeta = await this.getNicknameRateLimitState(row.id);
+    return this.mapAuthUser(row, nicknameMeta);
   }
 
   async createUser(params: {
@@ -412,8 +512,8 @@ export class AppDatabase {
     await this.driver.query(
       `INSERT INTO users (
         id, username, username_lower, display_name, email, email_lower,
-        password_hash, avatar_color, avatar_url, settings_json, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        password_hash, avatar_color, avatar_url, bio, presence_status, settings_json, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         id,
         params.username,
@@ -424,6 +524,8 @@ export class AppDatabase {
         params.passwordHash,
         params.avatarColor,
         null,
+        '',
+        'online',
         settingsJson,
         now,
       ]
@@ -431,7 +533,7 @@ export class AppDatabase {
 
     const created = await this.findUserRowById(id);
     if (!created) throw new Error('Falha ao persistir usuário');
-    return this.mapAuthUser(created);
+    return this.enrichAuthUser(created);
   }
 
   async updateUserPasswordHash(userId: string, newPasswordHash: string): Promise<void> {
@@ -493,19 +595,99 @@ export class AppDatabase {
 
   async updateUserProfile(
     userId: string,
-    updates: { displayName?: string; avatarUrl?: string | null }
+    updates: UpdateProfileInput
   ): Promise<AuthUser | null> {
     const current = await this.findUserRowById(userId);
     if (!current) return null;
-    const nextDisplayName = updates.displayName?.trim() || current.display_name;
-    const nextAvatarUrl = updates.avatarUrl !== undefined ? updates.avatarUrl : current.avatar_url;
-    await this.driver.query('UPDATE users SET display_name = $1, avatar_url = $2 WHERE id = $3', [
-      nextDisplayName,
-      nextAvatarUrl,
-      userId,
-    ]);
+
+    let nextUsername = current.username;
+    let nextUsernameLower = current.username_lower;
+    let didChangeUsername = false;
+
+    if (updates.username !== undefined && updates.username.trim() !== current.username) {
+      const requestedUsername = updates.username.trim();
+      const requestedLower = requestedUsername.toLowerCase();
+
+      const rateState = await this.getNicknameRateLimitState(userId);
+      if (rateState.changesLast24h >= USERNAME_MAX_CHANGES_PER_24H && rateState.lockedUntil) {
+        throw Object.assign(
+          new Error(
+            `Você já alterou seu nickname ${USERNAME_MAX_CHANGES_PER_24H} vezes nas últimas 24 horas. Aguarde o desbloqueio automático.`
+          ),
+          {
+            code: 'NICKNAME_RATE_LIMIT',
+            lockedUntil: rateState.lockedUntil,
+          }
+        );
+      }
+
+      if (requestedLower !== current.username_lower) {
+        const conflict = await this.driver.queryOne<{ id: string }>(
+          'SELECT id FROM users WHERE username_lower = $1 AND id != $2',
+          [requestedLower, userId]
+        );
+        if (conflict) {
+          throw Object.assign(new Error('Este nickname já está sendo usado por outra pessoa'), {
+            code: 'USERNAME_TAKEN',
+          });
+        }
+      }
+
+      nextUsername = requestedUsername;
+      nextUsernameLower = requestedLower;
+      didChangeUsername = true;
+    }
+
+    const nextDisplayName =
+      updates.displayName !== undefined ? updates.displayName.trim() : current.display_name;
+    const nextBio = updates.bio !== undefined ? updates.bio.trim() : (current.bio ?? '');
+    const nextAvatarColor =
+      updates.avatarColor !== undefined ? updates.avatarColor : current.avatar_color;
+    const nextAvatarUrl =
+      updates.avatarUrl !== undefined ? updates.avatarUrl : current.avatar_url;
+    const nextPresence =
+      updates.presenceStatus !== undefined
+        ? updates.presenceStatus
+        : this.parsePresenceStatus(current.presence_status);
+
+    await this.driver.query(
+      `UPDATE users
+       SET username = $1,
+           username_lower = $2,
+           display_name = $3,
+           bio = $4,
+           avatar_color = $5,
+           avatar_url = $6,
+           presence_status = $7
+       WHERE id = $8`,
+      [
+        nextUsername,
+        nextUsernameLower,
+        nextDisplayName,
+        nextBio,
+        nextAvatarColor,
+        nextAvatarUrl,
+        nextPresence,
+        userId,
+      ]
+    );
+
+    if (didChangeUsername) {
+      await this.driver.query(
+        `INSERT INTO username_change_logs (id, user_id, old_username, new_username, changed_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          crypto.randomUUID(),
+          userId,
+          current.username,
+          nextUsername,
+          new Date().toISOString(),
+        ]
+      );
+    }
+
     const updated = await this.findUserRowById(userId);
-    return updated ? this.mapAuthUser(updated) : null;
+    return updated ? this.enrichAuthUser(updated) : null;
   }
 
   async storeRefreshToken(params: {
@@ -546,7 +728,6 @@ export class AppDatabase {
     );
     if (!row) return { ok: false };
 
-    // Refresh Token Reuse Detection: if a rotated/revoked token is replayed, revoke ALL active sessions of this user!
     if (Boolean(row.revoked)) {
       await this.revokeAllUserRefreshTokens(userId);
       return { ok: false, replayDetected: true };
@@ -668,11 +849,12 @@ export class AppDatabase {
     const now = new Date().toISOString();
     await this.driver.query(
       `INSERT INTO attachments (
-        id, message_id, room_id, uploader_id, filename, mime_type,
+        id, message_id, dm_message_id, room_id, uploader_id, filename, mime_type,
         size_bytes, storage_key, url_path, is_image, width, height, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [
         id,
+        null,
         null,
         params.roomId,
         params.uploaderId,
@@ -699,7 +881,7 @@ export class AppDatabase {
     return this.driver.queryOne<DbAttachmentRow>('SELECT * FROM attachments WHERE id = $1', [id]);
   }
 
-  // Messages
+  // Room Messages
   async createMessage(params: {
     roomId: string;
     authorId: string;
@@ -726,7 +908,7 @@ export class AppDatabase {
 
     for (const attId of params.attachmentIds) {
       await this.driver.query(
-        'UPDATE attachments SET message_id = $1, room_id = $2 WHERE id = $3 AND uploader_id = $4 AND message_id IS NULL',
+        'UPDATE attachments SET message_id = $1, room_id = $2 WHERE id = $3 AND uploader_id = $4 AND message_id IS NULL AND dm_message_id IS NULL',
         [id, params.roomId, attId, params.authorId]
       );
     }
@@ -751,13 +933,17 @@ export class AppDatabase {
       u_display_name: string;
       u_avatar_color: string;
       u_avatar_url: string | null;
+      u_bio: string | null;
+      u_presence_status: string | null;
       u_role: string | null;
       u_created_at: string;
     }>(
       `SELECT
         m.id, m.room_id, m.author_id, m.content, m.mentions_json, m.created_at, m.edited_at, m.deleted,
         u.id as u_id, u.username as u_username, u.display_name as u_display_name,
-        u.avatar_color as u_avatar_color, u.avatar_url as u_avatar_url, u.role as u_role, u.created_at as u_created_at
+        u.avatar_color as u_avatar_color, u.avatar_url as u_avatar_url,
+        u.bio as u_bio, u.presence_status as u_presence_status,
+        u.role as u_role, u.created_at as u_created_at
        FROM messages m
        JOIN users u ON u.id = m.author_id
        WHERE m.id = $1`,
@@ -787,6 +973,8 @@ export class AppDatabase {
         displayName: row.u_display_name,
         avatarColor: row.u_avatar_color,
         avatarUrl: row.u_avatar_url,
+        bio: row.u_bio ?? '',
+        presenceStatus: this.parsePresenceStatus(row.u_presence_status),
         role: this.parseUserRole(row.u_role),
         createdAt: row.u_created_at,
       },
@@ -862,12 +1050,487 @@ export class AppDatabase {
     return { roomId: existing.roomId, deleted: true };
   }
 
+  // Friends System
+  async sendFriendRequest(
+    requesterId: string,
+    targetUsernameRaw: string
+  ): Promise<{ friendshipId: string; targetUser: UserPublic; autoAccepted: boolean }> {
+    const cleanTarget = targetUsernameRaw.trim().replace(/^@+/, '').toLowerCase();
+    const targetRow = await this.driver.queryOne<DbUserRow>(
+      'SELECT * FROM users WHERE username_lower = $1',
+      [cleanTarget]
+    );
+    if (!targetRow) {
+      throw Object.assign(new Error('Nenhum usuário encontrado com este nickname'), {
+        code: 'USER_NOT_FOUND',
+      });
+    }
+    if (targetRow.id === requesterId) {
+      throw Object.assign(new Error('Você não pode adicionar a si mesmo como amigo'), {
+        code: 'CANNOT_ADD_SELF',
+      });
+    }
+
+    const existing = await this.driver.queryOne<{
+      id: string;
+      requester_id: string;
+      addressee_id: string;
+      status: string;
+    }>(
+      `SELECT id, requester_id, addressee_id, status
+       FROM friendships
+       WHERE (requester_id = $1 AND addressee_id = $2)
+          OR (requester_id = $3 AND addressee_id = $4)`,
+      [requesterId, targetRow.id, targetRow.id, requesterId]
+    );
+
+    const now = new Date().toISOString();
+    const targetUser = this.mapUserPublic(targetRow);
+
+    if (existing) {
+      if (existing.status === 'accepted') {
+        throw Object.assign(new Error('Vocês já são amigos!'), { code: 'ALREADY_FRIENDS' });
+      }
+      if (existing.requester_id === requesterId) {
+        throw Object.assign(new Error('Solicitação de amizade já enviada e pendente'), {
+          code: 'REQUEST_ALREADY_SENT',
+        });
+      }
+      // Target user had already sent us a request -> automatically accept mutual friendship!
+      await this.driver.query(
+        'UPDATE friendships SET status = $1, updated_at = $2 WHERE id = $3',
+        ['accepted', now, existing.id]
+      );
+      return { friendshipId: existing.id, targetUser, autoAccepted: true };
+    }
+
+    const friendshipId = crypto.randomUUID();
+    await this.driver.query(
+      `INSERT INTO friendships (id, requester_id, addressee_id, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [friendshipId, requesterId, targetRow.id, 'pending', now, now]
+    );
+
+    return { friendshipId, targetUser, autoAccepted: false };
+  }
+
+  async respondFriendRequest(
+    friendshipId: string,
+    userId: string,
+    accept: boolean
+  ): Promise<{ requesterId: string; addresseeId: string; accepted: boolean }> {
+    const existing = await this.driver.queryOne<{
+      id: string;
+      requester_id: string;
+      addressee_id: string;
+      status: string;
+    }>('SELECT id, requester_id, addressee_id, status FROM friendships WHERE id = $1', [
+      friendshipId,
+    ]);
+
+    if (!existing) {
+      throw Object.assign(new Error('Solicitação de amizade não encontrada'), {
+        code: 'NOT_FOUND',
+      });
+    }
+
+    if (accept) {
+      if (existing.addressee_id !== userId) {
+        throw Object.assign(new Error('Somente o destinatário pode aceitar esta solicitação'), {
+          code: 'FORBIDDEN',
+        });
+      }
+      await this.driver.query(
+        'UPDATE friendships SET status = $1, updated_at = $2 WHERE id = $3',
+        ['accepted', new Date().toISOString(), friendshipId]
+      );
+      return {
+        requesterId: existing.requester_id,
+        addresseeId: existing.addressee_id,
+        accepted: true,
+      };
+    }
+
+    if (existing.addressee_id !== userId && existing.requester_id !== userId) {
+      throw Object.assign(new Error('Sem permissão para recusar esta solicitação'), {
+        code: 'FORBIDDEN',
+      });
+    }
+
+    await this.driver.query('DELETE FROM friendships WHERE id = $1', [friendshipId]);
+    return {
+      requesterId: existing.requester_id,
+      addresseeId: existing.addressee_id,
+      accepted: false,
+    };
+  }
+
+  async removeFriendship(
+    friendshipId: string,
+    userId: string
+  ): Promise<{ otherUserId: string }> {
+    const existing = await this.driver.queryOne<{
+      id: string;
+      requester_id: string;
+      addressee_id: string;
+    }>('SELECT id, requester_id, addressee_id FROM friendships WHERE id = $1', [friendshipId]);
+
+    if (!existing || (existing.requester_id !== userId && existing.addressee_id !== userId)) {
+      throw Object.assign(new Error('Amizade não encontrada'), { code: 'NOT_FOUND' });
+    }
+
+    await this.driver.query('DELETE FROM friendships WHERE id = $1', [friendshipId]);
+    const otherUserId =
+      existing.requester_id === userId ? existing.addressee_id : existing.requester_id;
+    return { otherUserId };
+  }
+
+  async areUsersFriends(userA: string, userB: string): Promise<boolean> {
+    if (userA === userB) return true;
+    const row = await this.driver.queryOne<{ id: string }>(
+      `SELECT id FROM friendships
+       WHERE status = $1
+         AND ((requester_id = $2 AND addressee_id = $3)
+           OR (requester_id = $4 AND addressee_id = $5))`,
+      ['accepted', userA, userB, userB, userA]
+    );
+    return Boolean(row);
+  }
+
+  async listAcceptedFriendUserIds(userId: string): Promise<string[]> {
+    const rows = await this.driver.query<{ requester_id: string; addressee_id: string }>(
+      `SELECT requester_id, addressee_id FROM friendships
+       WHERE status = $1 AND (requester_id = $2 OR addressee_id = $3)`,
+      ['accepted', userId, userId]
+    );
+    return rows.map((r) => (r.requester_id === userId ? r.addressee_id : r.requester_id));
+  }
+
+  async listFriendsForUser(
+    userId: string,
+    resolveLiveState: (friendUser: UserPublic) => {
+      isOnline: boolean;
+      currentRoomId: string | null;
+      currentRoomName: string | null;
+      isStreaming: boolean;
+    }
+  ): Promise<FriendEntry[]> {
+    const rows = await this.driver.query<{
+      f_id: string;
+      f_requester_id: string;
+      f_addressee_id: string;
+      f_status: string;
+      f_created_at: string;
+      u_id: string;
+      u_username: string;
+      u_display_name: string;
+      u_avatar_color: string;
+      u_avatar_url: string | null;
+      u_bio: string | null;
+      u_presence_status: string | null;
+      u_role: string | null;
+      u_created_at: string;
+    }>(
+      `SELECT
+        f.id as f_id, f.requester_id as f_requester_id, f.addressee_id as f_addressee_id,
+        f.status as f_status, f.created_at as f_created_at,
+        u.id as u_id, u.username as u_username, u.display_name as u_display_name,
+        u.avatar_color as u_avatar_color, u.avatar_url as u_avatar_url,
+        u.bio as u_bio, u.presence_status as u_presence_status,
+        u.role as u_role, u.created_at as u_created_at
+       FROM friendships f
+       JOIN users u ON u.id = CASE WHEN f.requester_id = $1 THEN f.addressee_id ELSE f.requester_id END
+       WHERE f.requester_id = $2 OR f.addressee_id = $3
+       ORDER BY f.updated_at DESC`,
+      [userId, userId, userId]
+    );
+
+    const notDeletedVal = this.isPostgres ? false : 0;
+    const unreadRows = await this.driver.query<{ sender_id: string; cnt: number | string }>(
+      `SELECT sender_id, COUNT(*) as cnt
+       FROM direct_messages
+       WHERE recipient_id = $1 AND read_at IS NULL AND deleted = $2
+       GROUP BY sender_id`,
+      [userId, notDeletedVal]
+    );
+    const unreadBySender = new Map<string, number>();
+    for (const ur of unreadRows) {
+      unreadBySender.set(ur.sender_id, Number(ur.cnt));
+    }
+
+    const entries: FriendEntry[] = [];
+    for (const r of rows) {
+      const friendUser: UserPublic = {
+        id: r.u_id,
+        username: r.u_username,
+        displayName: r.u_display_name,
+        avatarColor: r.u_avatar_color,
+        avatarUrl: r.u_avatar_url,
+        bio: r.u_bio ?? '',
+        presenceStatus: this.parsePresenceStatus(r.u_presence_status),
+        role: this.parseUserRole(r.u_role),
+        createdAt: r.u_created_at,
+      };
+
+      let status: FriendshipStatus = 'accepted';
+      if (r.f_status !== 'accepted') {
+        status = r.f_requester_id === userId ? 'pending_outgoing' : 'pending_incoming';
+      }
+
+      const convKey = makeConversationKey(userId, friendUser.id);
+      const lastDmRow = await this.driver.queryOne<{ created_at: string }>(
+        `SELECT created_at FROM direct_messages
+         WHERE conversation_key = $1 AND deleted = $2
+         ORDER BY created_at DESC LIMIT 1`,
+        [convKey, notDeletedVal]
+      );
+
+      const live = resolveLiveState(friendUser);
+      const effectivePresence: UserPresenceStatus = live.isOnline
+        ? friendUser.presenceStatus === 'busy'
+          ? 'busy'
+          : 'online'
+        : 'offline';
+
+      entries.push({
+        friendshipId: r.f_id,
+        user: friendUser,
+        status,
+        isOnline: live.isOnline,
+        presenceStatus: effectivePresence,
+        currentRoomId: live.currentRoomId,
+        currentRoomName: live.currentRoomName,
+        isStreaming: live.isStreaming,
+        unreadDmCount: unreadBySender.get(friendUser.id) ?? 0,
+        lastDmAt: lastDmRow?.created_at ?? null,
+        createdAt: r.f_created_at,
+      });
+    }
+
+    return entries;
+  }
+
+  // Direct Messages (DMs)
+  async createDirectMessage(params: {
+    senderId: string;
+    recipientId: string;
+    content: string;
+    mentionUserIds: string[];
+    attachmentIds: string[];
+    roomInvite?: { roomId: string; roomName: string } | null;
+  }): Promise<DirectMessage> {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const conversationKey = makeConversationKey(params.senderId, params.recipientId);
+
+    await this.driver.query(
+      `INSERT INTO direct_messages (
+        id, conversation_key, sender_id, recipient_id, content,
+        mentions_json, room_invite_json, created_at, edited_at, read_at, deleted
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [
+        id,
+        conversationKey,
+        params.senderId,
+        params.recipientId,
+        params.content,
+        JSON.stringify(params.mentionUserIds),
+        params.roomInvite ? JSON.stringify(params.roomInvite) : null,
+        now,
+        null,
+        null,
+        false,
+      ]
+    );
+
+    for (const attId of params.attachmentIds) {
+      await this.driver.query(
+        'UPDATE attachments SET dm_message_id = $1 WHERE id = $2 AND uploader_id = $3 AND message_id IS NULL AND dm_message_id IS NULL',
+        [id, attId, params.senderId]
+      );
+    }
+
+    const created = await this.getDirectMessageById(id);
+    if (!created) throw new Error('Falha ao criar mensagem direta');
+    return created;
+  }
+
+  async getDirectMessageById(messageId: string): Promise<DirectMessage | null> {
+    const row = await this.driver.queryOne<{
+      id: string;
+      conversation_key: string;
+      sender_id: string;
+      recipient_id: string;
+      content: string;
+      mentions_json: string;
+      room_invite_json: string | null;
+      created_at: string;
+      edited_at: string | null;
+      read_at: string | null;
+      deleted: number | boolean;
+      u_id: string;
+      u_username: string;
+      u_display_name: string;
+      u_avatar_color: string;
+      u_avatar_url: string | null;
+      u_bio: string | null;
+      u_presence_status: string | null;
+      u_role: string | null;
+      u_created_at: string;
+    }>(
+      `SELECT
+        d.id, d.conversation_key, d.sender_id, d.recipient_id, d.content,
+        d.mentions_json, d.room_invite_json, d.created_at, d.edited_at, d.read_at, d.deleted,
+        u.id as u_id, u.username as u_username, u.display_name as u_display_name,
+        u.avatar_color as u_avatar_color, u.avatar_url as u_avatar_url,
+        u.bio as u_bio, u.presence_status as u_presence_status,
+        u.role as u_role, u.created_at as u_created_at
+       FROM direct_messages d
+       JOIN users u ON u.id = d.sender_id
+       WHERE d.id = $1`,
+      [messageId]
+    );
+    if (!row) return null;
+
+    const attRows = await this.driver.query<DbAttachmentRow>(
+      'SELECT * FROM attachments WHERE dm_message_id = $1 ORDER BY created_at ASC',
+      [messageId]
+    );
+
+    let mentions: string[] = [];
+    try {
+      mentions = JSON.parse(row.mentions_json);
+    } catch {
+      mentions = [];
+    }
+
+    let roomInvite: { roomId: string; roomName: string } | null = null;
+    if (row.room_invite_json) {
+      try {
+        const parsed = JSON.parse(row.room_invite_json);
+        if (parsed?.roomId && parsed?.roomName) {
+          roomInvite = { roomId: String(parsed.roomId), roomName: String(parsed.roomName) };
+        }
+      } catch {
+        roomInvite = null;
+      }
+    }
+
+    const isDeleted = Boolean(row.deleted);
+    return {
+      id: row.id,
+      conversationKey: row.conversation_key,
+      sender: {
+        id: row.u_id,
+        username: row.u_username,
+        displayName: row.u_display_name,
+        avatarColor: row.u_avatar_color,
+        avatarUrl: row.u_avatar_url,
+        bio: row.u_bio ?? '',
+        presenceStatus: this.parsePresenceStatus(row.u_presence_status),
+        role: this.parseUserRole(row.u_role),
+        createdAt: row.u_created_at,
+      },
+      recipientId: row.recipient_id,
+      content: isDeleted ? '' : row.content,
+      mentions: isDeleted ? [] : mentions,
+      attachments: isDeleted ? [] : attRows.map((a) => this.mapAttachment(a)),
+      roomInvite: isDeleted ? null : roomInvite,
+      createdAt: row.created_at,
+      editedAt: row.edited_at,
+      readAt: row.read_at,
+      deleted: isDeleted,
+    };
+  }
+
+  async listDirectMessages(
+    userId: string,
+    peerUserId: string,
+    limit = 60,
+    beforeCreatedAt?: string
+  ): Promise<DirectMessage[]> {
+    const convKey = makeConversationKey(userId, peerUserId);
+    const notDeletedVal = this.isPostgres ? false : 0;
+
+    const rows = beforeCreatedAt
+      ? await this.driver.query<{ id: string }>(
+          `SELECT id FROM direct_messages
+           WHERE conversation_key = $1 AND deleted = $2 AND created_at < $3
+           ORDER BY created_at DESC
+           LIMIT $4`,
+          [convKey, notDeletedVal, beforeCreatedAt, limit]
+        )
+      : await this.driver.query<{ id: string }>(
+          `SELECT id FROM direct_messages
+           WHERE conversation_key = $1 AND deleted = $2
+           ORDER BY created_at DESC
+           LIMIT $3`,
+          [convKey, notDeletedVal, limit]
+        );
+
+    const list: DirectMessage[] = [];
+    for (const r of rows.reverse()) {
+      const dm = await this.getDirectMessageById(r.id);
+      if (dm && !dm.deleted) list.push(dm);
+    }
+    return list;
+  }
+
+  async editDirectMessage(
+    messageId: string,
+    senderId: string,
+    newContent: string,
+    mentionUserIds: string[]
+  ): Promise<DirectMessage | null> {
+    const existing = await this.getDirectMessageById(messageId);
+    if (!existing || existing.deleted || existing.sender.id !== senderId) return null;
+
+    await this.driver.query(
+      'UPDATE direct_messages SET content = $1, mentions_json = $2, edited_at = $3 WHERE id = $4',
+      [newContent, JSON.stringify(mentionUserIds), new Date().toISOString(), messageId]
+    );
+    return this.getDirectMessageById(messageId);
+  }
+
+  async softDeleteDirectMessage(
+    messageId: string,
+    requesterId: string
+  ): Promise<{ conversationKey: string; senderId: string; recipientId: string } | null> {
+    const existing = await this.getDirectMessageById(messageId);
+    if (!existing || existing.deleted || existing.sender.id !== requesterId) return null;
+
+    await this.driver.query(
+      'UPDATE direct_messages SET deleted = $1, content = $2 WHERE id = $3',
+      [true, '', messageId]
+    );
+    return {
+      conversationKey: existing.conversationKey,
+      senderId: existing.sender.id,
+      recipientId: existing.recipientId,
+    };
+  }
+
+  async markDirectMessagesRead(
+    readerUserId: string,
+    peerUserId: string
+  ): Promise<{ readAt: string }> {
+    const readAt = new Date().toISOString();
+    const notDeletedVal = this.isPostgres ? false : 0;
+    await this.driver.query(
+      `UPDATE direct_messages
+       SET read_at = $1
+       WHERE recipient_id = $2 AND sender_id = $3 AND read_at IS NULL AND deleted = $4`,
+      [readAt, readerUserId, peerUserId, notDeletedVal]
+    );
+    return { readAt };
+  }
+
   // Administration & RBAC
   async setUserRole(userId: string, role: UserRole): Promise<AuthUser | null> {
     const validatedRole = UserRoleSchema.parse(role);
     await this.driver.query('UPDATE users SET role = $1 WHERE id = $2', [validatedRole, userId]);
     const updated = await this.findUserRowById(userId);
-    return updated ? this.mapAuthUser(updated) : null;
+    return updated ? this.enrichAuthUser(updated) : null;
   }
 
   async setUserBanState(
@@ -896,6 +1559,7 @@ export class AppDatabase {
         displayName: row.display_name,
         avatarColor: row.avatar_color,
         avatarUrl: row.avatar_url,
+        bio: row.bio ?? '',
         role: this.parseUserRole(row.role),
         isBanned: Boolean(row.is_banned),
         banReason: row.ban_reason ?? null,
@@ -971,4 +1635,3 @@ export class AppDatabase {
     }));
   }
 }
-

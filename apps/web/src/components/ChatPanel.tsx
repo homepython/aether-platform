@@ -3,17 +3,43 @@ import {
   Check,
   Download,
   FileText,
-  Loader2,
   Paperclip,
   Pencil,
   Send,
+  ShieldAlert,
+  Smile,
   Trash2,
   X,
 } from 'lucide-react';
 import { hasRoleAtLeast, type ChatAttachment, type ChatMessage } from '@aether/shared';
-import { api, resolveServerAssetUrl } from '../api/httpClient.js';
+import { api, resolveServerAssetUrl, type UploadProgressInfo } from '../api/httpClient.js';
 import { useAppStore } from '../store/useAppStore.js';
-import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
+import { StyledUserName, UserAvatar, UserRoleBadge } from './UserIdentity.js';
+
+const QUICK_EMOJIS = [
+  '😀',
+  '😂',
+  '🔥',
+  '❤️',
+  '🎮',
+  '🚀',
+  '👀',
+  '🎉',
+  '💯',
+  '🤝',
+  '⚡',
+  '✨',
+  '👍',
+  '🙏',
+  '😎',
+  '💀',
+];
+
+const MOD_SLASH_COMMANDS = [
+  { cmd: '/mute @', desc: 'Silencia imediatamente o microfone de um participante na sala' },
+  { cmd: '/kick @', desc: 'Remove o participante da sala atual (opcional: motivo)' },
+  { cmd: '/stopstream @', desc: 'Encerra a transmissão ao vivo do participante na sala' },
+];
 
 function formatTime(iso: string): string {
   const d = new Date(iso);
@@ -34,13 +60,18 @@ export const ChatPanel: React.FC = () => {
   const sendMessage = useAppStore((s) => s.sendMessage);
   const editMessage = useAppStore((s) => s.editMessage);
   const deleteMessage = useAppStore((s) => s.deleteMessage);
+  const setInspectedUser = useAppStore((s) => s.setInspectedUser);
   const setLightboxImageUrl = useAppStore((s) => s.setLightboxImageUrl);
   const pushToast = useAppStore((s) => s.pushToast);
 
   const [draft, setDraft] = useState('');
   const [stagedAttachments, setStagedAttachments] = useState<ChatAttachment[]>([]);
-  const [uploadingCount, setUploadingCount] = useState(0);
+  const [uploadProgress, setUploadProgress] = useState<{
+    filename: string;
+    info: UploadProgressInfo;
+  } | null>(null);
   const [sending, setSending] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
 
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -62,7 +93,10 @@ export const ChatPanel: React.FC = () => {
   const mentionCandidates = useMemo(() => {
     if (mentionQuery === null) return [];
     const q = mentionQuery.toLowerCase();
-    const unique = new Map<string, { username: string; displayName: string; avatarColor: string }>();
+    const unique = new Map<
+      string,
+      { username: string; displayName: string; avatarColor: string; avatarUrl: string | null }
+    >();
     for (const p of participants) {
       if (
         p.user.username.toLowerCase().includes(q) ||
@@ -72,11 +106,17 @@ export const ChatPanel: React.FC = () => {
           username: p.user.username,
           displayName: p.user.displayName,
           avatarColor: p.user.avatarColor,
+          avatarUrl: p.user.avatarUrl,
         });
       }
     }
     return Array.from(unique.values()).slice(0, 6);
   }, [mentionQuery, participants]);
+
+  const showSlashHelper =
+    hasRoleAtLeast(user?.role, 'moderator') &&
+    draft.startsWith('/') &&
+    !draft.includes(' ');
 
   const handleDraftChange = (val: string) => {
     setDraft(val);
@@ -100,43 +140,53 @@ export const ChatPanel: React.FC = () => {
 
   const uploadFiles = async (files: File[]) => {
     if (files.length === 0) return;
-    setUploadingCount((c) => c + files.length);
     for (const file of files) {
       try {
-        const uploaded = await api.uploadFile(file);
+        setUploadProgress({
+          filename: file.name,
+          info: { percent: 0, loadedBytes: 0, totalBytes: file.size },
+        });
+        const uploaded = await api.uploadFile(file, (info) => {
+          setUploadProgress({ filename: file.name, info });
+        });
         setStagedAttachments((prev) => [...prev, uploaded]);
       } catch (err) {
         pushToast({
           title: `Falha no envio de ${file.name}`,
-          body: err instanceof Error ? err.message : 'Verifique o tamanho do arquivo',
+          body: err instanceof Error ? err.message : 'Limite máximo: 550 MB por arquivo',
         });
       } finally {
-        setUploadingCount((c) => Math.max(0, c - 1));
+        setUploadProgress(null);
       }
     }
   };
 
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData?.items || []);
-    const imageFiles: File[] = [];
+    const pastedFiles: File[] = [];
     for (const item of items) {
-      if (item.kind === 'file' && item.type.startsWith('image/')) {
+      if (item.kind === 'file') {
         const f = item.getAsFile();
         if (f) {
-          const ext = f.type.split('/')[1] || 'png';
-          const namedFile = new File([f], `imagem-colada-${Date.now()}.${ext}`, { type: f.type });
-          imageFiles.push(namedFile);
+          if (f.type.startsWith('image/') && !f.name) {
+            const ext = f.type.split('/')[1] || 'png';
+            pastedFiles.push(
+              new File([f], `imagem-colada-${Date.now()}.${ext}`, { type: f.type })
+            );
+          } else {
+            pastedFiles.push(f);
+          }
         }
       }
     }
-    if (imageFiles.length > 0) {
+    if (pastedFiles.length > 0) {
       e.preventDefault();
-      void uploadFiles(imageFiles);
+      void uploadFiles(pastedFiles);
     }
   };
 
   const handleSend = async () => {
-    if (sending || uploadingCount > 0) return;
+    if (sending || uploadProgress) return;
     const text = draft.trim();
     if (!text && stagedAttachments.length === 0) return;
     setSending(true);
@@ -148,6 +198,7 @@ export const ChatPanel: React.FC = () => {
       setDraft('');
       setStagedAttachments([]);
       setMentionQuery(null);
+      setEmojiOpen(false);
     } catch (err) {
       pushToast({
         title: 'Erro ao enviar mensagem',
@@ -209,7 +260,9 @@ export const ChatPanel: React.FC = () => {
           }}
         >
           <Paperclip className="mb-2 h-7 w-7" style={{ color: 'var(--accent)' }} />
-          <div className="text-sm font-semibold">Solte arquivos ou imagens para anexar ao chat</div>
+          <div className="text-sm font-semibold">
+            Solte arquivos ou imagens (até 550 MB) para anexar ao chat
+          </div>
         </div>
       )}
 
@@ -226,8 +279,8 @@ export const ChatPanel: React.FC = () => {
             >
               <div className="text-sm font-semibold">Bem-vindo a #{currentRoom.name}</div>
               <p className="mt-1 max-w-sm text-xs" style={{ color: 'var(--text-secondary)' }}>
-                Envie mensagens, mencione participantes com <code>@usuario</code>, cole capturas de
-                tela com <code>Ctrl+V</code> ou arraste arquivos aqui.
+                Envie mensagens, mencione participantes com <code>@usuario</code>, cole imagens com{' '}
+                <code>Ctrl+V</code> ou envie arquivos de até <strong>550 MB</strong>.
               </p>
             </div>
           </div>
@@ -249,20 +302,26 @@ export const ChatPanel: React.FC = () => {
                   borderLeft: mentionsMe ? '2px solid var(--accent)' : '2px solid transparent',
                 }}
               >
-                <div
-                  className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white"
-                  style={{ backgroundColor: msg.author.avatarColor }}
-                >
-                  {msg.author.displayName.slice(0, 2).toUpperCase()}
-                </div>
+                <UserAvatar
+                  user={msg.author}
+                  size="md"
+                  className="mt-0.5"
+                  onClick={() => setInspectedUser(msg.author)}
+                />
 
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <StyledUserName
-                      name={msg.author.displayName}
-                      role={msg.author.role}
-                      className="text-sm font-semibold"
-                    />
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setInspectedUser(msg.author)}
+                      className="text-left hover:underline"
+                    >
+                      <StyledUserName
+                        name={msg.author.displayName}
+                        role={msg.author.role}
+                        className="text-sm font-semibold"
+                      />
+                    </button>
                     <UserRoleBadge role={msg.author.role} compact />
                     <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
                       @{msg.author.username}
@@ -361,6 +420,29 @@ export const ChatPanel: React.FC = () => {
                             </button>
                           );
                         }
+                        if (att.mimeType.startsWith('video/')) {
+                          return (
+                            <video
+                              key={att.id}
+                              src={fullUrl}
+                              controls
+                              preload="metadata"
+                              className="max-h-72 max-w-sm rounded-xl border bg-black"
+                              style={{ borderColor: 'var(--border-hairline)' }}
+                            />
+                          );
+                        }
+                        if (att.mimeType.startsWith('audio/')) {
+                          return (
+                            <audio
+                              key={att.id}
+                              src={fullUrl}
+                              controls
+                              preload="metadata"
+                              className="w-72 max-w-full"
+                            />
+                          );
+                        }
                         return (
                           <a
                             key={att.id}
@@ -377,7 +459,7 @@ export const ChatPanel: React.FC = () => {
                           >
                             <FileText className="h-4 w-4 shrink-0" style={{ color: 'var(--accent)' }} />
                             <div className="min-w-0">
-                              <div className="max-w-[200px] truncate font-medium">{att.filename}</div>
+                              <div className="max-w-[220px] truncate font-medium">{att.filename}</div>
                               <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
                                 {formatBytes(att.sizeBytes)}
                               </div>
@@ -434,6 +516,41 @@ export const ChatPanel: React.FC = () => {
 
       {/* Composer Area */}
       <div className="px-5 pb-4 pt-2">
+        {/* Moderator Slash Command Helper */}
+        {showSlashHelper && (
+          <div
+            className="mb-2 overflow-hidden rounded-2xl border p-2"
+            style={{
+              backgroundColor: 'var(--bg-surface)',
+              borderColor: 'var(--border-strong)',
+              boxShadow: 'var(--shadow-card)',
+            }}
+          >
+            <div className="mb-1 flex items-center gap-1.5 px-2 text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--voice-green)' }}>
+              <ShieldAlert className="h-3 w-3" />
+              Comandos Rápidos de Moderação
+            </div>
+            {MOD_SLASH_COMMANDS.map((item) => (
+              <button
+                key={item.cmd}
+                type="button"
+                onClick={() => {
+                  handleDraftChange(item.cmd);
+                  textareaRef.current?.focus();
+                }}
+                className="flex w-full items-center justify-between gap-2 rounded-xl px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+              >
+                <code className="font-semibold" style={{ color: 'var(--accent)' }}>
+                  {item.cmd}usuario
+                </code>
+                <span className="truncate text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  {item.desc}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* @Mention Autocomplete Popover */}
         {mentionCandidates.length > 0 && (
           <div
@@ -454,12 +571,14 @@ export const ChatPanel: React.FC = () => {
                 onClick={() => insertMention(cand.username)}
                 className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-black/5 dark:hover:bg-white/5"
               >
-                <span
-                  className="flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-bold text-white"
-                  style={{ backgroundColor: cand.avatarColor }}
-                >
-                  {cand.displayName.slice(0, 2).toUpperCase()}
-                </span>
+                <UserAvatar
+                  user={{
+                    displayName: cand.displayName,
+                    avatarColor: cand.avatarColor,
+                    avatarUrl: cand.avatarUrl,
+                  }}
+                  size="xs"
+                />
                 <span className="font-medium">{cand.displayName}</span>
                 <span style={{ color: 'var(--text-muted)' }}>@{cand.username}</span>
               </button>
@@ -467,8 +586,39 @@ export const ChatPanel: React.FC = () => {
           </div>
         )}
 
+        {/* Live XHR Upload Progress Bar (550 MB+) */}
+        {uploadProgress && (
+          <div
+            className="mb-2 rounded-2xl border p-3 text-xs"
+            style={{
+              backgroundColor: 'var(--bg-surface)',
+              borderColor: 'var(--border-hairline)',
+            }}
+          >
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="truncate font-medium">Enviando {uploadProgress.filename}...</span>
+              <span className="font-semibold tabular-nums">
+                {uploadProgress.info.percent}% ({formatBytes(uploadProgress.info.loadedBytes)} /{' '}
+                {formatBytes(uploadProgress.info.totalBytes)})
+              </span>
+            </div>
+            <div
+              className="h-2 w-full overflow-hidden rounded-full"
+              style={{ backgroundColor: 'var(--bg-elevated)' }}
+            >
+              <div
+                className="h-full rounded-full transition-all"
+                style={{
+                  width: `${uploadProgress.info.percent}%`,
+                  backgroundColor: 'var(--accent)',
+                }}
+              />
+            </div>
+          </div>
+        )}
+
         {/* Staged Attachments Preview */}
-        {(stagedAttachments.length > 0 || uploadingCount > 0) && (
+        {stagedAttachments.length > 0 && (
           <div
             className="mb-2 flex flex-wrap items-center gap-2 rounded-2xl border p-2.5"
             style={{
@@ -506,12 +656,27 @@ export const ChatPanel: React.FC = () => {
                 </button>
               </div>
             ))}
-            {uploadingCount > 0 && (
-              <div className="inline-flex items-center gap-2 px-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Enviando arquivo...
-              </div>
-            )}
+          </div>
+        )}
+
+        {emojiOpen && (
+          <div
+            className="mb-2 flex flex-wrap gap-1.5 rounded-2xl border p-2.5"
+            style={{
+              backgroundColor: 'var(--bg-surface)',
+              borderColor: 'var(--border-strong)',
+            }}
+          >
+            {QUICK_EMOJIS.map((em) => (
+              <button
+                key={em}
+                type="button"
+                onClick={() => setDraft((prev) => `${prev}${em}`)}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-base transition-transform hover:scale-110 hover:bg-black/5 dark:hover:bg-white/5"
+              >
+                {em}
+              </button>
+            ))}
           </div>
         )}
 
@@ -538,11 +703,21 @@ export const ChatPanel: React.FC = () => {
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            title="Enviar arquivo ou imagem"
+            title="Enviar arquivo ou imagem (até 550 MB)"
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-colors hover:bg-black/5 dark:hover:bg-white/5"
             style={{ color: 'var(--text-secondary)' }}
           >
             <Paperclip className="h-4 w-4" />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setEmojiOpen((o) => !o)}
+            title="Emojis rápidos"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+            style={{ color: emojiOpen ? 'var(--accent)' : 'var(--text-secondary)' }}
+          >
+            <Smile className="h-4 w-4" />
           </button>
 
           <textarea
@@ -557,14 +732,22 @@ export const ChatPanel: React.FC = () => {
                 void handleSend();
               }
             }}
-            placeholder={`Mensagem em #${currentRoom.name} (@ para mencionar, Ctrl+V para colar imagem)`}
+            placeholder={
+              hasRoleAtLeast(user?.role, 'moderator')
+                ? `Mensagem em #${currentRoom.name} (@mencionar, /mute, /kick, Ctrl+V)`
+                : `Mensagem em #${currentRoom.name} (@ para mencionar, Ctrl+V para colar)`
+            }
             className="max-h-32 min-h-[36px] flex-1 resize-none bg-transparent py-2 text-sm outline-none"
             style={{ color: 'var(--text-primary)' }}
           />
 
           <button
             type="button"
-            disabled={sending || uploadingCount > 0 || (!draft.trim() && stagedAttachments.length === 0)}
+            disabled={
+              sending ||
+              Boolean(uploadProgress) ||
+              (!draft.trim() && stagedAttachments.length === 0)
+            }
             onClick={() => void handleSend()}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-white transition-opacity disabled:opacity-40"
             style={{ backgroundColor: 'var(--accent)' }}
@@ -577,4 +760,3 @@ export const ChatPanel: React.FC = () => {
     </div>
   );
 };
-

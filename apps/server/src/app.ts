@@ -80,7 +80,7 @@ export async function createServerApp(options?: {
 
   await app.register(websocket, {
     options: {
-      maxPayload: 2 * 1024 * 1024,
+      maxPayload: 8 * 1024 * 1024,
     },
   });
 

@@ -12,7 +12,6 @@ import {
   Moon,
   ShieldCheck,
   Sun,
-  UserCheck,
   Volume2,
   Zap,
 } from 'lucide-react';
@@ -20,7 +19,7 @@ import { api, resolveServerAssetUrl } from '../api/httpClient.js';
 import { isDesktopClient } from '../bridge/DesktopBridge.js';
 import { useAppStore } from '../store/useAppStore.js';
 import { AdminModal } from './AdminModal.js';
-import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
+import { StyledUserName, UserAvatar, UserRoleBadge } from './UserIdentity.js';
 
 export const LandingPage: React.FC = () => {
   const user = useAppStore((s) => s.user);
@@ -118,7 +117,7 @@ export const LandingPage: React.FC = () => {
                     backgroundColor: 'var(--bg-surface)',
                   }}
                 >
-                  <UserCheck className="h-3.5 w-3.5" style={{ color: 'var(--voice-green)' }} />
+                  <UserAvatar user={user} size="xs" showPresence isOnline />
                   <StyledUserName name={user.displayName} role={user.role} className="max-w-[160px]" />
                   <UserRoleBadge role={user.role} compact />
                 </div>
@@ -211,7 +210,7 @@ export const LandingPage: React.FC = () => {
             }}
           >
             <span className="h-2 w-2 rounded-full bg-emerald-500" />
-            Engenharia SFU em Tempo Real • 1440p 75 FPS • Zero Audio Ducking
+            Aether v1.1 Studio • 360p a 2K 144 FPS • Cloud Relay Anti-Tela-Preta • Zero Audio Ducking
           </div>
 
           <h1 className="text-4xl font-semibold leading-[1.08] tracking-tight sm:text-6xl">

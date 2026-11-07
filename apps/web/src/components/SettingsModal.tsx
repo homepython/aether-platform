@@ -1,15 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import {
   AppWindow,
+  DownloadCloud,
   Keyboard,
+  Loader2,
   Mic,
   MonitorPlay,
   Palette,
+  RefreshCw,
   ShieldCheck,
   Volume2,
   X,
 } from 'lucide-react';
 import {
+  STREAM_AUDIO_BITRATE_PRESETS,
   STREAM_FPS_OPTIONS,
   STREAM_RESOLUTIONS,
   STREAM_RESOLUTION_SPECS,
@@ -40,10 +44,14 @@ export const SettingsModal: React.FC = () => {
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const localMicDb = useAppStore((s) => s.localMicDb);
+  const updaterStatus = useAppStore((s) => s.updaterStatus);
+  const checkForAppUpdates = useAppStore((s) => s.checkForAppUpdates);
+  const installDownloadedUpdateNow = useAppStore((s) => s.installDownloadedUpdateNow);
 
   const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
   const [outputDevices, setOutputDevices] = useState<MediaDeviceInfo[]>([]);
   const [testingMic, setTestingMic] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [recordingShortcutKey, setRecordingShortcutKey] = useState<
     keyof ShortcutSettings | 'pttKey' | null
   >(null);
@@ -81,6 +89,15 @@ export const SettingsModal: React.FC = () => {
       await audioEngine.startMicrophone(settings.audio).catch(() => {});
     }
     audioEngine.setMicLoopbackTest(next);
+  };
+
+  const handleManualUpdateCheck = async () => {
+    setCheckingUpdate(true);
+    try {
+      await checkForAppUpdates();
+    } finally {
+      setCheckingUpdate(false);
+    }
   };
 
   const meterPercent = Math.max(0, Math.min(100, ((localMicDb + 85) / 85) * 100));
@@ -127,8 +144,8 @@ export const SettingsModal: React.FC = () => {
             {(
               [
                 { id: 'audio', label: 'Áudio & Voz', icon: Mic },
-                { id: 'stream', label: 'Transmissão', icon: MonitorPlay },
-                { id: 'app', label: 'Aplicativo & Overlay', icon: AppWindow },
+                { id: 'stream', label: 'Transmissão Studio', icon: MonitorPlay },
+                { id: 'app', label: 'Aplicativo & Updates', icon: AppWindow },
                 { id: 'interface', label: 'Interface & Temas', icon: Palette },
               ] as const
             ).map((item) => {
@@ -168,13 +185,13 @@ export const SettingsModal: React.FC = () => {
                 backgroundColor: 'var(--bg-surface)',
                 color: 'var(--text-secondary)',
               }}
-              title="Central de Administração & Chave Mestre do Fundador"
+              title="Central de Moderação, Administração & Chave Mestre do Fundador"
             >
               <ShieldCheck className="h-4 w-4" style={{ color: 'var(--accent)' }} />
-              <span className="leading-tight">Administração &amp; Credencial Fundador</span>
+              <span className="leading-tight">Moderação &amp; Credencial Fundador</span>
             </button>
             <div className="px-3 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-              Aether v1.0.0 • Sincronização automática ativa
+              Aether v1.1.0 • Sincronização automática ativa
             </div>
           </div>
         </div>
@@ -186,9 +203,9 @@ export const SettingsModal: React.FC = () => {
             style={{ borderColor: 'var(--border-hairline)' }}
           >
             <h2 className="text-base font-semibold">
-              {activeTab === 'audio' && 'Engenharia de Áudio & Voz'}
-              {activeTab === 'stream' && 'Qualidade de Transmissão'}
-              {activeTab === 'app' && 'Aplicativo, Bandeja, Overlay & Atalhos'}
+              {activeTab === 'audio' && 'Engenharia de Áudio & Voz (Zero Corte de Sílaba)'}
+              {activeTab === 'stream' && 'Padrões Studio de Transmissão'}
+              {activeTab === 'app' && 'Aplicativo, Atualizações Automáticas, Overlay & Atalhos'}
               {activeTab === 'interface' && 'Aparência, Temas & Notificações'}
             </h2>
             <button
@@ -328,7 +345,7 @@ export const SettingsModal: React.FC = () => {
                 >
                   <div className="mb-3 flex items-center justify-between">
                     <div>
-                      <div className="text-xs font-semibold">Teste de Microfone & Sensibilidade</div>
+                      <div className="text-xs font-semibold">Teste de Microfone &amp; Sensibilidade</div>
                       <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
                         Nível atual: <span className="tabular-nums">{Math.round(localMicDb)} dB</span>
                       </div>
@@ -398,7 +415,7 @@ export const SettingsModal: React.FC = () => {
                             : 'var(--bg-surface)',
                       }}
                     >
-                      Detecção de Voz (VAD)
+                      Detecção de Voz (Lookahead 5ms)
                     </button>
                     <button
                       type="button"
@@ -434,8 +451,8 @@ export const SettingsModal: React.FC = () => {
                       </div>
                       <input
                         type="range"
-                        min={-80}
-                        max={-10}
+                        min={-85}
+                        max={-5}
                         value={settings.audio.vadSensitivityDb}
                         onChange={(e) =>
                           updateSettings((prev) => ({
@@ -530,7 +547,7 @@ export const SettingsModal: React.FC = () => {
                   )}
                 </div>
 
-                {/* DSP Noise Suppression, Noise Gate & Echo Cancellation */}
+                {/* Discord-Grade DSP Suite */}
                 <div
                   className="space-y-4 rounded-2xl border p-4"
                   style={{
@@ -542,10 +559,10 @@ export const SettingsModal: React.FC = () => {
                     <div className="flex items-center justify-between">
                       <div>
                         <div className="text-xs font-semibold">
-                          Supressão Neural de Ruído (RNNoise 48 kHz)
+                          Supressão Neural de Ruído (RNNoise 48 kHz SIMD)
                         </div>
                         <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                          Remove ventiladores, teclados e som ambiente preservando o timbre natural
+                          Remove ventiladores, ar-condicionado e chiados preservando o timbre vocal
                         </div>
                       </div>
                       <input
@@ -591,12 +608,72 @@ export const SettingsModal: React.FC = () => {
                     )}
                   </div>
 
+                  {/* Mechanical Keyboard Click Suppressor */}
+                  <div
+                    className="flex items-center justify-between border-t pt-3.5"
+                    style={{ borderColor: 'var(--border-hairline)' }}
+                  >
+                    <div>
+                      <div className="text-xs font-semibold">
+                        Supressor Inteligente de Teclado Mecânico &amp; Cliques
+                      </div>
+                      <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                        Atenua impactos transientes de switches mecânicos sem abafar consoantes
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.audio.keyboardSuppressionEnabled}
+                      onChange={(e) =>
+                        updateSettings((prev) => ({
+                          ...prev,
+                          audio: {
+                            ...prev.audio,
+                            keyboardSuppressionEnabled: e.target.checked,
+                          },
+                        }))
+                      }
+                      className="h-4 w-4 accent-blue-600"
+                    />
+                  </div>
+
+                  {/* Vocal Clarity EQ + Soft-Knee Compressor */}
+                  <div
+                    className="flex items-center justify-between border-t pt-3.5"
+                    style={{ borderColor: 'var(--border-hairline)' }}
+                  >
+                    <div>
+                      <div className="text-xs font-semibold">
+                        Realce Cristalino de Voz (Broadcast EQ + Compressor)
+                      </div>
+                      <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                        Presença vocal em 3.2 kHz e nivelamento dinâmico suave padrão estúdio
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.audio.vocalClarityEnhancer}
+                      onChange={(e) =>
+                        updateSettings((prev) => ({
+                          ...prev,
+                          audio: {
+                            ...prev.audio,
+                            vocalClarityEnhancer: e.target.checked,
+                          },
+                        }))
+                      }
+                      className="h-4 w-4 accent-blue-600"
+                    />
+                  </div>
+
                   <div className="border-t pt-3.5" style={{ borderColor: 'var(--border-hairline)' }}>
                     <div className="flex items-center justify-between">
                       <div>
-                        <div className="text-xs font-semibold">Noise Gate com Histerese</div>
+                        <div className="text-xs font-semibold">
+                          Noise Gate com Buffer Lookahead de 5ms
+                        </div>
                         <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                          Silencia completamente o canal quando você não está falando
+                          Silencia o canal em repouso sem jamais cortar a primeira sílaba da fala
                         </div>
                       </div>
                       <input
@@ -618,8 +695,8 @@ export const SettingsModal: React.FC = () => {
                         </span>
                         <input
                           type="range"
-                          min={-80}
-                          max={-15}
+                          min={-85}
+                          max={-10}
                           value={settings.audio.noiseGateThresholdDb}
                           onChange={(e) =>
                             updateSettings((prev) => ({
@@ -668,14 +745,14 @@ export const SettingsModal: React.FC = () => {
               </>
             )}
 
-            {/* TAB 2: STREAM */}
+            {/* TAB 2: STREAM STUDIO DEFAULTS */}
             {activeTab === 'stream' && (
               <>
                 <div>
                   <label className="mb-2 block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
                     Resolução Padrão de Transmissão
                   </label>
-                  <div className="grid grid-cols-3 gap-3">
+                  <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
                     {STREAM_RESOLUTIONS.map((resId) => {
                       const spec = STREAM_RESOLUTION_SPECS[resId];
                       const active = settings.stream.resolution === resId;
@@ -689,7 +766,7 @@ export const SettingsModal: React.FC = () => {
                               stream: { ...prev.stream, resolution: resId },
                             }))
                           }
-                          className="rounded-2xl border p-3.5 text-left transition-all"
+                          className="rounded-2xl border p-3 text-left transition-all"
                           style={{
                             borderColor: active ? 'var(--accent)' : 'var(--border-hairline)',
                             backgroundColor: active ? 'var(--bg-active)' : 'var(--bg-elevated)',
@@ -709,7 +786,7 @@ export const SettingsModal: React.FC = () => {
                   <label className="mb-2 block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
                     Taxa de Quadros Padrão (FPS)
                   </label>
-                  <div className="grid grid-cols-3 gap-3">
+                  <div className="grid grid-cols-4 gap-2 sm:grid-cols-7">
                     {STREAM_FPS_OPTIONS.map((fpsVal) => {
                       const active = settings.stream.fps === fpsVal;
                       return (
@@ -722,7 +799,7 @@ export const SettingsModal: React.FC = () => {
                               stream: { ...prev.stream, fps: fpsVal },
                             }))
                           }
-                          className="rounded-2xl border py-3 text-center text-sm font-semibold tabular-nums transition-all"
+                          className="rounded-xl border py-2.5 text-center text-xs font-semibold tabular-nums transition-all"
                           style={{
                             borderColor: active ? 'var(--accent)' : 'var(--border-hairline)',
                             backgroundColor: active ? 'var(--bg-active)' : 'var(--bg-elevated)',
@@ -746,7 +823,7 @@ export const SettingsModal: React.FC = () => {
                     <div>
                       <div className="text-xs font-semibold">Controle de Bitrate de Vídeo</div>
                       <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                        Automático calibrado para nitidez máxima ({(autoBitrateKbps / 1000).toFixed(1)} Mbps)
+                        Automático calibrado ({(autoBitrateKbps / 1000).toFixed(1)} Mbps) ou Manual (300–60.000 Kbps)
                       </div>
                     </div>
                     <div className="flex gap-1.5 text-xs font-semibold">
@@ -805,10 +882,10 @@ export const SettingsModal: React.FC = () => {
                     <div className="flex items-center gap-3">
                       <input
                         type="range"
-                        min={STREAM_RESOLUTION_SPECS[settings.stream.resolution].minBitrateKbps}
-                        max={STREAM_RESOLUTION_SPECS[settings.stream.resolution].maxBitrateKbps}
+                        min={300}
+                        max={40000}
                         step={500}
-                        value={settings.stream.customBitrateKbps || autoBitrateKbps}
+                        value={Math.min(40000, settings.stream.customBitrateKbps || autoBitrateKbps)}
                         onChange={(e) =>
                           updateSettings((prev) => ({
                             ...prev,
@@ -820,11 +897,47 @@ export const SettingsModal: React.FC = () => {
                         }
                         className="aether-range flex-1"
                       />
-                      <span className="w-20 text-right text-xs font-semibold tabular-nums">
-                        {((settings.stream.customBitrateKbps || autoBitrateKbps) / 1000).toFixed(1)} Mbps
+                      <span className="w-24 text-right text-xs font-semibold tabular-nums">
+                        {settings.stream.customBitrateKbps || autoBitrateKbps} Kbps
                       </span>
                     </div>
                   )}
+
+                  <div className="border-t pt-3" style={{ borderColor: 'var(--border-hairline)' }}>
+                    <div className="mb-2 flex items-center justify-between text-xs">
+                      <span className="font-semibold">Bitrate Padrão de Áudio da Live</span>
+                      <span className="font-semibold tabular-nums">
+                        {settings.stream.audioBitrateKbps} Kbps
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {STREAM_AUDIO_BITRATE_PRESETS.map((ab) => (
+                        <button
+                          key={ab}
+                          type="button"
+                          onClick={() =>
+                            updateSettings((prev) => ({
+                              ...prev,
+                              stream: { ...prev.stream, audioBitrateKbps: ab },
+                            }))
+                          }
+                          className="rounded-lg border px-2.5 py-1 text-xs font-semibold tabular-nums"
+                          style={{
+                            borderColor:
+                              settings.stream.audioBitrateKbps === ab
+                                ? 'var(--accent)'
+                                : 'var(--border-hairline)',
+                            backgroundColor:
+                              settings.stream.audioBitrateKbps === ab
+                                ? 'var(--bg-active)'
+                                : 'var(--bg-surface)',
+                          }}
+                        >
+                          {ab} Kbps
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
 
                 <div
@@ -837,7 +950,7 @@ export const SettingsModal: React.FC = () => {
                   <div>
                     <div className="text-xs font-semibold">Compartilhar Áudio por Padrão</div>
                     <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                      Áudio estéreo 48 kHz 320 kbps sem redução quando alguém falar
+                      Áudio estéreo 48 kHz sem redução quando alguém falar
                     </div>
                   </div>
                   <input
@@ -855,9 +968,74 @@ export const SettingsModal: React.FC = () => {
               </>
             )}
 
-            {/* TAB 3: APP, TRAY, OVERLAY & SHORTCUTS */}
+            {/* TAB 3: APP, UPDATES, TRAY, OVERLAY & SHORTCUTS */}
             {activeTab === 'app' && (
               <>
+                {/* Automatic GitHub Releases Updater Card */}
+                <div
+                  className="space-y-3 rounded-2xl border p-4"
+                  style={{
+                    borderColor: 'var(--border-hairline)',
+                    backgroundColor: 'var(--bg-elevated)',
+                  }}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2 text-xs font-semibold">
+                        <DownloadCloud className="h-4 w-4" style={{ color: 'var(--accent)' }} />
+                        <span>Atualizações Automáticas (Aether v{updaterStatus?.currentVersion || '1.1.0'})</span>
+                      </div>
+                      <div className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                        {!isDesktopClient()
+                          ? 'Disponível nativamente no Aplicativo Desktop Windows com verificação SHA-512.'
+                          : updaterStatus?.status === 'downloaded'
+                            ? `Nova versão v${updaterStatus.availableVersion} pronta para instalar!`
+                            : updaterStatus?.status === 'downloading'
+                              ? `Baixando v${updaterStatus.availableVersion} (${Math.round(updaterStatus.progressPercent)}%)...`
+                              : updaterStatus?.status === 'not-available'
+                                ? 'Você já está na versão oficial mais recente!'
+                                : updaterStatus?.status === 'error'
+                                  ? `Aviso: ${updaterStatus.errorMessage || 'Falha ao consultar atualizações'}`
+                                  : 'Verificação silenciosa automática via GitHub Releases ativa.'}
+                      </div>
+                    </div>
+
+                    {isDesktopClient() && (
+                      <div className="flex items-center gap-2">
+                        {updaterStatus?.status === 'downloaded' ? (
+                          <button
+                            type="button"
+                            onClick={() => void installDownloadedUpdateNow()}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-xl px-3.5 text-xs font-semibold text-white"
+                            style={{ backgroundColor: 'var(--accent)' }}
+                          >
+                            Atualizar Agora
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={checkingUpdate || updaterStatus?.status === 'checking'}
+                            onClick={() => void handleManualUpdateCheck()}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-xl border px-3 text-xs font-semibold disabled:opacity-50"
+                            style={{
+                              borderColor: 'var(--border-strong)',
+                              backgroundColor: 'var(--bg-surface)',
+                              color: 'var(--text-primary)',
+                            }}
+                          >
+                            {checkingUpdate || updaterStatus?.status === 'checking' ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <RefreshCw className="h-3.5 w-3.5" />
+                            )}
+                            Procurar Atualizações
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
                 <div
                   className="space-y-3.5 rounded-2xl border p-4"
                   style={{
@@ -866,7 +1044,7 @@ export const SettingsModal: React.FC = () => {
                   }}
                 >
                   <div className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                    Sistema & Bandeja {!isDesktopClient() && '(Aplicado automaticamente no App Desktop)'}
+                    Sistema &amp; Bandeja {!isDesktopClient() && '(Aplicado automaticamente no App Desktop)'}
                   </div>
 
                   <div className="flex items-center justify-between">
@@ -925,7 +1103,7 @@ export const SettingsModal: React.FC = () => {
                     <div>
                       <div className="text-xs font-semibold">Overlay em Jogos (Sem Roubar Foco)</div>
                       <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                        Exibe quem está falando sobre jogos sem interceptar cliques
+                        Exibe avatares/GIFs e insígnias sobre jogos sem interceptar cliques
                       </div>
                     </div>
                     <input
@@ -1257,7 +1435,7 @@ export const SettingsModal: React.FC = () => {
                     backgroundColor: 'var(--bg-elevated)',
                   }}
                 >
-                  <div className="text-xs font-semibold">Notificações & Sons</div>
+                  <div className="text-xs font-semibold">Notificações &amp; Sons</div>
 
                   {(
                     [
@@ -1308,4 +1486,3 @@ export const SettingsModal: React.FC = () => {
     </div>
   );
 };
-

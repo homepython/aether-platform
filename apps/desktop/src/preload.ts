@@ -3,7 +3,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 contextBridge.exposeInMainWorld('aetherDesktop', {
   isDesktop: true,
   platform: process.platform,
-  appVersion: '1.0.0',
+  appVersion: '1.1.0',
   defaultServerUrl: process.env.AETHER_SERVER_URL || 'https://aether-platform.onrender.com',
 
   minimizeWindow: () => ipcRenderer.send('window:minimize'),
@@ -13,6 +13,19 @@ contextBridge.exposeInMainWorld('aetherDesktop', {
   setAutoStart: (enabled: boolean) => ipcRenderer.invoke('app:setAutoStart', enabled),
   getAutoStart: () => ipcRenderer.invoke('app:getAutoStart'),
 
+  updater: {
+    getStatus: () => ipcRenderer.invoke('updater:getStatus'),
+    check: () => ipcRenderer.invoke('updater:check'),
+    quitAndInstall: () => ipcRenderer.invoke('updater:quitAndInstall'),
+    onStatus: (cb: (status: unknown) => void) => {
+      const listener = (_ev: unknown, status: unknown) => cb(status);
+      ipcRenderer.on('updater:status', listener);
+      return () => {
+        ipcRenderer.removeListener('updater:status', listener);
+      };
+    },
+  },
+
   secureVault: {
     saveSession: (data: { refreshToken: string; serverUrl?: string }) =>
       ipcRenderer.invoke('vault:saveSession', data),
@@ -20,14 +33,19 @@ contextBridge.exposeInMainWorld('aetherDesktop', {
     clearSession: () => ipcRenderer.invoke('vault:clearSession'),
   },
 
+  getCaptureAccessStatus: () => ipcRenderer.invoke('capture:getAccessStatus'),
+  openCaptureSystemPermissions: () => ipcRenderer.invoke('capture:openSystemPermissions'),
   listCaptureSources: () => ipcRenderer.invoke('capture:listSources'),
   prepareDisplayMedia: (sourceId: string) =>
     ipcRenderer.invoke('capture:prepareDisplayMedia', sourceId),
 
+  listAudioSessions: () => ipcRenderer.invoke('audio:listSessions'),
+
   startProcessLoopback: (options: {
-    mode: 'exclude-self' | 'include-process';
+    mode: 'exclude-self' | 'include-process' | 'include-multi';
     targetPid?: number;
     targetHwnd?: number;
+    targetPids?: number[];
   }) => ipcRenderer.invoke('audio:startProcessLoopback', options),
 
   stopProcessLoopback: () => ipcRenderer.invoke('audio:stopProcessLoopback'),

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   HeadphoneOff,
   Headphones,
@@ -14,19 +14,24 @@ import {
   Settings,
   ShieldCheck,
   Trash2,
+  UserCog,
+  Users,
   Volume2,
 } from 'lucide-react';
 import { hasRoleAtLeast, type RoomSummary } from '@aether/shared';
 import { useAppStore } from '../store/useAppStore.js';
-import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
+import { StyledUserName, UserAvatar, UserRoleBadge } from './UserIdentity.js';
 
 export const SidebarRooms: React.FC = () => {
   const user = useAppStore((s) => s.user);
   const wsConnected = useAppStore((s) => s.wsConnected);
+  const navView = useAppStore((s) => s.navView);
+  const setNavView = useAppStore((s) => s.setNavView);
   const rooms = useAppStore((s) => s.rooms);
   const currentRoom = useAppStore((s) => s.currentRoom);
   const joiningRoomId = useAppStore((s) => s.joiningRoomId);
   const activeStreams = useAppStore((s) => s.activeStreams);
+  const friends = useAppStore((s) => s.friends);
 
   const micMuted = useAppStore((s) => s.micMuted);
   const deafened = useAppStore((s) => s.deafened);
@@ -38,10 +43,12 @@ export const SidebarRooms: React.FC = () => {
   const toggleMicMute = useAppStore((s) => s.toggleMicMute);
   const toggleDeafen = useAppStore((s) => s.toggleDeafen);
   const openSettings = useAppStore((s) => s.openSettings);
+  const setProfileModalOpen = useAppStore((s) => s.setProfileModalOpen);
   const setAdminModalOpen = useAppStore((s) => s.setAdminModalOpen);
   const setCreateRoomModalOpen = useAppStore((s) => s.setCreateRoomModalOpen);
   const setStreamLauncherOpen = useAppStore((s) => s.setStreamLauncherOpen);
   const stopBroadcast = useAppStore((s) => s.stopBroadcast);
+  const refreshFriends = useAppStore((s) => s.refreshFriends);
   const logout = useAppStore((s) => s.logout);
   const pushToast = useAppStore((s) => s.pushToast);
 
@@ -49,10 +56,28 @@ export const SidebarRooms: React.FC = () => {
   const [roomPassword, setRoomPassword] = useState('');
   const [passwordError, setPasswordError] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (wsConnected && user) {
+      void refreshFriends().catch(() => {});
+    }
+  }, [wsConnected, user?.id, refreshFriends]);
+
+  const friendsAttentionBadge = useMemo(() => {
+    let count = 0;
+    for (const f of friends) {
+      if (f.status === 'pending_incoming') count += 1;
+      count += f.unreadDmCount || 0;
+    }
+    return count;
+  }, [friends]);
+
   const myActiveStream = activeStreams.find((s) => s.broadcasterId === user?.id) || null;
 
   const handleRoomClick = async (room: RoomSummary) => {
-    if (currentRoom?.id === room.id) return;
+    if (currentRoom?.id === room.id) {
+      setNavView('rooms');
+      return;
+    }
     try {
       await joinRoom(room.id, null);
     } catch (err) {
@@ -87,7 +112,8 @@ export const SidebarRooms: React.FC = () => {
   const privateRooms = rooms.filter((r) => r.isPrivate);
 
   const renderRoomItem = (room: RoomSummary) => {
-    const isActive = currentRoom?.id === room.id;
+    const isActive = currentRoom?.id === room.id && navView === 'rooms';
+    const isConnectedRoom = currentRoom?.id === room.id;
     const isJoining = joiningRoomId === room.id;
     const isOwner = user?.id === room.ownerId;
 
@@ -99,8 +125,18 @@ export const SidebarRooms: React.FC = () => {
           disabled={isJoining}
           className="flex w-full flex-col gap-1.5 rounded-xl px-3 py-2.5 text-left transition-all"
           style={{
-            backgroundColor: isActive ? 'var(--bg-active)' : 'transparent',
-            border: `1px solid ${isActive ? 'var(--border-focus)' : 'transparent'}`,
+            backgroundColor: isActive
+              ? 'var(--bg-active)'
+              : isConnectedRoom
+                ? 'var(--bg-elevated)'
+                : 'transparent',
+            border: `1px solid ${
+              isActive
+                ? 'var(--border-focus)'
+                : isConnectedRoom
+                  ? 'var(--border-hairline)'
+                  : 'transparent'
+            }`,
           }}
         >
           <div className="flex w-full items-center justify-between gap-2">
@@ -110,12 +146,14 @@ export const SidebarRooms: React.FC = () => {
               ) : (
                 <Volume2
                   className="h-3.5 w-3.5 shrink-0"
-                  style={{ color: isActive ? 'var(--accent)' : 'var(--text-secondary)' }}
+                  style={{
+                    color: isConnectedRoom ? 'var(--voice-green)' : 'var(--text-secondary)',
+                  }}
                 />
               )}
               <span
                 className="truncate text-sm font-medium"
-                style={{ color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)' }}
+                style={{ color: isConnectedRoom ? 'var(--text-primary)' : 'var(--text-secondary)' }}
               >
                 {room.name}
               </span>
@@ -163,13 +201,19 @@ export const SidebarRooms: React.FC = () => {
                     boxShadow: p.speaking ? '0 0 0 1.5px var(--voice-green)' : 'none',
                   }}
                 >
-                  <span
-                    className="h-2 w-2 rounded-full"
-                    style={{ backgroundColor: p.speaking ? 'var(--voice-green)' : p.avatarColor }}
+                  <UserAvatar
+                    user={{
+                      displayName: p.displayName,
+                      avatarColor: p.avatarColor,
+                      avatarUrl: p.avatarUrl,
+                    }}
+                    size="xs"
+                    className="!h-4 !w-4 !text-[8px]"
                   />
-                  <span className="max-w-[96px] truncate">
+                  <span className="max-w-[92px] truncate">
                     <StyledUserName name={p.displayName} role={p.role} />
                   </span>
+                  <UserRoleBadge role={p.role} compact />
                 </div>
               ))}
             </div>
@@ -223,7 +267,15 @@ export const SidebarRooms: React.FC = () => {
             A
           </div>
           <div>
-            <div className="text-sm font-semibold leading-tight">Aether</div>
+            <div className="flex items-center gap-1.5 text-sm font-semibold leading-tight">
+              <span>Aether</span>
+              <span
+                className="rounded px-1 py-0.2 text-[9px] font-bold uppercase"
+                style={{ backgroundColor: 'var(--accent-soft)', color: 'var(--accent)' }}
+              >
+                v1.1
+              </span>
+            </div>
             <div className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
               <span
                 className="h-1.5 w-1.5 rounded-full"
@@ -249,8 +301,47 @@ export const SidebarRooms: React.FC = () => {
         </button>
       </div>
 
+      {/* Primary Mode Switcher: Salas de Voz vs Amigos & DMs */}
+      <div className="border-b px-3 py-2.5" style={{ borderColor: 'var(--border-hairline)' }}>
+        <div
+          className="grid grid-cols-2 gap-1 rounded-xl p-1"
+          style={{ backgroundColor: 'var(--bg-surface)' }}
+        >
+          <button
+            type="button"
+            onClick={() => setNavView('rooms')}
+            className="flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs font-semibold transition-all"
+            style={{
+              backgroundColor: navView === 'rooms' ? 'var(--accent)' : 'transparent',
+              color: navView === 'rooms' ? '#ffffff' : 'var(--text-secondary)',
+            }}
+          >
+            <Volume2 className="h-3.5 w-3.5" />
+            <span>Salas</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setNavView('friends')}
+            className="flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs font-semibold transition-all"
+            style={{
+              backgroundColor: navView === 'friends' ? 'var(--accent)' : 'transparent',
+              color: navView === 'friends' ? '#ffffff' : 'var(--text-secondary)',
+            }}
+          >
+            <Users className="h-3.5 w-3.5" />
+            <span>Amigos &amp; DMs</span>
+            {friendsAttentionBadge > 0 && (
+              <span className="rounded-full bg-red-500 px-1.5 text-[10px] font-bold text-white">
+                {friendsAttentionBadge}
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+
       {/* Rooms Scroll Area */}
-      <div className="flex-1 space-y-5 overflow-y-auto px-3 py-4">
+      <div className="flex-1 space-y-5 overflow-y-auto px-3 py-3.5">
         <div>
           <div className="mb-1.5 flex items-center justify-between px-2">
             <span
@@ -281,14 +372,18 @@ export const SidebarRooms: React.FC = () => {
       {/* Active Voice & Stream Quick Bar */}
       {currentRoom && (
         <div
-          className="border-t px-3.5 py-3"
+          className="border-t px-3.5 py-2.5"
           style={{
             borderColor: 'var(--border-hairline)',
             backgroundColor: 'var(--bg-surface)',
           }}
         >
           <div className="flex items-center justify-between gap-2">
-            <div className="min-w-0">
+            <div
+              className="min-w-0 cursor-pointer"
+              onClick={() => setNavView('rooms')}
+              title="Voltar para a sala ativa"
+            >
               <div
                 className="flex items-center gap-1.5 text-[11px] font-semibold"
                 style={{ color: 'var(--voice-green)' }}
@@ -301,7 +396,7 @@ export const SidebarRooms: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-1.5">
+            <div className="flex shrink-0 items-center gap-1.5">
               {myActiveStream ? (
                 <button
                   type="button"
@@ -315,7 +410,10 @@ export const SidebarRooms: React.FC = () => {
               ) : (
                 <button
                   type="button"
-                  onClick={() => setStreamLauncherOpen(true)}
+                  onClick={() => {
+                    setNavView('rooms');
+                    setStreamLauncherOpen(true);
+                  }}
                   className="inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold text-white transition-opacity hover:opacity-90"
                   style={{ backgroundColor: 'var(--accent)' }}
                   title="Transmitir tela ou jogo"
@@ -343,42 +441,53 @@ export const SidebarRooms: React.FC = () => {
         </div>
       )}
 
-      {/* Personal Control Dock */}
+      {/* 2-Row Personal Control Dock (Zero Overlap Between Identity & Buttons!) */}
       {user && (
         <div
-          className="flex items-center justify-between gap-2 border-t px-3.5 py-3"
+          className="space-y-2 border-t px-3 py-2.5"
           style={{
             borderColor: 'var(--border-hairline)',
             backgroundColor: 'var(--bg-sidebar)',
           }}
         >
-          <div className="flex min-w-0 items-center gap-2.5">
-            <div
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white transition-shadow"
-              style={{
-                backgroundColor: user.avatarColor,
-                boxShadow: localSpeaking ? '0 0 0 2.5px var(--voice-green)' : 'none',
-              }}
-            >
-              {user.displayName.slice(0, 2).toUpperCase()}
-            </div>
-            <div className="min-w-0">
+          {/* Row 1: Full-width Clickable Identity Card */}
+          <button
+            type="button"
+            onClick={() => setProfileModalOpen(true)}
+            title="Clique para editar seu perfil, avatar/GIF e @nickname"
+            className="flex w-full items-center gap-2.5 rounded-xl px-2 py-1.5 text-left transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+          >
+            <UserAvatar
+              user={user}
+              size="md"
+              speaking={localSpeaking}
+              showPresence
+              isOnline={wsConnected}
+            />
+            <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-1.5 text-xs">
-                <StyledUserName name={user.displayName} role={user.role} />
+                <StyledUserName name={user.displayName} role={user.role} className="font-semibold" />
                 <UserRoleBadge role={user.role} compact />
               </div>
               <div className="truncate text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                @{user.username}
+                @{user.username} • {user.presenceStatus === 'busy' ? 'Ocupado' : 'Online'}
               </div>
             </div>
-          </div>
+          </button>
 
-          <div className="flex shrink-0 items-center gap-1">
+          {/* Row 2: Dedicated Action Controls Strip */}
+          <div
+            className="flex items-center justify-between gap-1 rounded-xl border px-1.5 py-1"
+            style={{
+              borderColor: 'var(--border-hairline)',
+              backgroundColor: 'var(--bg-surface)',
+            }}
+          >
             <button
               type="button"
               onClick={toggleMicMute}
               title={micMuted ? 'Ativar Microfone' : 'Silenciar Microfone'}
-              className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors"
+              className="flex h-8 flex-1 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
               style={{
                 backgroundColor: micMuted ? 'var(--live-red-soft)' : 'transparent',
                 color: micMuted ? 'var(--live-red)' : 'var(--text-secondary)',
@@ -391,7 +500,7 @@ export const SidebarRooms: React.FC = () => {
               type="button"
               onClick={toggleDeafen}
               title={deafened ? 'Reativar Áudio' : 'Desativar Áudio de Voz'}
-              className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors"
+              className="flex h-8 flex-1 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
               style={{
                 backgroundColor: deafened ? 'var(--live-red-soft)' : 'transparent',
                 color: deafened ? 'var(--live-red)' : 'var(--text-secondary)',
@@ -402,21 +511,28 @@ export const SidebarRooms: React.FC = () => {
 
             <button
               type="button"
-              onClick={() => openSettings('audio')}
-              title="Configurações Completas"
-              className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+              onClick={() => setProfileModalOpen(true)}
+              title="Editar Meu Perfil & Avatar GIF"
+              className="flex h-8 flex-1 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
               style={{ color: 'var(--text-secondary)' }}
             >
-              <Settings className="h-4 w-4" />
+              <UserCog className="h-4 w-4" />
             </button>
 
             {hasRoleAtLeast(user.role, 'moderator') && (
               <button
                 type="button"
                 onClick={() => setAdminModalOpen(true)}
-                title="Central de Administração"
-                className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
-                style={{ color: user.role === 'owner' ? '#fbbf24' : '#60a5fa' }}
+                title="Central de Moderação & Administração"
+                className="flex h-8 flex-1 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+                style={{
+                  color:
+                    user.role === 'owner'
+                      ? '#fbbf24'
+                      : user.role === 'admin'
+                        ? '#60a5fa'
+                        : 'var(--voice-green)',
+                }}
               >
                 <ShieldCheck className="h-4 w-4" />
               </button>
@@ -424,9 +540,19 @@ export const SidebarRooms: React.FC = () => {
 
             <button
               type="button"
+              onClick={() => openSettings('audio')}
+              title="Configurações Completas"
+              className="flex h-8 flex-1 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              <Settings className="h-4 w-4" />
+            </button>
+
+            <button
+              type="button"
               onClick={() => void logout()}
               title="Sair da conta"
-              className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+              className="flex h-8 flex-1 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
               style={{ color: 'var(--text-muted)' }}
             >
               <LogOut className="h-3.5 w-3.5" />
@@ -499,4 +625,3 @@ export const SidebarRooms: React.FC = () => {
     </aside>
   );
 };
-

@@ -12,9 +12,12 @@ import {
   protocol,
   safeStorage,
   screen,
-  session,
+   session,
+  shell,
+  systemPreferences,
   Tray,
 } from 'electron';
+import { autoUpdater } from 'electron-updater';
 import { nativeHelper } from './nativeClient';
 
 // Register privileged secure custom scheme BEFORE app ready so AudioWorklet, WASM SIMD,
@@ -32,14 +35,12 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-// Critical Chromium flags for Zero Audio Ducking, Zero Unfocused FPS Drop & Hardware GPU Video Encode/Decode
+// Critical Chromium flags for Zero Audio Ducking, Zero Unfocused FPS Drop & Clean Hardware Video Encode/Decode
+// Intentionally omits WebRtcUseGpuMemoryBufferVideoFrames & ignore-gpu-blocklist to prevent black H.264 streams
+// on AMD/Intel GPUs and D3D11 lock contention in heavy DX12 games (e.g., Fortnite).
 app.commandLine.appendSwitch(
   'disable-features',
   'AudioDucking,WebRtcHybridAgc,CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes'
-);
-app.commandLine.appendSwitch(
-  'enable-features',
-  'WebRtcUseGpuMemoryBufferVideoFrames,MediaFoundationD3D11VideoCapture'
 );
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-background-timer-throttling');
@@ -49,8 +50,6 @@ app.commandLine.appendSwitch('enable-accelerated-video-decode');
 app.commandLine.appendSwitch('webrtc-max-cpu-consumption-percentage', '100');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('enable-gpu-rasterization');
-app.commandLine.appendSwitch('enable-zero-copy');
-app.commandLine.appendSwitch('ignore-gpu-blocklist');
 
 let mainWindow: BrowserWindow | null = null;
 let overlayWindow: BrowserWindow | null = null;
@@ -61,6 +60,111 @@ let activePowerBlockerId: number | null = null;
 let lastOverlayBoundsKey = '';
 let lastOverlayRenderJson = '';
 let overlayAlignRight = false;
+
+export interface UpdaterStatusPayload {
+  status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error';
+  currentVersion: string;
+  availableVersion: string | null;
+  releaseNotes: string | null;
+  progressPercent: number;
+  bytesPerSecond: number;
+  errorMessage: string | null;
+}
+
+let latestUpdaterStatus: UpdaterStatusPayload = {
+  status: 'idle',
+  currentVersion: app.getVersion() || '1.1.0',
+  availableVersion: null,
+  releaseNotes: null,
+  progressPercent: 0,
+  bytesPerSecond: 0,
+  errorMessage: null,
+};
+
+function emitUpdaterStatus(patch: Partial<UpdaterStatusPayload>): void {
+  latestUpdaterStatus = {
+    ...latestUpdaterStatus,
+    currentVersion: app.getVersion() || '1.1.0',
+    ...patch,
+  };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('updater:status', latestUpdaterStatus);
+  }
+}
+
+function configureAutoUpdater(): void {
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowDowngrade = false;
+
+  autoUpdater.on('checking-for-update', () => {
+    emitUpdaterStatus({ status: 'checking', errorMessage: null });
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    const rawNotes =
+      typeof info.releaseNotes === 'string'
+        ? info.releaseNotes
+        : Array.isArray(info.releaseNotes)
+          ? info.releaseNotes.map((n) => n.note || '').join('\n')
+          : null;
+    emitUpdaterStatus({
+      status: 'available',
+      availableVersion: info.version,
+      releaseNotes: rawNotes,
+      progressPercent: 0,
+      errorMessage: null,
+    });
+  });
+
+  autoUpdater.on('download-progress', (prog) => {
+    emitUpdaterStatus({
+      status: 'downloading',
+      progressPercent: Math.round((prog.percent || 0) * 10) / 10,
+      bytesPerSecond: Math.round(prog.bytesPerSecond || 0),
+    });
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    const rawNotes =
+      typeof info.releaseNotes === 'string'
+        ? info.releaseNotes
+        : Array.isArray(info.releaseNotes)
+          ? info.releaseNotes.map((n) => n.note || '').join('\n')
+          : latestUpdaterStatus.releaseNotes;
+    emitUpdaterStatus({
+      status: 'downloaded',
+      availableVersion: info.version,
+      releaseNotes: rawNotes,
+      progressPercent: 100,
+      errorMessage: null,
+    });
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    emitUpdaterStatus({
+      status: 'not-available',
+      errorMessage: null,
+    });
+  });
+
+  autoUpdater.on('error', (err) => {
+    emitUpdaterStatus({
+      status: 'error',
+      errorMessage: err?.message || 'Falha ao verificar atualizações',
+    });
+  });
+
+  if (app.isPackaged) {
+    setTimeout(() => {
+      void autoUpdater.checkForUpdates().catch(() => {});
+    }, 6000);
+
+    setInterval(() => {
+      void autoUpdater.checkForUpdates().catch(() => {});
+    }, 4 * 60 * 60 * 1000);
+  }
+}
 
 interface OverlayConfig {
   enabled: boolean;
@@ -119,6 +223,7 @@ const MIME_BY_EXT: Record<string, string> = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
+  '.gif': 'image/gif',
   '.ico': 'image/x-icon',
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
@@ -141,7 +246,6 @@ function registerAetherProtocol(): void {
 
       let targetFile = isInsideRoot ? candidate : path.join(rendererRoot, 'index.html');
       if (!fs.existsSync(targetFile) || fs.statSync(targetFile).isDirectory()) {
-        // SPA fallback only for extensionless navigation routes
         if (!path.extname(targetFile)) {
           targetFile = path.join(rendererRoot, 'index.html');
         } else {
@@ -168,6 +272,21 @@ function registerAetherProtocol(): void {
   });
 }
 
+function collectElectronPriorityPids(): { pids: number[]; highPriorityPids: number[] } {
+  const metrics = app.getAppMetrics();
+  const pids = metrics.map((m) => m.pid);
+  const highPriorityPids = metrics
+    .filter(
+      (m) =>
+        m.type === 'GPU' ||
+        m.type === 'Utility' ||
+        (typeof m.serviceName === 'string' &&
+          /video|capture|audio|gpu/i.test(m.serviceName))
+    )
+    .map((m) => m.pid);
+  return { pids, highPriorityPids };
+}
+
 function configureMediaAndDisplayPermissions(): void {
   const allowedPermissions = new Set([
     'media',
@@ -186,8 +305,6 @@ function configureMediaAndDisplayPermissions(): void {
     callback(allowedPermissions.has(permission));
   });
 
-  // Unified Windows Graphics Capture (WGC) handler for navigator.mediaDevices.getDisplayMedia()
-  // Ensures 100% identical capture behavior between Browser and Desktop Executable!
   session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
       const sources = await desktopCapturer.getSources({
@@ -313,10 +430,10 @@ function clearEncryptedVault(): void {
 function createMainWindow(): void {
   const iconPath = resolveIconPath('icon.ico');
   mainWindow = new BrowserWindow({
-    width: 1340,
-    height: 850,
-    minWidth: 960,
-    minHeight: 640,
+    width: 1360,
+    height: 860,
+    minWidth: 980,
+    minHeight: 650,
     frame: false,
     show: !process.argv.includes('--minimized'),
     backgroundColor: '#090a0d',
@@ -326,7 +443,7 @@ function createMainWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      backgroundThrottling: false, // Keep voice & WebRTC crisp when minimized to tray or playing games!
+      backgroundThrottling: false,
     },
   });
 
@@ -338,9 +455,9 @@ function createMainWindow(): void {
   }
 
   mainWindow.webContents.on('did-finish-load', () => {
-    // Immediately opt Electron Browser, GPU, and Renderer processes out of Windows 11 EcoQoS & unfocused timer throttling
-    const pids = app.getAppMetrics().map((m) => m.pid);
-    void nativeHelper.sendCommand('setBroadcastBoost', { active: false, pids });
+    const { pids, highPriorityPids } = collectElectronPriorityPids();
+    void nativeHelper.sendCommand('setBroadcastBoost', { active: false, pids, highPriorityPids });
+    mainWindow?.webContents.send('updater:status', latestUpdaterStatus);
   });
 
   mainWindow.on('close', (e) => {
@@ -439,8 +556,6 @@ function repositionOverlayIfNeeded(): void {
 
   overlayAlignRight = alignRight;
   const boundsKey = `${targetX}:${targetY}:${winW}:${winH}`;
-  // Never spam Win32 SetWindowPos on TOPMOST layered windows when bounds did not change!
-  // Preserves Windows DWM DirectFlip / Multiplane Overlay for full 1% low FPS in DirectX 11/12 & Vulkan games.
   if (boundsKey !== lastOverlayBoundsKey) {
     lastOverlayBoundsKey = boundsKey;
     overlayWindow.setBounds({ x: targetX, y: targetY, width: winW, height: winH });
@@ -499,7 +614,7 @@ function createSystemTray(): void {
     : nativeImage.createEmpty();
 
   tray = new Tray(icon);
-  tray.setToolTip('Aether — Voz, Chat & Transmissão em Tempo Real');
+  tray.setToolTip(`Aether v${app.getVersion() || '1.1.0'} — Voz, Chat & Transmissão`);
 
   const menu = Menu.buildFromTemplate([
     {
@@ -507,6 +622,15 @@ function createSystemTray(): void {
       click: () => {
         mainWindow?.show();
         mainWindow?.focus();
+      },
+    },
+    {
+      label: 'Verificar Atualizações',
+      click: () => {
+        mainWindow?.show();
+        if (app.isPackaged) {
+          void autoUpdater.checkForUpdates().catch(() => {});
+        }
       },
     },
     { type: 'separator' },
@@ -571,6 +695,38 @@ function registerIpcHandlers(): void {
     return app.getLoginItemSettings().openAtLogin;
   });
 
+  // Auto-Updater IPC
+  ipcMain.handle('updater:getStatus', () => {
+    return latestUpdaterStatus;
+  });
+
+  ipcMain.handle('updater:check', async () => {
+    if (!app.isPackaged) {
+      emitUpdaterStatus({ status: 'not-available', errorMessage: null });
+      return latestUpdaterStatus;
+    }
+    try {
+      await autoUpdater.checkForUpdates();
+    } catch (err) {
+      emitUpdaterStatus({
+        status: 'error',
+        errorMessage: err instanceof Error ? err.message : 'Erro ao buscar atualizações',
+      });
+    }
+    return latestUpdaterStatus;
+  });
+
+  ipcMain.handle('updater:quitAndInstall', () => {
+    if (latestUpdaterStatus.status === 'downloaded') {
+      isQuitting = true;
+      setImmediate(() => {
+        autoUpdater.quitAndInstall(false, true);
+      });
+      return { installing: true };
+    }
+    return { installing: false };
+  });
+
   // Encrypted Windows DPAPI Credential Vault IPC
   ipcMain.handle(
     'vault:saveSession',
@@ -586,6 +742,31 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('vault:clearSession', () => {
     clearEncryptedVault();
+  });
+
+  // Screen & Window Capture Diagnostics + Permission Reauthorization
+  ipcMain.handle('capture:getAccessStatus', () => {
+    try {
+      const screenAccess = systemPreferences.getMediaAccessStatus('screen');
+      const micAccess = systemPreferences.getMediaAccessStatus('microphone');
+      return { screenAccess, micAccess };
+    } catch {
+      return { screenAccess: 'granted', micAccess: 'granted' };
+    }
+  });
+
+  ipcMain.handle('capture:openSystemPermissions', async () => {
+    try {
+      await shell.openExternal('ms-settings:privacy-graphicscaptureprogrammatic');
+      return { opened: true };
+    } catch {
+      try {
+        await shell.openExternal('ms-settings:privacy');
+        return { opened: true };
+      } catch {
+        return { opened: false };
+      }
+    }
   });
 
   ipcMain.handle('capture:prepareDisplayMedia', (_ev, sourceId: string) => {
@@ -633,6 +814,12 @@ function registerIpcHandlers(): void {
     return results;
   });
 
+  // Real Windows WASAPI Active Audio Applications List + Multi-Process Loopback Mixer
+  ipcMain.handle('audio:listSessions', async () => {
+    const res = await nativeHelper.sendCommand('listAudioSessions');
+    return Array.isArray(res.sessions) ? res.sessions : [];
+  });
+
   ipcMain.handle('audio:startProcessLoopback', async (_ev, options: Record<string, unknown>) => {
     return nativeHelper.sendCommand('startLoopback', options);
   });
@@ -658,10 +845,11 @@ function registerIpcHandlers(): void {
       activePowerBlockerId = null;
     }
 
-    const pids = app.getAppMetrics().map((m) => m.pid);
+    const { pids, highPriorityPids } = collectElectronPriorityPids();
     return nativeHelper.sendCommand('setBroadcastBoost', {
       active: isBroadcasting,
       pids,
+      highPriorityPids,
     });
   });
 
@@ -675,7 +863,6 @@ function registerIpcHandlers(): void {
     syncOverlayVisibilityAndRender(false);
   });
 
-  // Forward Native Helper PCM frames & Global Input Hooks to Renderer
   nativeHelper.on('pcm', (buffer: ArrayBuffer) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('audio:pcmFrame', new Uint8Array(buffer));
@@ -695,7 +882,6 @@ function registerIpcHandlers(): void {
   });
 }
 
-// Register custom OS deep-link protocol (aether-app://open) so the official website can launch/focus Aether Desktop
 if (process.defaultApp) {
   if (process.argv.length >= 2) {
     app.setAsDefaultProtocolClient('aether-app', process.execPath, [path.resolve(process.argv[1])]);
@@ -725,6 +911,7 @@ if (!gotSingleLock) {
     createSystemTray();
     createMainWindow();
     createOverlayWindow();
+    configureAutoUpdater();
     screen.on('display-metrics-changed', () => {
       syncOverlayVisibilityAndRender(true);
     });

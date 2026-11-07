@@ -11,10 +11,36 @@ export interface DesktopCaptureSourceItem {
   pid?: number;
 }
 
+export interface DesktopAudioSessionItem {
+  pid: number;
+  processName: string;
+  displayName: string;
+  peak: number;
+  isPlaying: boolean;
+}
+
+export interface DesktopUpdaterStatus {
+  status:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'downloading'
+    | 'downloaded'
+    | 'not-available'
+    | 'error';
+  currentVersion: string;
+  availableVersion: string | null;
+  releaseNotes: string | null;
+  progressPercent: number;
+  bytesPerSecond: number;
+  errorMessage: string | null;
+}
+
 export interface OverlayParticipantState {
   userId: string;
   displayName: string;
   avatarColor: string;
+  avatarUrl?: string | null;
   role?: UserRole;
   speaking: boolean;
   micMuted: boolean;
@@ -38,21 +64,32 @@ export interface AetherDesktopApi {
   // App lifecycle settings
   setAutoStart: (enabled: boolean) => Promise<boolean>;
   getAutoStart: () => Promise<boolean>;
+  // Automatic GitHub Releases Updater (electron-updater with SHA-512 verification)
+  updater?: {
+    getStatus: () => Promise<DesktopUpdaterStatus>;
+    check: () => Promise<DesktopUpdaterStatus>;
+    quitAndInstall: () => Promise<{ installing: boolean }>;
+    onStatus: (cb: (status: DesktopUpdaterStatus) => void) => () => void;
+  };
   // Encrypted OS Credential Vault (Windows DPAPI via electron.safeStorage)
   secureVault: {
     saveSession: (data: { refreshToken: string; serverUrl?: string }) => Promise<boolean>;
     loadSession: () => Promise<DesktopSecureVaultSession>;
     clearSession: () => Promise<void>;
   };
-  // Screen & Game Window Capture (WGC Unified DisplayMedia + Source Picker)
+  // Screen & Game Window Capture (WGC Unified DisplayMedia + Source Picker + Permission Diagnostics)
+  getCaptureAccessStatus?: () => Promise<{ screenAccess: string; micAccess: string }>;
+  openCaptureSystemPermissions?: () => Promise<{ opened: boolean }>;
   listCaptureSources: () => Promise<DesktopCaptureSourceItem[]>;
   prepareDisplayMedia: (sourceId: string) => Promise<{ ok: boolean; error?: string }>;
-  // Native WASAPI Process-Isolated Audio Loopback (Zero Voice Echo!)
+  // Native WASAPI Active Audio Applications + Multi-Process Isolated Audio Loopback (Zero Voice Echo!)
+  listAudioSessions?: () => Promise<DesktopAudioSessionItem[]>;
   startProcessLoopback: (options: {
-    mode: 'exclude-self' | 'include-process';
+    mode: 'exclude-self' | 'include-process' | 'include-multi';
     targetPid?: number;
     targetHwnd?: number;
-  }) => Promise<{ ok: boolean; mode: string; error?: string }>;
+    targetPids?: number[];
+  }) => Promise<{ ok: boolean; mode?: string; count?: number; error?: string }>;
   stopProcessLoopback: () => Promise<void>;
   onLoopbackPcm: (cb: (pcmFloat32Buffer: ArrayBuffer) => void) => () => void;
   // Global Non-Blocking In-Game Push-To-Talk & Shortcuts

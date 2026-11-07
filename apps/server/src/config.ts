@@ -52,6 +52,7 @@ fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadsDir, { recursive: true });
 
 export const config = {
+  appVersion: '1.1.0',
   nodeEnv: process.env.NODE_ENV || 'development',
   isProduction: process.env.NODE_ENV === 'production',
   host: process.env.HOST || '0.0.0.0',
@@ -124,12 +125,15 @@ export const config = {
     preferUdp: true,
     rtcMinPort: Number(process.env.MEDIASOUP_MIN_PORT || 40000),
     rtcMaxPort: Number(process.env.MEDIASOUP_MAX_PORT || 40400),
-    initialAvailableOutgoingBitrate: 35_000_000, // 35 Mbps immediate start for ultra-crisp 1440p75
-    maxIncomingBitrate: 32_000_000,
+    initialAvailableOutgoingBitrate: 45_000_000,
+    maxIncomingBitrate: 65_000_000,
   },
 
   ice: {
-    stunUrls: (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478')
+    stunUrls: (
+      process.env.STUN_URLS ||
+      'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302,stun:stun2.l.google.com:19302,stun:stun.cloudflare.com:3478'
+    )
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),
@@ -143,7 +147,8 @@ export const config = {
     turnTtlSec: Number(process.env.TURN_TTL_SEC || 86400),
   },
 
-  maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES || 50 * 1024 * 1024), // 50 MB
+  maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES || 550 * 1024 * 1024), // 550 MB streaming uploads
+  maxAvatarBytes: Number(process.env.MAX_AVATAR_BYTES || 15 * 1024 * 1024), // 15 MB animated GIF / PNG / WebP avatars
 };
 
 /**
@@ -174,8 +179,9 @@ export function buildIceServersForUser(userId: string): IceServerConfig[] {
         username: config.ice.turnUsername,
         credential: config.ice.turnCredential,
       });
+    } else {
+      servers.push({ urls: config.ice.turnUrls });
     }
   }
   return servers;
 }
-

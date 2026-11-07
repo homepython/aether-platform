@@ -1,10 +1,13 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Eye,
+  Lock,
   Maximize2,
   Minimize2,
   Play,
+  RefreshCw,
   ShieldAlert,
+  ShieldCheck,
   Volume2,
   VolumeX,
   XCircle,
@@ -12,7 +15,7 @@ import {
 import { hasRoleAtLeast, ROLE_RANK, type ActiveStreamInfo } from '@aether/shared';
 import { useAppStore, type WatchedStreamViewState } from '../store/useAppStore.js';
 import { BroadcasterDeck } from './BroadcasterDeck.js';
-import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
+import { StyledUserName, UserAvatar, UserRoleBadge } from './UserIdentity.js';
 
 function useCanForceStop(info: ActiveStreamInfo): boolean {
   const user = useAppStore((s) => s.user);
@@ -69,10 +72,14 @@ const ActiveWatchedPlayer: React.FC<{
 }> = ({ info, watched }) => {
   const unwatchStream = useAppStore((s) => s.unwatchStream);
   const setWatchedStreamVolume = useAppStore((s) => s.setWatchedStreamVolume);
+  const switchWatchedStreamTransport = useAppStore((s) => s.switchWatchedStreamTransport);
+  const setInspectedUser = useAppStore((s) => s.setInspectedUser);
+  const pushToast = useAppStore((s) => s.pushToast);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const [isFullscreen, setIsFullscreen] = React.useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [switchingTransport, setSwitchingTransport] = useState(false);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -99,6 +106,21 @@ const ActiveWatchedPlayer: React.FC<{
     }
   };
 
+  const handleToggleCompatibilityMode = async () => {
+    const nextMode = watched.transportMode === 'relay' ? 'p2p' : 'relay';
+    setSwitchingTransport(true);
+    try {
+      await switchWatchedStreamTransport(info.streamId, nextMode);
+    } catch (err) {
+      pushToast({
+        title: 'Falha ao alternar rota da live',
+        body: err instanceof Error ? err.message : 'Tente novamente',
+      });
+    } finally {
+      setSwitchingTransport(false);
+    }
+  };
+
   const displayQuality =
     watched.stats.height > 0
       ? `${info.resolution} (${watched.stats.width}×${watched.stats.height})`
@@ -106,6 +128,13 @@ const ActiveWatchedPlayer: React.FC<{
 
   const displayFps =
     watched.stats.fps > 0 ? `${Math.round(watched.stats.fps)} FPS` : `${info.fps} FPS`;
+
+  const transportLabel =
+    watched.transportMode === 'relay'
+      ? 'Cloud Relay • Anti-Tela-Preta'
+      : watched.transportMode === 'sfu'
+        ? 'SFU Cloud'
+        : 'P2P Direto';
 
   return (
     <div
@@ -127,20 +156,58 @@ const ActiveWatchedPlayer: React.FC<{
       />
 
       {/* Top HUD Bar */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 flex items-center justify-between gap-2 bg-gradient-to-b from-black/75 via-black/35 to-transparent p-3.5 text-white">
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="pointer-events-none absolute inset-x-0 top-0 flex flex-wrap items-center justify-between gap-2 bg-gradient-to-b from-black/80 via-black/40 to-transparent p-3.5 text-white">
+        <div className="pointer-events-auto flex flex-wrap items-center gap-2">
           <span className="inline-flex items-center gap-1.5 rounded-full bg-red-600 px-2.5 py-0.5 text-[11px] font-bold uppercase tracking-wider text-white shadow">
             <span className="live-dot h-1.5 w-1.5 rounded-full bg-white" />
             AO VIVO
           </span>
-          <span className="inline-flex items-center gap-1.5 text-xs font-semibold drop-shadow">
+
+          <button
+            type="button"
+            onClick={() =>
+              setInspectedUser({
+                id: info.broadcasterId,
+                username: info.broadcasterUsername,
+                displayName: info.broadcasterDisplayName,
+                avatarColor: info.broadcasterAvatarColor,
+                avatarUrl: info.broadcasterAvatarUrl ?? null,
+                bio: '',
+                presenceStatus: 'online',
+                role: info.broadcasterRole,
+                createdAt: info.startedAt,
+              })
+            }
+            className="inline-flex items-center gap-1.5 text-xs font-semibold drop-shadow hover:underline"
+          >
+            <UserAvatar
+              user={{
+                displayName: info.broadcasterDisplayName,
+                avatarColor: info.broadcasterAvatarColor,
+                avatarUrl: info.broadcasterAvatarUrl,
+              }}
+              size="xs"
+            />
             <StyledUserName name={info.broadcasterDisplayName} role={info.broadcasterRole} />
             <UserRoleBadge role={info.broadcasterRole} compact />
-          </span>
+          </button>
+
           <span className="text-xs text-white/75">• {info.title}</span>
         </div>
 
-        <div className="flex items-center gap-2 text-[11px] font-semibold tabular-nums">
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-semibold tabular-nums">
+          <span
+            className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 backdrop-blur-md"
+            style={{
+              backgroundColor:
+                watched.transportMode === 'relay'
+                  ? 'rgba(16, 185, 129, 0.35)'
+                  : 'rgba(0, 0, 0, 0.6)',
+            }}
+          >
+            <ShieldCheck className="h-3 w-3" />
+            {transportLabel}
+          </span>
           <span className="rounded-md bg-black/60 px-2 py-0.5 backdrop-blur-md">
             {displayQuality}
           </span>
@@ -148,12 +215,13 @@ const ActiveWatchedPlayer: React.FC<{
           <span className="inline-flex items-center gap-1 rounded-md bg-black/60 px-2 py-0.5 backdrop-blur-md">
             <Eye className="h-3 w-3" />
             {info.viewerCount}
+            {info.viewerLimit ? `/${info.viewerLimit}` : ''}
           </span>
         </div>
       </div>
 
       {/* Bottom Interactive Controls */}
-      <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-3 bg-gradient-to-t from-black/85 via-black/45 to-transparent p-3.5 text-white opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+      <div className="absolute inset-x-0 bottom-0 flex flex-wrap items-center justify-between gap-3 bg-gradient-to-t from-black/85 via-black/45 to-transparent p-3.5 text-white opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
         <div className="flex items-center gap-2.5">
           {watched.hasAudio ? (
             <>
@@ -192,8 +260,26 @@ const ActiveWatchedPlayer: React.FC<{
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {info.relayActive && (
+            <button
+              type="button"
+              disabled={switchingTransport}
+              onClick={() => void handleToggleCompatibilityMode()}
+              title={
+                watched.transportMode === 'relay'
+                  ? 'Voltar para conexão direta P2P de menor latência'
+                  : 'Forçar Modo Compatibilidade via servidor (elimina tela preta em redes restritas)'
+              }
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-white/15 px-3 text-xs font-medium text-white backdrop-blur-md transition-colors hover:bg-emerald-600/80 disabled:opacity-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${switchingTransport ? 'animate-spin' : ''}`} />
+              {watched.transportMode === 'relay' ? 'Modo Direto P2P' : 'Modo Compatibilidade'}
+            </button>
+          )}
+
           <ForceStopButton info={info} variant="hud" />
+
           <button
             type="button"
             onClick={() => void unwatchStream(info.streamId)}
@@ -222,6 +308,7 @@ export const StreamStage: React.FC = () => {
   const activeStreams = useAppStore((s) => s.activeStreams);
   const watchedStreams = useAppStore((s) => s.watchedStreams);
   const watchStream = useAppStore((s) => s.watchStream);
+  const setInspectedUser = useAppStore((s) => s.setInspectedUser);
   const pushToast = useAppStore((s) => s.pushToast);
 
   if (activeStreams.length === 0) return null;
@@ -259,63 +346,128 @@ export const StreamStage: React.FC = () => {
           {unwatchedRemoteStreams.map((st) => (
             <div
               key={st.streamId}
-              className="flex flex-1 min-w-[280px] items-center justify-between gap-4 rounded-2xl border px-4 py-3"
+              className="flex min-w-[290px] flex-1 flex-wrap items-center justify-between gap-4 rounded-2xl border px-4 py-3"
               style={{
                 backgroundColor: 'var(--bg-surface)',
                 borderColor: 'var(--border-hairline)',
               }}
             >
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <span
-                    className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
-                    style={{
-                      backgroundColor: 'var(--live-red-soft)',
-                      color: 'var(--live-red)',
-                    }}
+              <div className="flex min-w-0 items-center gap-3">
+                <UserAvatar
+                  user={{
+                    displayName: st.broadcasterDisplayName,
+                    avatarColor: st.broadcasterAvatarColor,
+                    avatarUrl: st.broadcasterAvatarUrl,
+                  }}
+                  size="md"
+                  onClick={() =>
+                    setInspectedUser({
+                      id: st.broadcasterId,
+                      username: st.broadcasterUsername,
+                      displayName: st.broadcasterDisplayName,
+                      avatarColor: st.broadcasterAvatarColor,
+                      avatarUrl: st.broadcasterAvatarUrl ?? null,
+                      bio: '',
+                      presenceStatus: 'online',
+                      role: st.broadcasterRole,
+                      createdAt: st.startedAt,
+                    })
+                  }
+                />
+
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+                      style={{
+                        backgroundColor: 'var(--live-red-soft)',
+                        color: 'var(--live-red)',
+                      }}
+                    >
+                      <span className="live-dot h-1.5 w-1.5 rounded-full bg-current" />
+                      AO VIVO
+                    </span>
+                    <span className="inline-flex min-w-0 items-center gap-1.5 text-sm font-semibold">
+                      <StyledUserName
+                        name={st.broadcasterDisplayName}
+                        role={st.broadcasterRole}
+                      />
+                      <UserRoleBadge role={st.broadcasterRole} compact />
+                    </span>
+                    {st.privacy !== 'public' && (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium"
+                        style={{
+                          borderColor: 'var(--border-hairline)',
+                          color: 'var(--text-muted)',
+                        }}
+                      >
+                        <Lock className="h-2.5 w-2.5" />
+                        {st.privacy === 'friends' ? 'Amigos' : 'Privada'}
+                      </span>
+                    )}
+                  </div>
+                  <div
+                    className="mt-1 flex flex-wrap items-center gap-2 text-xs tabular-nums"
+                    style={{ color: 'var(--text-secondary)' }}
                   >
-                    <span className="live-dot h-1.5 w-1.5 rounded-full bg-current" />
-                    AO VIVO
-                  </span>
-                  <span className="inline-flex min-w-0 items-center gap-1.5 text-sm font-semibold">
-                    <StyledUserName name={st.broadcasterDisplayName} role={st.broadcasterRole} />
-                    <UserRoleBadge role={st.broadcasterRole} compact />
-                  </span>
-                </div>
-                <div
-                  className="mt-1 flex items-center gap-2 text-xs tabular-nums"
-                  style={{ color: 'var(--text-secondary)' }}
-                >
-                  <span className="truncate">{st.title}</span>
-                  <span>•</span>
-                  <span>
-                    {st.resolution} {st.fps} FPS
-                  </span>
-                  <span>•</span>
-                  <span className="inline-flex items-center gap-1">
-                    <Eye className="h-3 w-3" /> {st.viewerCount}
-                  </span>
+                    <span className="truncate">{st.title}</span>
+                    <span>•</span>
+                    <span>
+                      {st.resolution} {st.fps} FPS
+                    </span>
+                    <span>•</span>
+                    <span className="inline-flex items-center gap-1">
+                      <Eye className="h-3 w-3" /> {st.viewerCount}
+                      {st.viewerLimit ? `/${st.viewerLimit}` : ''}
+                    </span>
+                  </div>
                 </div>
               </div>
 
               <div className="flex shrink-0 items-center gap-2">
-              <ForceStopButton info={st} variant="card" />
-              <button
-                type="button"
-                onClick={() =>
-                  void watchStream(st.streamId).catch((err) =>
-                    pushToast({
-                      title: 'Falha ao abrir transmissão',
-                      body: err instanceof Error ? err.message : 'Tente novamente',
-                    })
-                  )
-                }
-                className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-xl px-4 text-xs font-semibold text-white transition-opacity hover:opacity-90"
-                style={{ backgroundColor: 'var(--accent)' }}
-              >
-                <Play className="h-3.5 w-3.5 fill-current" />
-                Assistir
-              </button>
+                <ForceStopButton info={st} variant="card" />
+
+                {st.relayActive && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void watchStream(st.streamId, 'relay').catch((err) =>
+                        pushToast({
+                          title: 'Falha ao abrir transmissão',
+                          body: err instanceof Error ? err.message : 'Tente novamente',
+                        })
+                      )
+                    }
+                    title="Assistir direto em Modo Compatibilidade (Cloud Relay anti-tela-preta)"
+                    className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-xl border px-3 text-xs font-semibold transition-opacity hover:opacity-90"
+                    style={{
+                      borderColor: 'var(--border-strong)',
+                      backgroundColor: 'var(--bg-elevated)',
+                      color: 'var(--text-primary)',
+                    }}
+                  >
+                    <ShieldCheck className="h-3.5 w-3.5" style={{ color: 'var(--voice-green)' }} />
+                    Compatibilidade
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    void watchStream(st.streamId).catch((err) =>
+                      pushToast({
+                        title: 'Falha ao abrir transmissão',
+                        body: err instanceof Error ? err.message : 'Tente novamente',
+                      })
+                    )
+                  }
+                  className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-xl px-4 text-xs font-semibold text-white transition-opacity hover:opacity-90"
+                  style={{ backgroundColor: 'var(--accent)' }}
+                >
+                  <Play className="h-3.5 w-3.5 fill-current" />
+                  Assistir
+                </button>
               </div>
             </div>
           ))}
@@ -324,4 +476,3 @@ export const StreamStage: React.FC = () => {
     </div>
   );
 };
-

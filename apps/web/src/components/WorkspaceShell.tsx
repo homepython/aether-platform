@@ -15,10 +15,13 @@ import {
 import { audioEngine } from '../audio/AudioEngine.js';
 import { getDesktopApi } from '../bridge/DesktopBridge.js';
 import { useAppStore } from '../store/useAppStore.js';
-import { ChatPanel } from './ChatPanel.js';
 import { AdminModal } from './AdminModal.js';
+import { AutoUpdateBanner, RolePromotionModal } from './AutoUpdateAndPromoBanners.js';
+import { ChatPanel } from './ChatPanel.js';
 import { CreateRoomModal } from './CreateRoomModal.js';
+import { FriendsAndDmView } from './FriendsAndDmView.js';
 import { ParticipantsDrawer } from './ParticipantsDrawer.js';
+import { ProfileModal, UserProfilePopoverModal } from './ProfileModal.js';
 import { SettingsModal } from './SettingsModal.js';
 import { SidebarRooms } from './SidebarRooms.js';
 import { StreamLauncherModal } from './StreamLauncherModal.js';
@@ -36,14 +39,15 @@ function matchesCombo(e: KeyboardEvent, combo: string): boolean {
 }
 
 export const WorkspaceShell: React.FC = () => {
+  const navView = useAppStore((s) => s.navView);
   const currentRoom = useAppStore((s) => s.currentRoom);
   const rooms = useAppStore((s) => s.rooms);
-  const participants = useAppStore((s) => s.participants);
   const activeStreams = useAppStore((s) => s.activeStreams);
   const user = useAppStore((s) => s.user);
   const settings = useAppStore((s) => s.settings);
 
   const joinRoom = useAppStore((s) => s.joinRoom);
+  const openDmWithUser = useAppStore((s) => s.openDmWithUser);
   const toggleMicMute = useAppStore((s) => s.toggleMicMute);
   const toggleDeafen = useAppStore((s) => s.toggleDeafen);
   const stopBroadcast = useAppStore((s) => s.stopBroadcast);
@@ -136,7 +140,10 @@ export const WorkspaceShell: React.FC = () => {
     const onMouseDown = (e: MouseEvent) => {
       const st = useAppStore.getState().settings;
       if (st.audio.voiceMode !== 'ptt') return;
-      if ((e.button === 3 && st.audio.pttKey === 'Mouse4') || (e.button === 4 && st.audio.pttKey === 'Mouse5')) {
+      if (
+        (e.button === 3 && st.audio.pttKey === 'Mouse4') ||
+        (e.button === 4 && st.audio.pttKey === 'Mouse5')
+      ) {
         audioEngine.setPushToTalkPressed(true);
       }
     };
@@ -144,7 +151,10 @@ export const WorkspaceShell: React.FC = () => {
     const onMouseUp = (e: MouseEvent) => {
       const st = useAppStore.getState().settings;
       if (st.audio.voiceMode !== 'ptt') return;
-      if ((e.button === 3 && st.audio.pttKey === 'Mouse4') || (e.button === 4 && st.audio.pttKey === 'Mouse5')) {
+      if (
+        (e.button === 3 && st.audio.pttKey === 'Mouse4') ||
+        (e.button === 4 && st.audio.pttKey === 'Mouse5')
+      ) {
         audioEngine.setPushToTalkPressed(false);
       }
     };
@@ -172,7 +182,11 @@ export const WorkspaceShell: React.FC = () => {
         className="flex min-w-0 flex-1 flex-col overflow-hidden"
         style={{ backgroundColor: 'var(--bg-canvas)' }}
       >
-        {currentRoom ? (
+        <AutoUpdateBanner />
+
+        {navView === 'friends' ? (
+          <FriendsAndDmView />
+        ) : currentRoom ? (
           <>
             {/* Room Top Bar */}
             <header
@@ -221,7 +235,7 @@ export const WorkspaceShell: React.FC = () => {
                     style={{ backgroundColor: 'var(--accent)' }}
                   >
                     <MonitorUp className="h-3.5 w-3.5" />
-                    Transmitir em 2K / 1080p
+                    Transmitir Tela / Jogo
                   </button>
                 )}
 
@@ -269,7 +283,7 @@ export const WorkspaceShell: React.FC = () => {
                     Escolha uma sala para conectar
                   </h2>
                   <p className="mt-1 text-sm" style={{ color: 'var(--text-secondary)' }}>
-                    Entrada instantânea em voz de baixa latência, chat rico e transmissões 1440p 75 FPS.
+                    Voz cristalina sem corte de sílaba, DMs privadas (550 MB) e lives Studio até 2K 144 FPS.
                   </p>
                 </div>
 
@@ -359,13 +373,16 @@ export const WorkspaceShell: React.FC = () => {
         )}
       </main>
 
-      {currentRoom && <ParticipantsDrawer />}
+      {currentRoom && navView === 'rooms' && <ParticipantsDrawer />}
 
       {/* Modals */}
       <CreateRoomModal />
       <StreamLauncherModal />
       <SettingsModal />
       <AdminModal />
+      <ProfileModal />
+      <UserProfilePopoverModal />
+      <RolePromotionModal />
 
       {/* Fullscreen Image Lightbox */}
       <AnimatePresence>
@@ -430,7 +447,9 @@ export const WorkspaceShell: React.FC = () => {
               <div
                 className="min-w-0 flex-1 cursor-pointer"
                 onClick={() => {
-                  if (t.roomId && t.roomId !== participants[0]?.peerId) {
+                  if (t.dmUserId) {
+                    void openDmWithUser(t.dmUserId);
+                  } else if (t.roomId) {
                     void joinRoom(t.roomId, null).catch(() => {});
                   }
                   dismissToast(t.id);
@@ -455,4 +474,3 @@ export const WorkspaceShell: React.FC = () => {
     </div>
   );
 };
-

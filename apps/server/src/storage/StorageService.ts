@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { Readable } from 'node:stream';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { config } from '../config.js';
 
@@ -41,7 +43,7 @@ export function probeImageDimensions(
       };
     }
 
-    // GIF
+    // GIF (including multi-frame animated GIF87a / GIF89a)
     if (
       buffer.length >= 10 &&
       buffer[0] === 0x47 &&
@@ -54,7 +56,7 @@ export function probeImageDimensions(
       };
     }
 
-    // WEBP (VP8 / VP8L / VP8X)
+    // WEBP (VP8 / VP8L / VP8X including animated WebP)
     if (
       buffer.length >= 30 &&
       buffer.toString('ascii', 0, 4) === 'RIFF' &&
@@ -177,12 +179,124 @@ export class StorageService {
     };
   }
 
+  /**
+   * Zero-RAM streaming file storage supporting 500 MB+ files safely on constrained 512 MB cloud containers.
+   * Captures only the first 64 KB to inspect image headers while piping directly to disk/S3 with backpressure.
+   */
+  async storeStream(params: {
+    stream: Readable & { truncated?: boolean };
+    originalFilename: string;
+    mimeType: string;
+    maxBytes: number;
+  }): Promise<StoredFileResult> {
+    const safeName = sanitizeFilename(params.originalFilename);
+    const idPrefix = crypto.randomUUID();
+    const storageKey = `${idPrefix}-${safeName}`;
+    const isImage = /^image\/(png|jpeg|jpg|webp|gif|avif)$/i.test(params.mimeType);
+
+    fs.mkdirSync(config.uploadsDir, { recursive: true });
+    const tmpPath = path.join(config.uploadsDir, `.tmp-${storageKey}`);
+    const targetPath = path.join(config.uploadsDir, storageKey);
+    const writeStream = fs.createWriteStream(tmpPath, { flags: 'wx' });
+
+    const headerChunks: Buffer[] = [];
+    let headerBytes = 0;
+    const maxHeaderBytes = 65536;
+    let sizeBytes = 0;
+
+    try {
+      for await (const rawChunk of params.stream) {
+        const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk as Uint8Array);
+        sizeBytes += chunk.length;
+
+        if (sizeBytes > params.maxBytes) {
+          throw Object.assign(
+            new Error(
+              `Arquivo excede o limite máximo permitido (${Math.round(params.maxBytes / (1024 * 1024))} MB)`
+            ),
+            { code: 'PAYLOAD_TOO_LARGE' }
+          );
+        }
+
+        if (isImage && headerBytes < maxHeaderBytes) {
+          const needed = Math.min(chunk.length, maxHeaderBytes - headerBytes);
+          headerChunks.push(chunk.subarray(0, needed));
+          headerBytes += needed;
+        }
+
+        if (!writeStream.write(chunk)) {
+          await once(writeStream, 'drain');
+        }
+      }
+
+      if (params.stream.truncated) {
+        throw Object.assign(
+          new Error(
+            `Arquivo excede o limite máximo permitido (${Math.round(params.maxBytes / (1024 * 1024))} MB)`
+          ),
+          { code: 'PAYLOAD_TOO_LARGE' }
+        );
+      }
+
+      writeStream.end();
+      await once(writeStream, 'finish');
+
+      if (sizeBytes === 0) {
+        throw Object.assign(new Error('Arquivo vazio'), { code: 'EMPTY_FILE' });
+      }
+
+      const headerBuffer = headerChunks.length > 0 ? Buffer.concat(headerChunks) : Buffer.alloc(0);
+      const dims = isImage ? probeImageDimensions(headerBuffer, params.mimeType) : null;
+
+      if (this.s3 && config.s3.bucket) {
+        const readForS3 = fs.createReadStream(tmpPath);
+        await this.s3.send(
+          new PutObjectCommand({
+            Bucket: config.s3.bucket,
+            Key: storageKey,
+            Body: readForS3,
+            ContentLength: sizeBytes,
+            ContentType: params.mimeType,
+            CacheControl: 'public, max-age=31536000, immutable',
+          })
+        );
+        await fs.promises.unlink(tmpPath).catch(() => {});
+        const base = config.s3.publicBaseUrl.replace(/\/+$/, '');
+        const urlPath = base
+          ? `${base}/${encodeURIComponent(storageKey)}`
+          : `/uploads/${encodeURIComponent(storageKey)}`;
+        return {
+          storageKey,
+          urlPath,
+          sizeBytes,
+          isImage,
+          width: dims?.width ?? null,
+          height: dims?.height ?? null,
+        };
+      }
+
+      await fs.promises.rename(tmpPath, targetPath);
+
+      return {
+        storageKey,
+        urlPath: `/uploads/${encodeURIComponent(storageKey)}`,
+        sizeBytes,
+        isImage,
+        width: dims?.width ?? null,
+        height: dims?.height ?? null,
+      };
+    } catch (err) {
+      writeStream.destroy();
+      await fs.promises.unlink(tmpPath).catch(() => {});
+      throw err;
+    }
+  }
+
   resolveLocalFilePath(storageKey: string): string | null {
     const safe = path.basename(storageKey);
-    if (safe !== storageKey) return null;
+    if (safe !== storageKey || safe.startsWith('.tmp-')) return null;
     const fullPath = path.join(config.uploadsDir, safe);
     if (!fs.existsSync(fullPath)) return null;
     return fullPath;
   }
 }
-

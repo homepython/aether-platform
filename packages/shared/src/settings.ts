@@ -1,5 +1,11 @@
 import { z } from 'zod';
-import { StreamFpsSchema, StreamResolutionSchema } from './media.js';
+import {
+  StreamConnectionModeSchema,
+  StreamFpsSchema,
+  StreamPrivacyModeSchema,
+  StreamProfileSchema,
+  StreamResolutionSchema,
+} from './media.js';
 
 export const PeerAudioOverrideSchema = z.object({
   volume: z.number().min(0).max(200).default(100),
@@ -28,7 +34,9 @@ export const AudioSettingsSchema = z.object({
   voiceMode: z.enum(['vad', 'ptt']).default('vad'),
   vadSensitivityDb: z.number().min(-85).max(-5).default(-48),
   noiseSuppressionEnabled: z.boolean().default(true),
-  noiseSuppressionLevel: z.number().min(0).max(100).default(80),
+  noiseSuppressionLevel: z.number().min(0).max(100).default(92),
+  keyboardSuppressionEnabled: z.boolean().default(true),
+  vocalClarityEnhancer: z.boolean().default(true),
   noiseGateEnabled: z.boolean().default(true),
   noiseGateThresholdDb: z.number().min(-85).max(-10).default(-52),
   echoCancellationEnabled: z.boolean().default(true),
@@ -39,12 +47,17 @@ export const AudioSettingsSchema = z.object({
 export type AudioSettings = z.infer<typeof AudioSettingsSchema>;
 
 export const StreamSettingsSchema = z.object({
+  profile: StreamProfileSchema.default('auto'),
   resolution: StreamResolutionSchema.default('1080p'),
   fps: StreamFpsSchema.default(60),
   bitrateMode: z.enum(['auto', 'custom']).default('auto'),
-  customBitrateKbps: z.number().min(2500).max(32000).nullable().default(null),
+  customBitrateKbps: z.number().min(300).max(60000).nullable().default(null),
+  audioBitrateKbps: z.number().min(32).max(510).default(320),
   shareAudio: z.boolean().default(true),
-  contentOptimization: z.enum(['detail', 'motion']).default('detail'),
+  privacy: StreamPrivacyModeSchema.default('public'),
+  viewerLimit: z.number().int().min(1).max(500).nullable().default(null),
+  connectionMode: StreamConnectionModeSchema.default('auto'),
+  contentOptimization: z.enum(['detail', 'motion']).default('motion'),
 });
 export type StreamSettings = z.infer<typeof StreamSettingsSchema>;
 
@@ -103,4 +116,3 @@ export const UserSettingsSchema = z.object({
 export type UserSettings = z.infer<typeof UserSettingsSchema>;
 
 export const DEFAULT_USER_SETTINGS: UserSettings = UserSettingsSchema.parse({});
-

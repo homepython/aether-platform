@@ -3,7 +3,9 @@ import {
   Ban,
   HeadphoneOff,
   Laptop,
+  MessageSquare,
   MicOff,
+  Radio,
   ShieldAlert,
   Sliders,
   Sparkles,
@@ -13,16 +15,20 @@ import {
 } from 'lucide-react';
 import { hasRoleAtLeast, ROLE_RANK } from '@aether/shared';
 import { useAppStore } from '../store/useAppStore.js';
-import { StyledUserName, UserRoleBadge } from './UserIdentity.js';
+import { StyledUserName, UserAvatar, UserRoleBadge } from './UserIdentity.js';
 
 export const ParticipantsDrawer: React.FC = () => {
   const user = useAppStore((s) => s.user);
   const currentRoom = useAppStore((s) => s.currentRoom);
   const participants = useAppStore((s) => s.participants);
+  const activeStreams = useAppStore((s) => s.activeStreams);
   const peerOverrides = useAppStore((s) => s.settings.audio.peerOverrides);
   const setPeerAudioOverride = useAppStore((s) => s.setPeerAudioOverride);
+  const setInspectedUser = useAppStore((s) => s.setInspectedUser);
+  const openDmWithUser = useAppStore((s) => s.openDmWithUser);
   const kickParticipant = useAppStore((s) => s.kickParticipant);
   const forceMuteParticipant = useAppStore((s) => s.forceMuteParticipant);
+  const forceStopStream = useAppStore((s) => s.forceStopStream);
   const pushToast = useAppStore((s) => s.pushToast);
 
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
@@ -75,10 +81,13 @@ export const ParticipantsDrawer: React.FC = () => {
             hasRoleAtLeast(myRole, 'moderator') &&
             (myRole === 'owner' || ROLE_RANK[myRole] > ROLE_RANK[targetRole]);
 
+          const peerActiveStream =
+            activeStreams.find((st) => st.broadcasterId === p.user.id) || null;
+
           return (
             <div
               key={p.peerId}
-              className="rounded-2xl border p-2.5 transition-all"
+              className="group rounded-2xl border p-2.5 transition-all"
               style={{
                 backgroundColor: isExpanded ? 'var(--bg-surface)' : 'transparent',
                 borderColor: isExpanded ? 'var(--border-hairline)' : 'transparent',
@@ -86,24 +95,27 @@ export const ParticipantsDrawer: React.FC = () => {
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2.5">
-                  <div
-                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white transition-shadow"
-                    style={{
-                      backgroundColor: p.user.avatarColor,
-                      boxShadow: p.speaking ? '0 0 0 2.5px var(--voice-green)' : 'none',
-                    }}
-                  >
-                    {p.user.displayName.slice(0, 2).toUpperCase()}
-                  </div>
+                  <UserAvatar
+                    user={p.user}
+                    size="md"
+                    speaking={p.speaking}
+                    onClick={() => setInspectedUser(p.user)}
+                  />
 
                   <div className="min-w-0">
                     <div className="flex min-w-0 items-center gap-1.5 text-xs">
-                      <StyledUserName
-                        name={p.user.displayName}
-                        role={p.user.role}
-                        suffix={isMe ? '(Você)' : undefined}
-                        className="font-semibold"
-                      />
+                      <button
+                        type="button"
+                        onClick={() => setInspectedUser(p.user)}
+                        className="min-w-0 truncate text-left hover:underline"
+                      >
+                        <StyledUserName
+                          name={p.user.displayName}
+                          role={p.user.role}
+                          suffix={isMe ? '(Você)' : undefined}
+                          className="font-semibold"
+                        />
+                      </button>
                       <UserRoleBadge role={p.user.role} compact />
                       {p.clientPlatform === 'desktop' && (
                         <span title="Aplicativo Desktop">
@@ -133,13 +145,32 @@ export const ParticipantsDrawer: React.FC = () => {
                   {p.deafened && (
                     <HeadphoneOff className="h-3.5 w-3.5" style={{ color: 'var(--live-red)' }} />
                   )}
+
+                  {/* Quick Inline Moderator Buttons */}
+                  {canModerate && !p.micMuted && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void runModeration(
+                          () => forceMuteParticipant(p.peerId),
+                          `${p.user.displayName} foi silenciado na sala.`
+                        )
+                      }
+                      title="Silenciar microfone (Moderação)"
+                      className="hidden h-6 w-6 items-center justify-center rounded-lg hover:bg-black/5 group-hover:flex dark:hover:bg-white/5"
+                      style={{ color: 'var(--warn-amber)' }}
+                    >
+                      <MicOff className="h-3 w-3" />
+                    </button>
+                  )}
+
                   {!isMe && (
                     <button
                       type="button"
                       onClick={() =>
                         setExpandedUserId((cur) => (cur === p.user.id ? null : p.user.id))
                       }
-                      title="Controle individual de volume e ruído"
+                      title="Volume, ruído, mensagem direta e moderação"
                       className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5"
                       style={{
                         color: isExpanded ? 'var(--accent)' : 'var(--text-secondary)',
@@ -151,12 +182,26 @@ export const ParticipantsDrawer: React.FC = () => {
                 </div>
               </div>
 
-              {/* Per-User Individual Volume & Noise Control Panel */}
+              {/* Per-User Individual Volume, DM & Moderation Panel */}
               {isExpanded && (
                 <div
                   className="mt-3 space-y-3 border-t pt-3 text-xs"
                   style={{ borderColor: 'var(--border-hairline)' }}
                 >
+                  <button
+                    type="button"
+                    onClick={() => void openDmWithUser(p.user.id)}
+                    className="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded-xl border text-xs font-semibold transition-colors hover:opacity-90"
+                    style={{
+                      borderColor: 'var(--border-hairline)',
+                      backgroundColor: 'var(--bg-elevated)',
+                      color: 'var(--accent)',
+                    }}
+                  >
+                    <MessageSquare className="h-3.5 w-3.5" />
+                    Enviar Mensagem Direta
+                  </button>
+
                   <div>
                     <div className="mb-1.5 flex items-center justify-between">
                       <span className="inline-flex items-center gap-1.5 font-medium" style={{ color: 'var(--text-secondary)' }}>
@@ -248,7 +293,7 @@ export const ParticipantsDrawer: React.FC = () => {
                         style={{ color: 'var(--text-muted)' }}
                       >
                         <ShieldAlert className="h-3.5 w-3.5" />
-                        Moderação
+                        Ferramentas de Moderação
                       </div>
                       <div className="grid grid-cols-2 gap-2">
                         <button
@@ -267,7 +312,7 @@ export const ParticipantsDrawer: React.FC = () => {
                           }}
                         >
                           <Ban className="h-3 w-3" />
-                          Silenciar na Sala
+                          Silenciar
                         </button>
                         <button
                           type="button"
@@ -284,9 +329,33 @@ export const ParticipantsDrawer: React.FC = () => {
                           }}
                         >
                           <UserMinus className="h-3 w-3" />
-                          Remover da Sala
+                          Remover
                         </button>
                       </div>
+
+                      {peerActiveStream && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void runModeration(
+                              () =>
+                                forceStopStream(
+                                  peerActiveStream.streamId,
+                                  'Encerrada pela moderação'
+                                ),
+                              `Live de ${p.user.displayName} encerrada.`
+                            )
+                          }
+                          className="mt-2 inline-flex w-full items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[11px] font-semibold"
+                          style={{
+                            backgroundColor: 'var(--live-red-soft)',
+                            color: 'var(--live-red)',
+                          }}
+                        >
+                          <Radio className="h-3 w-3" />
+                          Encerrar Live Ativa
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -298,4 +367,3 @@ export const ParticipantsDrawer: React.FC = () => {
     </aside>
   );
 };
-

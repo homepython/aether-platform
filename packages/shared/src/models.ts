@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { StreamFpsSchema, StreamResolutionSchema } from './media.js';
+import {
+  StreamConnectionModeSchema,
+  StreamFpsSchema,
+  StreamPrivacyModeSchema,
+  StreamResolutionSchema,
+} from './media.js';
 import { UserSettingsSchema } from './settings.js';
 
 export const USER_ROLES = ['owner', 'admin', 'moderator', 'member'] as const;
@@ -18,12 +23,27 @@ export function hasRoleAtLeast(role: UserRole | undefined | null, minRole: UserR
   return current >= ROLE_RANK[minRole];
 }
 
+export const USER_PRESENCE_STATUSES = ['online', 'busy', 'offline'] as const;
+export type UserPresenceStatus = (typeof USER_PRESENCE_STATUSES)[number];
+export const UserPresenceStatusSchema = z.enum(USER_PRESENCE_STATUSES);
+
+export const USERNAME_MAX_CHANGES_PER_24H = 3;
+
+export const UsernameSchema = z
+  .string()
+  .trim()
+  .min(3, 'Nickname precisa ter ao menos 3 caracteres')
+  .max(28, 'Nickname deve ter no máximo 28 caracteres')
+  .regex(/^[a-zA-Z0-9_.-]+$/, 'Use apenas letras, números, ponto, hífen ou sublinhado');
+
 export const UserPublicSchema = z.object({
   id: z.string(),
   username: z.string(),
   displayName: z.string(),
   avatarColor: z.string(),
   avatarUrl: z.string().nullable(),
+  bio: z.string().default(''),
+  presenceStatus: UserPresenceStatusSchema.default('online'),
   role: UserRoleSchema.default('member'),
   createdAt: z.string(),
 });
@@ -32,8 +52,23 @@ export type UserPublic = z.infer<typeof UserPublicSchema>;
 export const AuthUserSchema = UserPublicSchema.extend({
   email: z.string().email(),
   settings: UserSettingsSchema,
+  nicknameChangesLast24h: z.number().int().nonnegative().default(0),
+  nicknameLockedUntil: z.string().nullable().default(null),
 });
 export type AuthUser = z.infer<typeof AuthUserSchema>;
+
+export const UpdateProfileInputSchema = z.object({
+  displayName: z.string().trim().min(2, 'Nome de exibição muito curto').max(40).optional(),
+  username: UsernameSchema.optional(),
+  bio: z.string().trim().max(240, 'A bio pode ter no máximo 240 caracteres').optional(),
+  avatarColor: z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/, 'Cor de perfil inválida')
+    .optional(),
+  avatarUrl: z.string().max(500).nullable().optional(),
+  presenceStatus: z.enum(['online', 'busy']).optional(),
+});
+export type UpdateProfileInput = z.infer<typeof UpdateProfileInputSchema>;
 
 const COMMON_WEAK_PASSWORDS = new Set([
   '12345678',
@@ -67,12 +102,7 @@ export const StrongPasswordSchema = z
   });
 
 export const RegisterInputSchema = z.object({
-  username: z
-    .string()
-    .trim()
-    .min(3, 'Nome de usuário precisa ter ao menos 3 caracteres')
-    .max(28, 'Nome de usuário deve ter no máximo 28 caracteres')
-    .regex(/^[a-zA-Z0-9_.-]+$/, 'Use apenas letras, números, ponto, hífen ou sublinhado'),
+  username: UsernameSchema,
   displayName: z.string().trim().min(2).max(40),
   email: z.string().trim().email('E-mail inválido').max(160),
   password: StrongPasswordSchema,
@@ -92,13 +122,19 @@ export const ActiveStreamInfoSchema = z.object({
   broadcasterUsername: z.string(),
   broadcasterDisplayName: z.string(),
   broadcasterAvatarColor: z.string(),
+  broadcasterAvatarUrl: z.string().nullable().default(null),
   broadcasterRole: UserRoleSchema.default('member'),
   title: z.string(),
   resolution: StreamResolutionSchema,
   fps: StreamFpsSchema,
   targetBitrateKbps: z.number(),
+  audioBitrateKbps: z.number().default(320),
+  privacy: StreamPrivacyModeSchema.default('public'),
+  viewerLimit: z.number().int().positive().nullable().default(null),
+  connectionMode: StreamConnectionModeSchema.default('auto'),
+  relayActive: z.boolean().default(false),
   hasAudio: z.boolean(),
-  audioIsolationMode: z.enum(['process-isolated', 'tab-isolated', 'system-direct', 'none']),
+  audioIsolationMode: z.enum(['process-isolated', 'multi-process', 'tab-isolated', 'system-direct', 'none']),
   startedAt: z.string(),
   viewerCount: z.number().int().nonnegative(),
   viewerUsers: z.array(
@@ -107,6 +143,7 @@ export const ActiveStreamInfoSchema = z.object({
       username: z.string(),
       displayName: z.string(),
       avatarColor: z.string(),
+      avatarUrl: z.string().nullable().default(null),
       role: UserRoleSchema.default('member'),
     })
   ),
@@ -146,6 +183,7 @@ export const RoomSummarySchema = z.object({
       userId: z.string(),
       displayName: z.string(),
       avatarColor: z.string(),
+      avatarUrl: z.string().nullable().default(null),
       role: UserRoleSchema.default('member'),
       speaking: z.boolean(),
       isStreaming: z.boolean(),
@@ -161,6 +199,7 @@ export const AdminUserRecordSchema = z.object({
   displayName: z.string(),
   avatarColor: z.string(),
   avatarUrl: z.string().nullable(),
+  bio: z.string().default(''),
   role: UserRoleSchema,
   isBanned: z.boolean(),
   banReason: z.string().nullable(),
@@ -225,7 +264,7 @@ export const ChatMessageSchema = z.object({
   roomId: z.string(),
   author: UserPublicSchema,
   content: z.string(),
-  mentions: z.array(z.string()), // array of mentioned user IDs
+  mentions: z.array(z.string()),
   attachments: z.array(ChatAttachmentSchema),
   createdAt: z.string(),
   editedAt: z.string().nullable(),
@@ -233,9 +272,52 @@ export const ChatMessageSchema = z.object({
 });
 export type ChatMessage = z.infer<typeof ChatMessageSchema>;
 
+export const FriendshipStatusSchema = z.enum([
+  'pending_incoming',
+  'pending_outgoing',
+  'accepted',
+]);
+export type FriendshipStatus = z.infer<typeof FriendshipStatusSchema>;
+
+export const FriendEntrySchema = z.object({
+  friendshipId: z.string(),
+  user: UserPublicSchema,
+  status: FriendshipStatusSchema,
+  isOnline: z.boolean(),
+  presenceStatus: UserPresenceStatusSchema,
+  currentRoomId: z.string().nullable(),
+  currentRoomName: z.string().nullable(),
+  isStreaming: z.boolean(),
+  unreadDmCount: z.number().int().nonnegative().default(0),
+  lastDmAt: z.string().nullable().default(null),
+  createdAt: z.string(),
+});
+export type FriendEntry = z.infer<typeof FriendEntrySchema>;
+
+export const DirectMessageSchema = z.object({
+  id: z.string(),
+  conversationKey: z.string(),
+  sender: UserPublicSchema,
+  recipientId: z.string(),
+  content: z.string(),
+  mentions: z.array(z.string()),
+  attachments: z.array(ChatAttachmentSchema),
+  roomInvite: z
+    .object({
+      roomId: z.string(),
+      roomName: z.string(),
+    })
+    .nullable()
+    .default(null),
+  createdAt: z.string(),
+  editedAt: z.string().nullable(),
+  readAt: z.string().nullable(),
+  deleted: z.boolean(),
+});
+export type DirectMessage = z.infer<typeof DirectMessageSchema>;
+
 export interface IceServerConfig {
   urls: string | string[];
   username?: string;
   credential?: string;
 }
-

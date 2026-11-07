@@ -26,7 +26,7 @@ import {
 } from '@aether/shared';
 import { api } from '../api/httpClient.js';
 import { useAppStore } from '../store/useAppStore.js';
-import { ROLE_LABELS, StyledUserName, UserRoleBadge } from './UserIdentity.js';
+import { ROLE_LABELS, StyledUserName, UserAvatar, UserRoleBadge } from './UserIdentity.js';
 
 type AdminTab = 'users' | 'moderation' | 'audit' | 'masterkey';
 
@@ -63,7 +63,7 @@ export const AdminModal: React.FC = () => {
   const [claimError, setClaimError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
-    if (!isAdminOrOwner) return;
+    if (!isModeratorPlus) return;
     setLoading(true);
     try {
       const [uRes, aRes] = await Promise.all([
@@ -74,13 +74,13 @@ export const AdminModal: React.FC = () => {
       setAuditLogs(aRes.logs);
     } catch (err) {
       pushToast({
-        title: 'Falha ao carregar dados administrativos',
+        title: 'Falha ao carregar dados de moderação',
         body: err instanceof Error ? err.message : 'Verifique sua conexão',
       });
     } finally {
       setLoading(false);
     }
-  }, [isAdminOrOwner, pushToast]);
+  }, [isModeratorPlus, pushToast]);
 
   useEffect(() => {
     if (!open) {
@@ -93,6 +93,7 @@ export const AdminModal: React.FC = () => {
       void loadData();
     } else if (isModeratorPlus) {
       setTab('moderation');
+      void loadData();
     } else {
       setTab('masterkey');
     }
@@ -120,7 +121,7 @@ export const AdminModal: React.FC = () => {
     try {
       await api.updateUserRole(target.id, nextRole);
       pushToast({
-        title: 'Cargo atualizado',
+        title: 'Cargo atualizado em tempo real',
         body: `@${target.username} agora é ${ROLE_LABELS[nextRole]}.`,
       });
       await loadData();
@@ -205,14 +206,14 @@ export const AdminModal: React.FC = () => {
             <div className="mb-4 px-3">
               <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider">
                 <ShieldCheck className="h-4 w-4" style={{ color: 'var(--accent)' }} />
-                <span>Central Admin</span>
+                <span>Central Mod &amp; Admin</span>
               </div>
               <div className="mt-1.5">
                 <UserRoleBadge role={user.role} />
               </div>
             </div>
 
-            {isAdminOrOwner && (
+            {isModeratorPlus && (
               <button
                 type="button"
                 onClick={() => setTab('users')}
@@ -222,8 +223,11 @@ export const AdminModal: React.FC = () => {
                   color: tab === 'users' ? 'var(--text-primary)' : 'var(--text-secondary)',
                 }}
               >
-                <Users className="h-4 w-4" style={{ color: tab === 'users' ? 'var(--accent)' : 'var(--text-muted)' }} />
-                Usuários & Cargos
+                <Users
+                  className="h-4 w-4"
+                  style={{ color: tab === 'users' ? 'var(--accent)' : 'var(--text-muted)' }}
+                />
+                {isAdminOrOwner ? 'Usuários & Cargos' : 'Diretório de Usuários'}
               </button>
             )}
 
@@ -241,11 +245,11 @@ export const AdminModal: React.FC = () => {
                   className="h-4 w-4"
                   style={{ color: tab === 'moderation' ? 'var(--accent)' : 'var(--text-muted)' }}
                 />
-                Salas & Moderação Vivo
+                Salas &amp; Moderação Vivo
               </button>
             )}
 
-            {isAdminOrOwner && (
+            {isModeratorPlus && (
               <button
                 type="button"
                 onClick={() => setTab('audit')}
@@ -281,7 +285,8 @@ export const AdminModal: React.FC = () => {
           </div>
 
           <div className="px-3 text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
-            Permissões validadas no servidor em tempo real • Vinculadas à sua conta em qualquer PC.
+            Insígnias públicas &amp; permissões validadas no servidor em tempo real • Comandos de chat:{' '}
+            <code>/mute</code>, <code>/kick</code>, <code>/stopstream</code>.
           </div>
         </div>
 
@@ -293,7 +298,7 @@ export const AdminModal: React.FC = () => {
           >
             <div>
               <h2 className="text-base font-semibold">
-                {tab === 'users' && 'Gestão de Contas, Hierarquia & Acessos'}
+                {tab === 'users' && 'Gestão de Contas, Hierarquia Pública & Acessos'}
                 {tab === 'moderation' && 'Moderação Instantânea de Salas, Voz & Lives'}
                 {tab === 'audit' && 'Histórico Criptográfico de Ações Administrativas'}
                 {tab === 'masterkey' && 'Credencial Soberana de Fundador (Owner)'}
@@ -301,7 +306,7 @@ export const AdminModal: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-2">
-              {isAdminOrOwner && (tab === 'users' || tab === 'audit') && (
+              {isModeratorPlus && (tab === 'users' || tab === 'audit') && (
                 <button
                   type="button"
                   onClick={() => void loadData()}
@@ -330,7 +335,7 @@ export const AdminModal: React.FC = () => {
 
           <div className="min-h-0 flex-1 overflow-y-auto p-6">
             {/* TAB: USERS & ROLES */}
-            {tab === 'users' && isAdminOrOwner && (
+            {tab === 'users' && isModeratorPlus && (
               <div className="space-y-4">
                 <div className="relative">
                   <Search
@@ -356,10 +361,12 @@ export const AdminModal: React.FC = () => {
                     const isSelf = u.id === user.id;
                     const isTargetOwner = u.role === 'owner';
                     const canChangeRole =
+                      isAdminOrOwner &&
                       !isSelf &&
                       !isTargetOwner &&
                       (user.role === 'owner' || u.role !== 'admin');
                     const canBan =
+                      isAdminOrOwner &&
                       !isSelf &&
                       !isTargetOwner &&
                       (user.role === 'owner' || ROLE_RANK[user.role] > ROLE_RANK[u.role]);
@@ -377,22 +384,16 @@ export const AdminModal: React.FC = () => {
                         }}
                       >
                         <div className="flex min-w-0 items-center gap-3">
-                          <div
-                            className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white"
-                            style={{ backgroundColor: u.avatarColor }}
-                          >
-                            {u.displayName.slice(0, 2).toUpperCase()}
-                            <span
-                              className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2"
-                              style={{
-                                borderColor: 'var(--bg-elevated)',
-                                backgroundColor: u.isOnline
-                                  ? 'var(--voice-green)'
-                                  : 'var(--text-muted)',
-                              }}
-                              title={u.isOnline ? 'Online agora' : 'Offline'}
-                            />
-                          </div>
+                          <UserAvatar
+                            user={{
+                              displayName: u.displayName,
+                              avatarColor: u.avatarColor,
+                              avatarUrl: u.avatarUrl,
+                            }}
+                            size="lg"
+                            showPresence
+                            isOnline={u.isOnline}
+                          />
 
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
@@ -564,6 +565,7 @@ export const AdminModal: React.FC = () => {
                                 role={st.broadcasterRole}
                                 className="font-semibold"
                               />
+                              <UserRoleBadge role={st.broadcasterRole} compact />
                               <span style={{ color: 'var(--text-muted)' }}>
                                 • {st.title} ({st.resolution} {st.fps} FPS)
                               </span>
@@ -620,10 +622,7 @@ export const AdminModal: React.FC = () => {
                             }}
                           >
                             <div className="flex items-center gap-2.5 text-xs">
-                              <span
-                                className="h-2.5 w-2.5 rounded-full"
-                                style={{ backgroundColor: p.user.avatarColor }}
-                              />
+                              <UserAvatar user={p.user} size="xs" />
                               <StyledUserName
                                 name={p.user.displayName}
                                 role={p.user.role}
@@ -784,7 +783,7 @@ export const AdminModal: React.FC = () => {
             )}
 
             {/* TAB: AUDIT LOGS */}
-            {tab === 'audit' && isAdminOrOwner && (
+            {tab === 'audit' && isModeratorPlus && (
               <div className="space-y-2.5">
                 {auditLogs.length === 0 ? (
                   <div
@@ -861,7 +860,7 @@ export const AdminModal: React.FC = () => {
                     sua conta (<strong>@{user.username}</strong>) recebe permanentemente o cargo soberano de{' '}
                     <strong>Fundador</strong> no banco de dados. Você terá acesso administrativo automático
                     ao entrar nesta conta em <strong>qualquer computador</strong>, podendo também promover
-                    outros usuários a Administradores ou Moderadores.
+                    outros usuários a Administradores ou Moderadores em tempo real.
                   </p>
 
                   {user.role === 'owner' ? (
@@ -942,4 +941,3 @@ export const AdminModal: React.FC = () => {
     </div>
   );
 };
-

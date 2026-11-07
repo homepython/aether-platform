@@ -14,7 +14,10 @@ import type {
 } from 'mediasoup/types';
 import type {
   ActiveStreamInfo,
+  AudioIsolationMode,
+  StreamConnectionMode,
   StreamFps,
+  StreamPrivacyMode,
   StreamResolution,
   TransportDirection,
   TransportPlane,
@@ -34,10 +37,22 @@ const ROUTER_MEDIA_CODECS: RouterRtpCodecCapability[] = [
       usedtx: 0,
       stereo: 1,
       'sprop-stereo': 1,
-      maxaveragebitrate: 320000,
+      maxaveragebitrate: 510000,
     },
   },
-  // H.264 High Profile Level 5.2 (enables hardware NVENC/AMF/QSV at 2560x1440 @ 75 FPS)
+  // H.264 Constrained Baseline Level 5.2 (universal hardware + OpenH264 compatibility)
+  {
+    kind: 'video',
+    mimeType: 'video/H264',
+    clockRate: 90000,
+    parameters: {
+      'packetization-mode': 1,
+      'profile-level-id': '42e01f',
+      'level-asymmetry-allowed': 1,
+      'x-google-start-bitrate': 10000,
+    },
+  },
+  // H.264 High Profile Level 5.2 (enables hardware NVENC/AMF/QSV at 1440p/Original up to 144 FPS)
   {
     kind: 'video',
     mimeType: 'video/H264',
@@ -49,25 +64,13 @@ const ROUTER_MEDIA_CODECS: RouterRtpCodecCapability[] = [
       'x-google-start-bitrate': 12000,
     },
   },
-  // H.264 Constrained Baseline Level 5.2 (universal hardware compatibility)
+  // VP8 universal fallback
   {
     kind: 'video',
-    mimeType: 'video/H264',
+    mimeType: 'video/VP8',
     clockRate: 90000,
     parameters: {
-      'packetization-mode': 1,
-      'profile-level-id': '42e034',
-      'level-asymmetry-allowed': 1,
-      'x-google-start-bitrate': 10000,
-    },
-  },
-  // AV1 next-gen high sharpness for UI & text at 1440p
-  {
-    kind: 'video',
-    mimeType: 'video/AV1',
-    clockRate: 90000,
-    parameters: {
-      'x-google-start-bitrate': 10000,
+      'x-google-start-bitrate': 8000,
     },
   },
   // VP9 Profile 0
@@ -80,13 +83,13 @@ const ROUTER_MEDIA_CODECS: RouterRtpCodecCapability[] = [
       'x-google-start-bitrate': 10000,
     },
   },
-  // VP8 universal fallback
+  // AV1 next-gen high sharpness for UI & text at 1440p
   {
     kind: 'video',
-    mimeType: 'video/VP8',
+    mimeType: 'video/AV1',
     clockRate: 90000,
     parameters: {
-      'x-google-start-bitrate': 8000,
+      'x-google-start-bitrate': 10000,
     },
   },
 ];
@@ -118,7 +121,13 @@ interface ActiveStreamRecord {
   resolution: StreamResolution;
   fps: StreamFps;
   targetBitrateKbps: number;
-  audioIsolationMode: 'process-isolated' | 'tab-isolated' | 'system-direct' | 'none';
+  audioBitrateKbps: number;
+  privacy: StreamPrivacyMode;
+  allowedUserIds: Set<string>;
+  viewerLimit: number | null;
+  connectionMode: StreamConnectionMode;
+  relayActive: boolean;
+  audioIsolationMode: AudioIsolationMode;
   startedAt: string;
   videoProducer: Producer;
   audioProducer: Producer | null;
@@ -141,7 +150,7 @@ export class SfuManager {
 
   async init(): Promise<void> {
     if (config.mediasoup.mediaMode === 'p2p') {
-      console.log('[SFU] Cloud WebRTC Direct-Plane mode active (signaling via WSS)');
+      console.log('[SFU] Cloud WebRTC Direct-Plane + Built-in WSS Relay mode active');
       return;
     }
     const count = config.mediasoup.numWorkers;
@@ -209,7 +218,7 @@ export class SfuManager {
   }
 
   private buildListenInfos(plane: TransportPlane): TransportListenInfo[] {
-    const bufferSize = plane === 'stream' ? 8 * 1024 * 1024 : 1024 * 1024; // 8 MB UDP buffer for 1440p75 I-frames
+    const bufferSize = plane === 'stream' ? 8 * 1024 * 1024 : 1024 * 1024;
     const infos: TransportListenInfo[] = [];
 
     const protocols: ('udp' | 'tcp')[] = ['udp'];
@@ -224,7 +233,6 @@ export class SfuManager {
         recvBufferSize: bufferSize,
       });
 
-      // Ensure zero-latency loopback candidate when clients & server run behind Hairpin-NAT or same host
       if (config.mediasoup.listenIp === '0.0.0.0' && config.mediasoup.announcedIp !== '127.0.0.1') {
         infos.push({
           protocol,
@@ -253,7 +261,6 @@ export class SfuManager {
 
     const router = await this.getOrCreateRoomRouter(peer.roomId);
 
-    // Replace existing transport for the same (plane, direction) if reconnecting
     for (const [id, entry] of peer.transports.entries()) {
       if (entry.plane === plane && entry.direction === direction) {
         entry.transport.close();
@@ -268,7 +275,7 @@ export class SfuManager {
       preferUdp: true,
       initialAvailableOutgoingBitrate:
         plane === 'stream' ? config.mediasoup.initialAvailableOutgoingBitrate : 1_500_000,
-      maxIncomingBitrate: plane === 'stream' ? config.mediasoup.maxIncomingBitrate : 512_000,
+      maxIncomingBitrate: plane === 'stream' ? config.mediasoup.maxIncomingBitrate : 600_000,
       appData: { peerId, plane, direction },
     });
 
@@ -362,7 +369,6 @@ export class SfuManager {
       throw new Error('Cliente incompatível com capacidades RTP do produtor de voz');
     }
 
-    // Never consume own microphone (Regra Inquebrável Nº 4 — Zero Eco / Zero Loopback)
     if (consumerPeer.voiceProducer?.id === producerId) {
       throw new Error('Bloqueado: nunca consumir o próprio microfone');
     }
@@ -442,7 +448,12 @@ export class SfuManager {
     resolution: StreamResolution;
     fps: StreamFps;
     targetBitrateKbps: number;
-    audioIsolationMode: 'process-isolated' | 'tab-isolated' | 'system-direct' | 'none';
+    audioBitrateKbps?: number;
+    privacy?: StreamPrivacyMode;
+    allowedUserIds?: string[];
+    viewerLimit?: number | null;
+    connectionMode?: StreamConnectionMode;
+    audioIsolationMode: AudioIsolationMode;
     videoProducerId?: string;
     audioProducerId?: string | null;
     videoRtpParameters?: RtpParameters;
@@ -451,7 +462,6 @@ export class SfuManager {
     const peer = this.peers.get(params.peerId);
     if (!peer) throw new Error('Sessão não encontrada');
 
-    // Stop any previous stream by this peer cleanly without touching voice
     if (peer.activeStreamId) {
       this.stopStream(params.peerId, peer.activeStreamId);
     }
@@ -495,7 +505,6 @@ export class SfuManager {
       });
     }
 
-    // Close any leftover unattached pending producers for this peer
     for (const leftover of peer.pendingStreamProducers.values()) {
       if (!leftover.closed) leftover.close();
     }
@@ -511,6 +520,12 @@ export class SfuManager {
       resolution: params.resolution,
       fps: params.fps,
       targetBitrateKbps: params.targetBitrateKbps,
+      audioBitrateKbps: params.audioBitrateKbps ?? 320,
+      privacy: params.privacy ?? 'public',
+      allowedUserIds: new Set(params.allowedUserIds ?? []),
+      viewerLimit: params.viewerLimit ?? null,
+      connectionMode: params.connectionMode ?? 'auto',
+      relayActive: false,
       audioIsolationMode: audioProducer ? params.audioIsolationMode : 'none',
       startedAt: new Date().toISOString(),
       videoProducer,
@@ -528,18 +543,59 @@ export class SfuManager {
     return this.serializeStream(record);
   }
 
+  getStreamAccessMeta(streamId: string): {
+    roomId: string;
+    broadcasterId: string;
+    broadcasterPeerId: string;
+    privacy: StreamPrivacyMode;
+    allowedUserIds: Set<string>;
+    viewerLimit: number | null;
+    uniqueViewerIds: Set<string>;
+  } | null {
+    const record = this.streams.get(streamId);
+    if (!record) return null;
+    const uniqueViewerIds = new Set<string>();
+    for (const v of record.viewers.values()) {
+      uniqueViewerIds.add(v.user.id);
+    }
+    return {
+      roomId: record.roomId,
+      broadcasterId: record.broadcaster.id,
+      broadcasterPeerId: record.broadcasterPeerId,
+      privacy: record.privacy,
+      allowedUserIds: record.allowedUserIds,
+      viewerLimit: record.viewerLimit,
+      uniqueViewerIds,
+    };
+  }
+
+  setStreamRelayActive(streamId: string, active: boolean): ActiveStreamInfo | null {
+    const record = this.streams.get(streamId);
+    if (!record) return null;
+    record.relayActive = active;
+    return this.serializeStream(record);
+  }
+
   updateStreamMeta(
     peerId: string,
     streamId: string,
-    resolution: StreamResolution,
-    fps: StreamFps,
-    targetBitrateKbps: number
+    updates: {
+      resolution?: StreamResolution;
+      fps?: StreamFps;
+      targetBitrateKbps?: number;
+      audioBitrateKbps?: number;
+      privacy?: StreamPrivacyMode;
+      viewerLimit?: number | null;
+    }
   ): ActiveStreamInfo | null {
     const record = this.streams.get(streamId);
     if (!record || record.broadcasterPeerId !== peerId) return null;
-    record.resolution = resolution;
-    record.fps = fps;
-    record.targetBitrateKbps = targetBitrateKbps;
+    if (updates.resolution !== undefined) record.resolution = updates.resolution;
+    if (updates.fps !== undefined) record.fps = updates.fps;
+    if (updates.targetBitrateKbps !== undefined) record.targetBitrateKbps = updates.targetBitrateKbps;
+    if (updates.audioBitrateKbps !== undefined) record.audioBitrateKbps = updates.audioBitrateKbps;
+    if (updates.privacy !== undefined) record.privacy = updates.privacy;
+    if (updates.viewerLimit !== undefined) record.viewerLimit = updates.viewerLimit;
     return this.serializeStream(record);
   }
 
@@ -613,12 +669,10 @@ export class SfuManager {
       throw new Error('Transmissão não está ativa nesta sala');
     }
 
-    // Broadcaster never watches their own stream (Regra do Transmissor + Regra Nº 4 Zero Loopback)
     if (record.broadcaster.id === viewerPeer.user.id || record.broadcasterPeerId === viewerPeerId) {
       throw new Error('O transmissor não consome a própria transmissão');
     }
 
-    // Clean up existing viewer consumers if re-subscribing
     this.removeViewerInternal(record, viewerPeerId, false);
 
     const router = await this.getOrCreateRoomRouter(viewerPeer.roomId);
@@ -639,7 +693,6 @@ export class SfuManager {
     });
     viewerPeer.consumers.set(videoConsumer.id, videoConsumer);
 
-    // Request an immediate keyframe so the viewer gets crisp video instantaneously without gray/frozen start
     await videoConsumer.requestKeyFrame().catch(() => {});
 
     let audioConsumer: Consumer | null = null;
@@ -693,8 +746,7 @@ export class SfuManager {
   unwatchStream(viewerPeerId: string, streamId: string): ActiveStreamInfo | null {
     const record = this.streams.get(streamId);
     if (!record) return null;
-    const removed = this.removeViewerInternal(record, viewerPeerId, false);
-    if (!removed) return this.serializeStream(record);
+    this.removeViewerInternal(record, viewerPeerId, false);
     return this.serializeStream(record);
   }
 
@@ -838,7 +890,6 @@ export class SfuManager {
   }
 
   private serializeStream(record: ActiveStreamRecord): ActiveStreamInfo {
-    // Deduplicate unique real authenticated users watching this live stream
     const uniqueUsers = new Map<
       string,
       {
@@ -846,6 +897,7 @@ export class SfuManager {
         username: string;
         displayName: string;
         avatarColor: string;
+        avatarUrl: string | null;
         role: ActiveStreamInfo['broadcasterRole'];
       }
     >();
@@ -856,6 +908,7 @@ export class SfuManager {
           username: v.user.username,
           displayName: v.user.displayName,
           avatarColor: v.user.avatarColor,
+          avatarUrl: v.user.avatarUrl ?? null,
           role: v.user.role ?? 'member',
         });
       }
@@ -869,11 +922,17 @@ export class SfuManager {
       broadcasterUsername: record.broadcaster.username,
       broadcasterDisplayName: record.broadcaster.displayName,
       broadcasterAvatarColor: record.broadcaster.avatarColor,
+      broadcasterAvatarUrl: record.broadcaster.avatarUrl ?? null,
       broadcasterRole: record.broadcaster.role ?? 'member',
       title: record.title,
       resolution: record.resolution,
       fps: record.fps,
       targetBitrateKbps: record.targetBitrateKbps,
+      audioBitrateKbps: record.audioBitrateKbps,
+      privacy: record.privacy,
+      viewerLimit: record.viewerLimit,
+      connectionMode: record.connectionMode,
+      relayActive: record.relayActive,
       hasAudio: Boolean(record.audioProducer && !record.audioProducer.closed),
       audioIsolationMode: record.audioIsolationMode,
       startedAt: record.startedAt,
@@ -901,4 +960,3 @@ export class SfuManager {
     this.workers = [];
   }
 }
-

@@ -7,13 +7,23 @@ class AetherVoiceGateProcessor extends AudioWorkletProcessor {
     this.vadSensitivityDb = -48;
     this.pttActive = false;
     this.muted = false;
+    this.keyboardSuppressionEnabled = true;
+    this.meterActive = false;
 
     this.currentGain = 0;
+    this.transientGain = 1.0;
     this.holdSamplesRemaining = 0;
     this.vadHoldSamplesRemaining = 0;
+    this.sustainedVoiceFrames = 0;
     this.samplesSinceReport = 0;
     this.smoothedDb = -96;
     this.lastSpeaking = false;
+
+    // 5ms Lookahead Circular Buffer (240 samples @ 48kHz)
+    // Ensures gate & VAD open 5ms BEFORE the first syllable phoneme reaches output — zero clipped words!
+    this.lookaheadSamples = Math.max(64, Math.round(sampleRate * 0.005));
+    this.lookaheadBuf = new Float32Array(this.lookaheadSamples);
+    this.lookaheadIdx = 0;
 
     this.port.onmessage = (event) => {
       const msg = event.data;
@@ -24,6 +34,12 @@ class AetherVoiceGateProcessor extends AudioWorkletProcessor {
       if (typeof msg.vadSensitivityDb === 'number') this.vadSensitivityDb = msg.vadSensitivityDb;
       if (typeof msg.pttActive === 'boolean') this.pttActive = msg.pttActive;
       if (typeof msg.muted === 'boolean') this.muted = msg.muted;
+      if (typeof msg.keyboardSuppressionEnabled === 'boolean') {
+        this.keyboardSuppressionEnabled = msg.keyboardSuppressionEnabled;
+      }
+      if (typeof msg.meterActive === 'boolean') {
+        this.meterActive = msg.meterActive;
+      }
     };
   }
 
@@ -42,28 +58,58 @@ class AetherVoiceGateProcessor extends AudioWorkletProcessor {
 
     const inChan = input[0];
     let sumSq = 0;
+    let peak = 0;
+    let zeroCrossings = 0;
+    let prevSample = inChan[0] || 0;
+
     for (let i = 0; i < inChan.length; i++) {
       const s = inChan[i];
       sumSq += s * s;
+      const abs = s < 0 ? -s : s;
+      if (abs > peak) peak = abs;
+      if ((s >= 0 && prevSample < 0) || (s < 0 && prevSample >= 0)) {
+        zeroCrossings++;
+      }
+      prevSample = s;
     }
+
     const rms = Math.sqrt(sumSq / inChan.length);
     const instantDb = rms > 1e-6 ? 20 * Math.log10(rms) : -96;
+    const zcr = zeroCrossings / inChan.length;
+    const crestFactor = peak / (rms + 1e-5);
+
     this.smoothedDb = instantDb > this.smoothedDb
       ? this.smoothedDb * 0.45 + instantDb * 0.55
       : this.smoothedDb * 0.85 + instantDb * 0.15;
 
-    const holdSamples = Math.round(sampleRate * 0.18); // 180ms hold
-    const vadHoldSamples = Math.round(sampleRate * 0.24); // 240ms natural speech syllable hold
+    // Detect sustained harmonic speech vs isolated mechanical keyboard/mouse micro-clicks (<12ms)
+    const looksLikeSustainedSpeech = instantDb >= this.noiseGateThresholdDb && zcr < 0.23 && crestFactor < 4.2;
+    if (looksLikeSustainedSpeech) {
+      this.sustainedVoiceFrames = Math.min(20, this.sustainedVoiceFrames + 1);
+    } else {
+      this.sustainedVoiceFrames = Math.max(0, this.sustainedVoiceFrames - 1);
+    }
 
-    // 1. Noise Gate decision with 4 dB hysteresis
+    const isMechanicalClickTransient =
+      this.keyboardSuppressionEnabled &&
+      this.sustainedVoiceFrames < 2 &&
+      instantDb > -60 &&
+      (crestFactor > 3.7 || zcr > 0.25);
+
+    const effectiveDb = isMechanicalClickTransient ? instantDb - 18 : instantDb;
+
+    const holdSamples = Math.round(sampleRate * 0.20); // 200ms natural speech hold
+    const vadHoldSamples = Math.round(sampleRate * 0.26); // 260ms natural syllable hold
+
+    // 1. Noise Gate decision with 4.5 dB hysteresis
     let gateOpen = true;
     if (this.noiseGateEnabled) {
       const openThresh = this.noiseGateThresholdDb;
-      const closeThresh = openThresh - 4;
-      if (instantDb >= openThresh) {
+      const closeThresh = openThresh - 4.5;
+      if (effectiveDb >= openThresh) {
         this.holdSamplesRemaining = holdSamples;
         gateOpen = true;
-      } else if (instantDb >= closeThresh && this.holdSamplesRemaining > 0) {
+      } else if (effectiveDb >= closeThresh && this.holdSamplesRemaining > 0) {
         gateOpen = true;
       } else if (this.holdSamplesRemaining > 0) {
         this.holdSamplesRemaining = Math.max(0, this.holdSamplesRemaining - frameLen);
@@ -80,7 +126,7 @@ class AetherVoiceGateProcessor extends AudioWorkletProcessor {
     } else if (this.voiceMode === 'ptt') {
       voiceOpen = this.pttActive;
     } else {
-      if (instantDb >= this.vadSensitivityDb) {
+      if (effectiveDb >= this.vadSensitivityDb) {
         this.vadHoldSamplesRemaining = vadHoldSamples;
         voiceOpen = true;
       } else if (this.vadHoldSamplesRemaining > 0) {
@@ -92,23 +138,35 @@ class AetherVoiceGateProcessor extends AudioWorkletProcessor {
     }
 
     const targetOpen = !this.muted && gateOpen && voiceOpen;
-    const attackCoeff = 1 - Math.exp(-1 / (sampleRate * 0.003)); // 3ms crisp attack
-    const releaseCoeff = 1 - Math.exp(-1 / (sampleRate * 0.09)); // 90ms smooth release
+    const targetTransient = isMechanicalClickTransient ? 0.14 : 1.0;
 
+    const attackCoeff = 1 - Math.exp(-1 / (sampleRate * 0.0025)); // 2.5ms ultra-smooth attack (paired with 5ms lookahead)
+    const releaseCoeff = 1 - Math.exp(-1 / (sampleRate * 0.11)); // 110ms broadcast-grade tail release
+    const transientCoeff = isMechanicalClickTransient ? 0.35 : 0.08;
+
+    const outChan0 = output[0];
     for (let i = 0; i < frameLen; i++) {
+      const delayedSample = this.lookaheadBuf[this.lookaheadIdx];
+      this.lookaheadBuf[this.lookaheadIdx] = inChan[i];
+      this.lookaheadIdx = (this.lookaheadIdx + 1) % this.lookaheadSamples;
+
       const target = targetOpen ? 1.0 : 0.0;
       const coeff = target > this.currentGain ? attackCoeff : releaseCoeff;
       this.currentGain += (target - this.currentGain) * coeff;
+      this.transientGain += (targetTransient - this.transientGain) * transientCoeff;
 
-      for (let c = 0; c < output.length; c++) {
-        const src = input[c] || inChan;
-        output[c][i] = src[i] * this.currentGain;
+      const processedSample = delayedSample * this.currentGain * this.transientGain;
+      outChan0[i] = processedSample;
+      for (let c = 1; c < output.length; c++) {
+        output[c][i] = processedSample;
       }
     }
 
     this.samplesSinceReport += frameLen;
     const speakingNow = targetOpen && this.currentGain > 0.15;
-    if (this.samplesSinceReport >= Math.round(sampleRate * 0.02) || speakingNow !== this.lastSpeaking) {
+    const speakingChanged = speakingNow !== this.lastSpeaking;
+
+    if (speakingChanged || (this.meterActive && this.samplesSinceReport >= Math.round(sampleRate * 0.02))) {
       this.samplesSinceReport = 0;
       this.lastSpeaking = speakingNow;
       this.port.postMessage({
@@ -179,4 +237,3 @@ class AetherPcmBridgeProcessor extends AudioWorkletProcessor {
 
 registerProcessor('aether-voice-gate-processor', AetherVoiceGateProcessor);
 registerProcessor('aether-pcm-bridge-processor', AetherPcmBridgeProcessor);
-

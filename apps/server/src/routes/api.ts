@@ -11,6 +11,7 @@ import {
   LoginInputSchema,
   RegisterInputSchema,
   ROLE_RANK,
+  UpdateProfileInputSchema,
   UserSettingsSchema,
   type AuthUser,
 } from '@aether/shared';
@@ -72,7 +73,7 @@ async function requireAuthUser(req: FastifyRequest, reply: FastifyReply, db: App
     });
     return null;
   }
-  return db.mapAuthUser(row);
+  return db.enrichAuthUser(row);
 }
 
 async function issueSessionTokens(
@@ -112,6 +113,9 @@ function findDesktopInstallerFile(): { fullPath: string; filename: string; sizeB
   return { fullPath, filename: exe, sizeBytes: stat.size };
 }
 
+const DEFAULT_GITHUB_INSTALLER_URL =
+  'https://github.com/homepython/aether-platform/releases/download/v1.1.0/Aether-Setup-1.1.0.exe';
+
 export async function registerApiRoutes(
   app: FastifyInstance,
   deps: {
@@ -126,7 +130,8 @@ export async function registerApiRoutes(
     return {
       status: 'ok',
       service: 'aether-realtime-server',
-      version: '1.0.0',
+      version: config.appVersion,
+      maxUploadBytes: config.maxUploadBytes,
       database: db.isPostgres ? 'postgresql' : 'sqlite-wal',
       cluster: config.redisUrl ? 'redis-multi-node' : 'single-node',
       onlineConnections: gateway.getOnlineCount(),
@@ -203,7 +208,6 @@ export async function registerApiRoutes(
 
     const row = await db.findUserRowByIdentifier(parsed.data.identifier);
     if (!row) {
-      // Constant-time scrypt execution prevents timing-based username/email enumeration
       await verifyDummyPassword(parsed.data.password);
       authGuard.recordLoginFailure(req.ip, parsed.data.identifier);
       return reply.code(401).send({ error: 'Usuário ou senha incorretos' });
@@ -225,13 +229,12 @@ export async function registerApiRoutes(
       });
     }
 
-    // Transparently upgrade legacy password hashes to scrypt2 + pepper
     if (needsPasswordRehash(row.password_hash)) {
       const upgradedHash = await hashPassword(parsed.data.password);
       await db.updateUserPasswordHash(row.id, upgradedHash);
     }
 
-    const user = db.mapAuthUser(row);
+    const user = await db.enrichAuthUser(row);
     const tokens = await issueSessionTokens(db, user.id, user.username);
     reply.header(
       'Set-Cookie',
@@ -286,7 +289,7 @@ export async function registerApiRoutes(
           : 'Sua conta foi suspensa pela administração.',
       });
     }
-    const user = db.mapAuthUser(row);
+    const user = await db.enrichAuthUser(row);
     const tokens = await issueSessionTokens(db, user.id, user.username, consumed.familyId);
     reply.header(
       'Set-Cookie',
@@ -337,16 +340,104 @@ export async function registerApiRoutes(
     return { settings: saved };
   });
 
-  // User Profile Update
+  // Editable User Profile (DisplayName, Nickname with 3x/24h Guard, Bio, AvatarColor, AvatarUrl, Presence)
   app.patch('/api/users/me/profile', async (req, reply) => {
     const user = await requireAuthUser(req, reply, db);
     if (!user) return;
-    const body = (req.body || {}) as { displayName?: string; avatarUrl?: string | null };
-    if (body.displayName !== undefined && (body.displayName.trim().length < 2 || body.displayName.trim().length > 40)) {
-      return reply.code(400).send({ error: 'Nome de exibição deve ter entre 2 e 40 caracteres' });
+    const parsed = UpdateProfileInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: parsed.error.issues[0]?.message || 'Dados de perfil inválidos',
+      });
     }
-    const updated = await db.updateUserProfile(user.id, body);
-    return { user: updated };
+
+    try {
+      const updated = await db.updateUserProfile(user.id, parsed.data);
+      if (!updated) {
+        return reply.code(404).send({ error: 'Conta não encontrada' });
+      }
+      await gateway.syncUserProfileEverywhere(updated);
+      return { user: updated };
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      const lockedUntil = (err as { lockedUntil?: string })?.lockedUntil ?? null;
+      const message = err instanceof Error ? err.message : 'Erro ao atualizar perfil';
+      if (code === 'NICKNAME_RATE_LIMIT') {
+        return reply.code(429).send({ error: message, code, lockedUntil });
+      }
+      if (code === 'USERNAME_TAKEN') {
+        return reply.code(409).send({ error: message, code });
+      }
+      return reply.code(400).send({ error: message });
+    }
+  });
+
+  // User Avatar Upload (Static PNG/JPEG/WebP + Full Multi-Frame Animated GIF / WebP Preservation)
+  app.post(
+    '/api/users/me/avatar',
+    { bodyLimit: config.maxAvatarBytes + 2 * 1024 * 1024 },
+    async (req, reply) => {
+      const user = await requireAuthUser(req, reply, db);
+      if (!user) return;
+
+      const data = await req.file({ limits: { fileSize: config.maxAvatarBytes } });
+      if (!data) {
+        return reply.code(400).send({ error: 'Nenhuma imagem de perfil enviada' });
+      }
+
+      const mimeType = (data.mimetype || '').toLowerCase();
+      if (!/^image\/(png|jpeg|jpg|webp|gif)$/i.test(mimeType)) {
+        data.file.resume();
+        return reply.code(400).send({
+          error: 'Formato não suportado. Use PNG, JPG, WebP ou GIF animado.',
+        });
+      }
+
+      try {
+        const stored = await storage.storeStream({
+          stream: data.file,
+          originalFilename: data.filename || 'avatar',
+          mimeType,
+          maxBytes: config.maxAvatarBytes,
+        });
+
+        if (!stored.width || !stored.height) {
+          const local = storage.resolveLocalFilePath(stored.storageKey);
+          if (local) await fs.promises.unlink(local).catch(() => {});
+          return reply.code(400).send({
+            error: 'Arquivo de imagem inválido ou corrompido.',
+          });
+        }
+
+        const updated = await db.updateUserProfile(user.id, { avatarUrl: stored.urlPath });
+        if (!updated) {
+          return reply.code(404).send({ error: 'Conta não encontrada' });
+        }
+
+        await gateway.syncUserProfileEverywhere(updated);
+        return { user: updated, avatarUrl: stored.urlPath };
+      } catch (err) {
+        const code = (err as { code?: string })?.code;
+        const message = err instanceof Error ? err.message : 'Falha ao enviar foto de perfil';
+        if (code === 'PAYLOAD_TOO_LARGE') {
+          return reply.code(413).send({ error: message });
+        }
+        return reply.code(400).send({ error: message });
+      }
+    }
+  );
+
+  // Public User Card Lookup by Username
+  app.get('/api/users/:username/profile', async (req, reply) => {
+    const authUser = await requireAuthUser(req, reply, db);
+    if (!authUser) return;
+    const { username } = req.params as { username: string };
+    const clean = decodeURIComponent(username).trim().replace(/^@+/, '').toLowerCase();
+    const matches = await db.findUsersByUsernames([clean]);
+    if (!matches[0]) {
+      return reply.code(404).send({ error: 'Usuário não encontrado' });
+    }
+    return { user: matches[0] };
   });
 
   // Rooms List & Creation
@@ -451,11 +542,12 @@ export async function registerApiRoutes(
     return { user: updated };
   });
 
+  // Accessible to Moderator, Admin, and Owner so Moderators have full Moderation Panel visibility
   app.get('/api/admin/users', async (req, reply) => {
     const user = await requireAuthUser(req, reply, db);
     if (!user) return;
-    if (!hasRoleAtLeast(user.role, 'admin')) {
-      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+    if (!hasRoleAtLeast(user.role, 'moderator')) {
+      return reply.code(403).send({ error: 'Acesso restrito à equipe de moderação e administração' });
     }
     const users = await db.listAllUsersForAdmin(gateway.getOnlineUserMap());
     return { users };
@@ -465,7 +557,7 @@ export async function registerApiRoutes(
     const user = await requireAuthUser(req, reply, db);
     if (!user) return;
     if (!hasRoleAtLeast(user.role, 'admin')) {
-      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+      return reply.code(403).send({ error: 'Somente Administradores ou o Fundador podem alterar cargos' });
     }
 
     const { userId } = req.params as { userId: string };
@@ -519,7 +611,7 @@ export async function registerApiRoutes(
     const user = await requireAuthUser(req, reply, db);
     if (!user) return;
     if (!hasRoleAtLeast(user.role, 'admin')) {
-      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+      return reply.code(403).send({ error: 'Somente Administradores ou o Fundador podem suspender contas' });
     }
 
     const { userId } = req.params as { userId: string };
@@ -569,66 +661,61 @@ export async function registerApiRoutes(
   app.get('/api/admin/audit-logs', async (req, reply) => {
     const user = await requireAuthUser(req, reply, db);
     if (!user) return;
-    if (!hasRoleAtLeast(user.role, 'admin')) {
-      return reply.code(403).send({ error: 'Acesso restrito à administração' });
+    if (!hasRoleAtLeast(user.role, 'moderator')) {
+      return reply.code(403).send({ error: 'Acesso restrito à equipe de moderação e administração' });
     }
     const logs = await db.listAdminAuditLogs(100);
     return { logs };
   });
 
-  // File & Clipboard Image Upload
-  app.post('/api/uploads', async (req, reply) => {
-    const user = await requireAuthUser(req, reply, db);
-    if (!user) return;
+  // Zero-RAM Streaming File & Clipboard Upload (up to 550 MB)
+  app.post(
+    '/api/uploads',
+    { bodyLimit: config.maxUploadBytes + 4 * 1024 * 1024 },
+    async (req, reply) => {
+      const user = await requireAuthUser(req, reply, db);
+      if (!user) return;
 
-    const data = await req.file({ limits: { fileSize: config.maxUploadBytes } });
-    if (!data) {
-      return reply.code(400).send({ error: 'Nenhum arquivo enviado' });
-    }
-
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of data.file) {
-      total += chunk.length;
-      if (total > config.maxUploadBytes) {
-        return reply.code(413).send({ error: 'Arquivo excede o limite de 50 MB' });
+      const data = await req.file({ limits: { fileSize: config.maxUploadBytes } });
+      if (!data) {
+        return reply.code(400).send({ error: 'Nenhum arquivo enviado' });
       }
-      chunks.push(chunk);
+
+      const mimeType = data.mimetype || 'application/octet-stream';
+      try {
+        const stored = await storage.storeStream({
+          stream: data.file,
+          originalFilename: data.filename || 'upload',
+          mimeType,
+          maxBytes: config.maxUploadBytes,
+        });
+
+        const attachment = await db.createAttachment({
+          uploaderId: user.id,
+          roomId: null,
+          filename: data.filename || 'arquivo',
+          mimeType,
+          sizeBytes: stored.sizeBytes,
+          storageKey: stored.storageKey,
+          urlPath: stored.urlPath,
+          isImage: stored.isImage,
+          width: stored.width,
+          height: stored.height,
+        });
+
+        return reply.code(201).send({ attachment });
+      } catch (err) {
+        const code = (err as { code?: string })?.code;
+        const message = err instanceof Error ? err.message : 'Falha ao processar upload';
+        if (code === 'PAYLOAD_TOO_LARGE') {
+          return reply.code(413).send({ error: message });
+        }
+        return reply.code(400).send({ error: message });
+      }
     }
+  );
 
-    if (data.file.truncated) {
-      return reply.code(413).send({ error: 'Arquivo excede o limite máximo permitido' });
-    }
-
-    const buffer = Buffer.concat(chunks);
-    if (buffer.length === 0) {
-      return reply.code(400).send({ error: 'Arquivo vazio' });
-    }
-
-    const mimeType = data.mimetype || 'application/octet-stream';
-    const stored = await storage.storeBuffer({
-      buffer,
-      originalFilename: data.filename || 'upload',
-      mimeType,
-    });
-
-    const attachment = await db.createAttachment({
-      uploaderId: user.id,
-      roomId: null,
-      filename: data.filename || 'arquivo',
-      mimeType,
-      sizeBytes: stored.sizeBytes,
-      storageKey: stored.storageKey,
-      urlPath: stored.urlPath,
-      isImage: stored.isImage,
-      width: stored.width,
-      height: stored.height,
-    });
-
-    return reply.code(201).send({ attachment });
-  });
-
-  // Serve uploaded files securely
+  // Serve uploaded files securely with HTTP Range support for 500 MB video/audio streaming
   app.get('/uploads/:storageKey', async (req, reply) => {
     const { storageKey } = req.params as { storageKey: string };
     const decoded = decodeURIComponent(storageKey);
@@ -636,6 +723,9 @@ export async function registerApiRoutes(
     if (!localPath) {
       return reply.code(404).send({ error: 'Arquivo não encontrado' });
     }
+
+    const stat = await fs.promises.stat(localPath);
+    const totalSize = stat.size;
 
     const ext = path.extname(localPath).toLowerCase();
     const mimeByExt: Record<string, string> = {
@@ -649,19 +739,46 @@ export async function registerApiRoutes(
       '.txt': 'text/plain; charset=utf-8',
       '.mp4': 'video/mp4',
       '.webm': 'video/webm',
+      '.mkv': 'video/x-matroska',
+      '.mov': 'video/quicktime',
       '.mp3': 'audio/mpeg',
+      '.ogg': 'audio/ogg',
+      '.flac': 'audio/flac',
       '.wav': 'audio/wav',
       '.zip': 'application/zip',
+      '.7z': 'application/x-7z-compressed',
+      '.rar': 'application/vnd.rar',
     };
     const contentType = mimeByExt[ext] || 'application/octet-stream';
-    const isSafeInline = contentType.startsWith('image/') || contentType === 'application/pdf';
+    const isSafeInline =
+      contentType.startsWith('image/') ||
+      contentType.startsWith('video/') ||
+      contentType.startsWith('audio/') ||
+      contentType === 'application/pdf';
 
     reply.header('Content-Type', contentType);
     reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Accept-Ranges', 'bytes');
     reply.header('Cache-Control', 'public, max-age=31536000, immutable');
     if (!isSafeInline) {
       reply.header('Content-Disposition', `attachment; filename="${path.basename(localPath)}"`);
     }
+
+    const rangeHeader = req.headers.range;
+    if (rangeHeader && typeof rangeHeader === 'string' && rangeHeader.startsWith('bytes=')) {
+      const [startStr, endStr] = rangeHeader.replace(/bytes=/, '').split('-');
+      const start = Number.parseInt(startStr, 10);
+      const end = endStr ? Number.parseInt(endStr, 10) : totalSize - 1;
+      if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && start <= end && end < totalSize) {
+        const chunkSize = end - start + 1;
+        reply.code(206);
+        reply.header('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+        reply.header('Content-Length', String(chunkSize));
+        return reply.send(fs.createReadStream(localPath, { start, end }));
+      }
+    }
+
+    reply.header('Content-Length', String(totalSize));
     return reply.send(fs.createReadStream(localPath));
   });
 
@@ -670,12 +787,12 @@ export async function registerApiRoutes(
     const externalUrl = process.env.DESKTOP_INSTALLER_URL || '';
     const installer = findDesktopInstallerFile();
     return {
-      version: '1.0.0',
+      version: config.appVersion,
       platform: 'Windows 10 / 11 (64-bit)',
-      available: Boolean(externalUrl || installer),
-      filename: installer?.filename || 'Aether-Setup-1.0.0.exe',
+      available: true,
+      filename: installer?.filename || `Aether-Setup-${config.appVersion}.exe`,
       sizeBytes: installer?.sizeBytes || null,
-      downloadUrl: externalUrl || '/api/releases/desktop/windows',
+      downloadUrl: externalUrl || (installer ? '/api/releases/desktop/windows' : DEFAULT_GITHUB_INSTALLER_URL),
     };
   });
 
@@ -685,9 +802,7 @@ export async function registerApiRoutes(
     }
     const installer = findDesktopInstallerFile();
     if (!installer) {
-      return reply.code(404).send({
-        error: 'Instalador Desktop ainda não foi compilado no diretório de releases.',
-      });
+      return reply.redirect(DEFAULT_GITHUB_INSTALLER_URL);
     }
     reply.header('Content-Type', 'application/vnd.microsoft.portable-executable');
     reply.header('Content-Length', String(installer.sizeBytes));
@@ -695,4 +810,3 @@ export async function registerApiRoutes(
     return reply.send(fs.createReadStream(installer.fullPath));
   });
 }
-

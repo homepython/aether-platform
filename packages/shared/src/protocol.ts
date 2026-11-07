@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import {
+  StreamConnectionModeSchema,
   StreamFpsSchema,
+  StreamPrivacyModeSchema,
   StreamResolutionSchema,
   TransportDirectionSchema,
   TransportPlaneSchema,
@@ -8,9 +10,12 @@ import {
 import type {
   ActiveStreamInfo,
   ChatMessage,
+  DirectMessage,
+  FriendEntry,
   IceServerConfig,
   RoomParticipant,
   RoomSummary,
+  UserPublic,
   UserRole,
 } from './models.js';
 
@@ -19,6 +24,7 @@ export const ClientRpcMethodSchema = z.enum([
   'lobby:listRooms',
   'room:join',
   'room:leave',
+  'room:syncState',
   'voice:updateState',
   'sfu:createTransport',
   'sfu:connectTransport',
@@ -39,10 +45,26 @@ export const ClientRpcMethodSchema = z.enum([
   'p2p:streamStop',
   'p2p:streamWatch',
   'p2p:streamUnwatch',
+  'stream:relayStart',
+  'stream:relayInitSegment',
+  'stream:relayStop',
+  'stream:relayWatch',
+  'stream:relayUnwatch',
   'chat:send',
   'chat:edit',
   'chat:delete',
   'chat:history',
+  'friends:list',
+  'friends:request',
+  'friends:respond',
+  'friends:remove',
+  'friends:inviteToRoom',
+  'dm:history',
+  'dm:send',
+  'dm:edit',
+  'dm:delete',
+  'dm:typing',
+  'dm:markRead',
   'admin:kickParticipant',
   'admin:forceMuteParticipant',
   'admin:forceStopStream',
@@ -93,16 +115,28 @@ export const SfuResumeConsumerParamsSchema = z.object({
   consumerId: z.string().min(1),
 });
 
+export const AudioIsolationModeSchema = z.enum([
+  'process-isolated',
+  'multi-process',
+  'tab-isolated',
+  'system-direct',
+  'none',
+]);
+export type AudioIsolationMode = z.infer<typeof AudioIsolationModeSchema>;
+
 export const StreamStartParamsSchema = z
   .object({
     transportId: z.string().min(1),
     title: z.string().trim().min(1).max(80).default('Transmissão ao Vivo'),
     resolution: StreamResolutionSchema,
     fps: StreamFpsSchema,
-    targetBitrateKbps: z.number().min(2000).max(35000),
-    audioIsolationMode: z
-      .enum(['process-isolated', 'tab-isolated', 'system-direct', 'none'])
-      .default('none'),
+    targetBitrateKbps: z.number().min(300).max(60000),
+    audioBitrateKbps: z.number().min(32).max(510).default(320),
+    privacy: StreamPrivacyModeSchema.default('public'),
+    allowedUserIds: z.array(z.string()).max(200).default([]),
+    viewerLimit: z.number().int().min(1).max(500).nullable().default(null),
+    connectionMode: StreamConnectionModeSchema.default('auto'),
+    audioIsolationMode: AudioIsolationModeSchema.default('none'),
     videoProducerId: z.string().min(1).optional(),
     audioProducerId: z.string().min(1).optional().nullable(),
     videoRtpParameters: z.any().optional(),
@@ -114,9 +148,12 @@ export const StreamStartParamsSchema = z
 
 export const StreamUpdateMetaParamsSchema = z.object({
   streamId: z.string().min(1),
-  resolution: StreamResolutionSchema,
-  fps: StreamFpsSchema,
-  targetBitrateKbps: z.number().min(2000).max(35000),
+  resolution: StreamResolutionSchema.optional(),
+  fps: StreamFpsSchema.optional(),
+  targetBitrateKbps: z.number().min(300).max(60000).optional(),
+  audioBitrateKbps: z.number().min(32).max(510).optional(),
+  privacy: StreamPrivacyModeSchema.optional(),
+  viewerLimit: z.number().int().min(1).max(500).nullable().optional(),
 });
 
 export const StreamTelemetryParamsSchema = z.object({
@@ -152,11 +189,24 @@ export const P2pStreamStartParamsSchema = z.object({
   title: z.string().trim().min(1).max(80).default('Transmissão ao Vivo'),
   resolution: StreamResolutionSchema,
   fps: StreamFpsSchema,
-  targetBitrateKbps: z.number().min(2000).max(35000),
+  targetBitrateKbps: z.number().min(300).max(60000),
+  audioBitrateKbps: z.number().min(32).max(510).default(320),
+  privacy: StreamPrivacyModeSchema.default('public'),
+  allowedUserIds: z.array(z.string()).max(200).default([]),
+  viewerLimit: z.number().int().min(1).max(500).nullable().default(null),
+  connectionMode: StreamConnectionModeSchema.default('auto'),
   hasAudio: z.boolean().default(false),
-  audioIsolationMode: z
-    .enum(['process-isolated', 'tab-isolated', 'system-direct', 'none'])
-    .default('none'),
+  audioIsolationMode: AudioIsolationModeSchema.default('none'),
+});
+
+export const StreamRelayStartParamsSchema = z.object({
+  streamId: z.string().min(1),
+  mimeType: z.string().min(3).max(160),
+});
+
+export const StreamRelayInitParamsSchema = z.object({
+  streamId: z.string().min(1),
+  base64Init: z.string().min(1).max(2_000_000),
 });
 
 export const ChatSendParamsSchema = z.object({
@@ -178,6 +228,61 @@ export const ChatHistoryParamsSchema = z.object({
   roomId: z.string().min(1),
   beforeCreatedAt: z.string().optional(),
   limit: z.number().int().min(1).max(100).default(50),
+});
+
+export const FriendRequestParamsSchema = z.object({
+  username: z.string().trim().min(2).max(40),
+});
+
+export const FriendRespondParamsSchema = z.object({
+  friendshipId: z.string().min(1),
+  accept: z.boolean(),
+});
+
+export const FriendRemoveParamsSchema = z.object({
+  friendshipId: z.string().min(1),
+});
+
+export const FriendInviteToRoomParamsSchema = z.object({
+  targetUserId: z.string().min(1),
+  roomId: z.string().min(1),
+});
+
+export const DmHistoryParamsSchema = z.object({
+  peerUserId: z.string().min(1),
+  beforeCreatedAt: z.string().optional(),
+  limit: z.number().int().min(1).max(100).default(60),
+});
+
+export const DmSendParamsSchema = z.object({
+  recipientId: z.string().min(1),
+  content: z.string().max(4000),
+  attachmentIds: z.array(z.string()).max(8).default([]),
+  roomInvite: z
+    .object({
+      roomId: z.string().min(1),
+      roomName: z.string().min(1).max(80),
+    })
+    .optional()
+    .nullable(),
+});
+
+export const DmEditParamsSchema = z.object({
+  messageId: z.string().min(1),
+  content: z.string().trim().min(1).max(4000),
+});
+
+export const DmDeleteParamsSchema = z.object({
+  messageId: z.string().min(1),
+});
+
+export const DmTypingParamsSchema = z.object({
+  recipientId: z.string().min(1),
+  typing: z.boolean(),
+});
+
+export const DmMarkReadParamsSchema = z.object({
+  peerUserId: z.string().min(1),
 });
 
 export const AdminKickParticipantParamsSchema = z.object({
@@ -249,6 +354,16 @@ export interface StreamWatchResult {
 export type ServerPushEvent =
   | { type: 'event'; event: 'connected'; payload: { peerId: string; serverTime: string } }
   | { type: 'event'; event: 'lobby:roomsUpdated'; payload: { rooms: RoomSummary[] } }
+  | {
+      type: 'event';
+      event: 'room:stateSynced';
+      payload: {
+        roomId: string;
+        room: RoomSummary;
+        participants: RoomParticipant[];
+        activeStreams: ActiveStreamInfo[];
+      };
+    }
   | { type: 'event'; event: 'room:participantJoined'; payload: { roomId: string; participant: RoomParticipant } }
   | { type: 'event'; event: 'room:participantLeft'; payload: { roomId: string; peerId: string; userId: string } }
   | {
@@ -281,6 +396,16 @@ export type ServerPushEvent =
       type: 'event';
       event: 'room:streamStopped';
       payload: { roomId: string; streamId: string; broadcasterId: string };
+    }
+  | {
+      type: 'event';
+      event: 'stream:relayReady';
+      payload: { streamId: string; mimeType: string; base64Init?: string | null };
+    }
+  | {
+      type: 'event';
+      event: 'stream:relayViewerNeeded';
+      payload: { streamId: string };
     }
   | { type: 'event'; event: 'chat:messageCreated'; payload: { message: ChatMessage } }
   | { type: 'event'; event: 'chat:messageUpdated'; payload: { message: ChatMessage } }
@@ -324,6 +449,68 @@ export type ServerPushEvent =
     }
   | {
       type: 'event';
+      event: 'user:profileUpdated';
+      payload: {
+        user: UserPublic;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'friends:updated';
+      payload: {
+        friends?: FriendEntry[];
+        reason: string;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'friends:roomInvite';
+      payload: {
+        fromUser: UserPublic;
+        roomId: string;
+        roomName: string;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'dm:messageCreated';
+      payload: {
+        message: DirectMessage;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'dm:messageUpdated';
+      payload: {
+        message: DirectMessage;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'dm:messageDeleted';
+      payload: {
+        messageId: string;
+        conversationKey: string;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'dm:typing';
+      payload: {
+        fromUserId: string;
+        typing: boolean;
+      };
+    }
+  | {
+      type: 'event';
+      event: 'dm:read';
+      payload: {
+        byUserId: string;
+        readAt: string;
+      };
+    }
+  | {
+      type: 'event';
       event: 'admin:kickedFromRoom';
       payload: {
         roomId: string;
@@ -347,4 +534,3 @@ export type ServerPushEvent =
         reason: string;
       };
     };
-

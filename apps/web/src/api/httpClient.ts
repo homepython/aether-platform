@@ -7,6 +7,8 @@ import type {
   LoginInput,
   RegisterInput,
   RoomSummary,
+  UpdateProfileInput,
+  UserPublic,
   UserSettings,
 } from '@aether/shared';
 import { getDesktopApi } from '../bridge/DesktopBridge.js';
@@ -74,7 +76,7 @@ export function setServerBaseUrl(url: string): void {
 }
 
 export function resolveServerAssetUrl(pathOrUrl: string): string {
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+  if (/^(https?:|blob:|data:)/i.test(pathOrUrl)) return pathOrUrl;
   const base = getServerBaseUrl();
   const cleanPath = pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`;
   return `${base}${cleanPath}`;
@@ -110,7 +112,6 @@ async function persistSecureSessionTokens(
       await desktop.secureVault.clearSession().catch(() => {});
     }
   } else {
-    // Browser relies on HttpOnly; SameSite=Strict cookie (`aether_rt`) set by the server
     try {
       if (accessToken) {
         localStorage.setItem(SESSION_HINT_KEY, '1');
@@ -177,11 +178,6 @@ async function performSessionRefresh(): Promise<{ user: AuthUser; accessToken: s
   return refreshPromise;
 }
 
-/**
- * Restores an authenticated user session securely on app launch:
- * - Desktop: decrypts refresh token from Windows DPAPI (`electron.safeStorage`)
- * - Web: uses the `HttpOnly` refresh cookie without ever storing tokens in `localStorage`
- */
 export async function restoreSecureSession(): Promise<AuthUser | null> {
   const desktop = getDesktopApi();
   if (!desktop) {
@@ -238,16 +234,114 @@ export async function apiRequest<T>(
 
   if (!res.ok) {
     let errMsg = `Erro HTTP ${res.status}`;
+    let errCode: string | undefined;
+    let lockedUntil: string | null | undefined;
     try {
-      const body = (await res.json()) as { error?: string };
+      const body = (await res.json()) as {
+        error?: string;
+        code?: string;
+        lockedUntil?: string | null;
+      };
       if (body?.error) errMsg = body.error;
+      errCode = body?.code;
+      lockedUntil = body?.lockedUntil;
     } catch {
       // Ignore JSON parse error
     }
-    throw new Error(errMsg);
+    throw Object.assign(new Error(errMsg), {
+      status: res.status,
+      code: errCode,
+      lockedUntil,
+    });
   }
 
   return (await res.json()) as T;
+}
+
+export interface UploadProgressInfo {
+  percent: number;
+  loadedBytes: number;
+  totalBytes: number;
+}
+
+async function uploadMultipartWithProgress<T>(
+  path: string,
+  file: File | Blob,
+  filename: string,
+  onProgress?: (info: UploadProgressInfo) => void,
+  retried = false
+): Promise<T> {
+  if (!memoryAccessToken) {
+    await performSessionRefresh();
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${getServerBaseUrl()}${path}`, true);
+    xhr.withCredentials = true;
+    xhr.timeout = 0; // Zero timeout so 500 MB+ files upload reliably on any connection speed
+
+    if (memoryAccessToken) {
+      xhr.setRequestHeader('Authorization', `Bearer ${memoryAccessToken}`);
+    }
+
+    if (onProgress) {
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && ev.total > 0) {
+          const percent = Math.min(100, Math.round((ev.loaded / ev.total) * 100));
+          onProgress({ percent, loadedBytes: ev.loaded, totalBytes: ev.total });
+        }
+      };
+    }
+
+    xhr.onload = async () => {
+      if (xhr.status === 401 && !retried) {
+        const refreshed = await performSessionRefresh();
+        if (refreshed?.accessToken) {
+          try {
+            const retryRes = await uploadMultipartWithProgress<T>(
+              path,
+              file,
+              filename,
+              onProgress,
+              true
+            );
+            resolve(retryRes);
+            return;
+          } catch (retryErr) {
+            reject(retryErr);
+            return;
+          }
+        }
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as T);
+        } catch {
+          reject(new Error('Resposta inválida do servidor no envio de arquivo'));
+        }
+        return;
+      }
+
+      let errMsg = `Erro HTTP ${xhr.status}`;
+      try {
+        const parsed = JSON.parse(xhr.responseText) as { error?: string };
+        if (parsed?.error) errMsg = parsed.error;
+      } catch {
+        // Ignore
+      }
+      reject(new Error(errMsg));
+    };
+
+    xhr.onerror = () => {
+      reject(new Error('Falha de rede durante o envio do arquivo'));
+    };
+
+    const form = new FormData();
+    form.append('file', file, filename);
+    xhr.send(form);
+  });
 }
 
 export interface ServerHealthStatus {
@@ -270,7 +364,11 @@ export const api = {
         signal: ctrl.signal,
       });
       if (!res.ok) {
-        return { ok: false, latencyMs: Math.round(performance.now() - start), error: `HTTP ${res.status}` };
+        return {
+          ok: false,
+          latencyMs: Math.round(performance.now() - start),
+          error: `HTTP ${res.status}`,
+        };
       }
       const data = (await res.json()) as {
         status?: string;
@@ -345,11 +443,28 @@ export const api = {
       body: JSON.stringify(settings),
     }),
 
-  updateProfile: (updates: { displayName?: string; avatarUrl?: string | null }) =>
+  updateProfile: (updates: UpdateProfileInput) =>
     apiRequest<{ user: AuthUser }>('/api/users/me/profile', {
       method: 'PATCH',
       body: JSON.stringify(updates),
     }),
+
+  uploadAvatar: (
+    file: File | Blob,
+    filename = 'avatar.png',
+    onProgress?: (info: UploadProgressInfo) => void
+  ) =>
+    uploadMultipartWithProgress<{ user: AuthUser; avatarUrl: string }>(
+      '/api/users/me/avatar',
+      file,
+      filename,
+      onProgress
+    ),
+
+  getPublicUserProfile: (username: string) =>
+    apiRequest<{ user: UserPublic }>(
+      `/api/users/${encodeURIComponent(username.replace(/^@+/, ''))}/profile`
+    ),
 
   listRooms: () => apiRequest<{ rooms: RoomSummary[] }>('/api/rooms'),
 
@@ -364,13 +479,16 @@ export const api = {
       method: 'DELETE',
     }),
 
-  uploadFile: async (file: File): Promise<ChatAttachment> => {
-    const form = new FormData();
-    form.append('file', file, file.name);
-    const data = await apiRequest<{ attachment: ChatAttachment }>('/api/uploads', {
-      method: 'POST',
-      body: form,
-    });
+  uploadFile: async (
+    file: File,
+    onProgress?: (info: UploadProgressInfo) => void
+  ): Promise<ChatAttachment> => {
+    const data = await uploadMultipartWithProgress<{ attachment: ChatAttachment }>(
+      '/api/uploads',
+      file,
+      file.name,
+      onProgress
+    );
     return data.attachment;
   },
 
