@@ -127,6 +127,37 @@ export const BroadcasterDeck: React.FC<{ stream: ActiveStreamInfo }> = ({ stream
     }
   };
 
+  const handleToggleUltraPerformance = async () => {
+    const isUltra = stream.connectionMode === 'ultra-performance';
+    setApplyingBitrate(true);
+    try {
+      const nextMode = isUltra ? 'auto' : 'ultra-performance';
+      const nextKbps = isUltra ? 8000 : 4500;
+      const nextAudio = isUltra ? 320 : 128;
+      setLiveBitrateInput(nextKbps);
+      await updateBroadcastSettings({
+        connectionMode: nextMode,
+        targetBitrateKbps: nextKbps,
+        audioBitrateKbps: nextAudio,
+      });
+      pushToast({
+        title: isUltra
+          ? 'Modo Padrão restaurado'
+          : '⚡ Modo Ultra Performance ativado ao vivo',
+        body: isUltra
+          ? 'Qualidade padrão reativada na transmissão.'
+          : 'Impacto mínimo no jogo (60 FPS fluidos, encoder CAVLC zero B-frames e zero shaders em background).',
+      });
+    } catch (err) {
+      pushToast({
+        title: 'Falha ao alternar modo de desempenho',
+        body: err instanceof Error ? err.message : 'Tente novamente',
+      });
+    } finally {
+      setApplyingBitrate(false);
+    }
+  };
+
   return (
     <div
       className="rounded-2xl border p-5 transition-all"
@@ -190,6 +221,16 @@ export const BroadcasterDeck: React.FC<{ stream: ActiveStreamInfo }> = ({ stream
             <span className="live-dot h-2 w-2 rounded-full bg-current" />
             AO VIVO
           </span>
+
+          {stream.connectionMode === 'ultra-performance' && (
+            <span
+              className="ultra-perf-badge inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide"
+              title="Modo Ultra Performance ativo: 60 FPS fluidos com mínimo impacto em GPU/CPU/RAM"
+            >
+              <Zap className="h-3 w-3" />
+              Ultra Performance
+            </span>
+          )}
 
           {stream.relayActive && (
             <span
@@ -397,6 +438,30 @@ export const BroadcasterDeck: React.FC<{ stream: ActiveStreamInfo }> = ({ stream
               Aplicar
             </button>
           )}
+
+          <button
+            type="button"
+            disabled={applyingBitrate}
+            onClick={() => void handleToggleUltraPerformance()}
+            title="Alternar Modo Ultra Performance ao vivo sem reiniciar a transmissão"
+            className={`inline-flex h-7 items-center gap-1 rounded-lg px-2.5 text-[11px] font-semibold transition-all ${
+              stream.connectionMode === 'ultra-performance' ? 'ultra-perf-badge' : 'border'
+            }`}
+            style={
+              stream.connectionMode !== 'ultra-performance'
+                ? {
+                    borderColor: 'var(--border-hairline)',
+                    backgroundColor: 'var(--bg-elevated)',
+                    color: 'var(--text-secondary)',
+                  }
+                : undefined
+            }
+          >
+            <Zap className="h-3 w-3" />
+            {stream.connectionMode === 'ultra-performance'
+              ? 'Ultra Performance Ativo'
+              : 'Ativar Ultra Performance'}
+          </button>
         </div>
 
         {stream.viewerUsers.length > 0 && (

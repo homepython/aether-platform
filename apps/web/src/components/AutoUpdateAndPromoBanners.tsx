@@ -171,3 +171,4 @@ export const RolePromotionModal: React.FC = () => {
     </div>
   );
 };
+

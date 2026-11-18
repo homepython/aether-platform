@@ -32,6 +32,7 @@ export const StreamFpsSchema = z.union([
 
 export const STREAM_PROFILES = [
   'auto',
+  'ultra-performance',
   '720p',
   '1080p',
   '1440p',
@@ -47,12 +48,30 @@ export const StreamPrivacyModeSchema = z.enum(STREAM_PRIVACY_MODES);
 
 export const STREAM_CONNECTION_MODES = [
   'auto',
-  'quality',
+  'ultra-performance',
   'performance',
+  'quality',
   'compatibility',
 ] as const;
 export type StreamConnectionMode = (typeof STREAM_CONNECTION_MODES)[number];
 export const StreamConnectionModeSchema = z.enum(STREAM_CONNECTION_MODES);
+
+/**
+ * Calibrated Ultra Performance preset for competitive gaming:
+ * - 720p @ 60 FPS true frame rate
+ * - 4,500 Kbps H.264 Constrained Baseline (42e01f, zero B-frames, CAVLC hardware encoder path)
+ * - 128 Kbps Stereo Opus
+ * - 'maintain-framerate' + 'motion' hint + zero background shader overhead
+ */
+export const ULTRA_PERFORMANCE_PRESET = {
+  profile: 'ultra-performance' as const,
+  resolution: '720p' as const,
+  fps: 60 as const,
+  targetBitrateKbps: 4500,
+  audioBitrateKbps: 128,
+  connectionMode: 'ultra-performance' as const,
+  contentOptimization: 'motion' as const,
+};
 
 export const STREAM_AUDIO_BITRATE_PRESETS = [64, 96, 128, 192, 256, 320] as const;
 export const STREAM_VIDEO_BITRATE_PRESETS = [1000, 2000, 5000, 8000, 12000, 20000, 26000] as const;
@@ -183,7 +202,8 @@ export const STREAM_RESOLUTION_SPECS: Record<StreamResolution, ResolutionSpec> =
 export function resolveTargetBitrateKbps(
   resolution: StreamResolution,
   fps: StreamFps,
-  customBitrateKbps?: number | null
+  customBitrateKbps?: number | null,
+  connectionMode?: StreamConnectionMode
 ): number {
   const spec = STREAM_RESOLUTION_SPECS[resolution] ?? STREAM_RESOLUTION_SPECS['1080p'];
   if (
@@ -194,7 +214,14 @@ export function resolveTargetBitrateKbps(
     // Allow full manual user control within safe WebRTC transport limits (300 Kbps .. 60,000 Kbps)
     return Math.max(300, Math.min(60000, Math.round(customBitrateKbps)));
   }
-  return spec.targetBitrateByFpsKbps[fps] ?? 8000;
+  const base = spec.targetBitrateByFpsKbps[fps] ?? 8000;
+  if (connectionMode === 'ultra-performance') {
+    if (resolution === '720p' && fps === 60) {
+      return ULTRA_PERFORMANCE_PRESET.targetBitrateKbps;
+    }
+    return Math.max(800, Math.round(base * 0.75));
+  }
+  return base;
 }
 
 export function resolveTargetAudioBitrateKbps(customAudioBitrateKbps?: number | null): number {

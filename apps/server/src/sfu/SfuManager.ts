@@ -586,6 +586,7 @@ export class SfuManager {
       audioBitrateKbps?: number;
       privacy?: StreamPrivacyMode;
       viewerLimit?: number | null;
+      connectionMode?: StreamConnectionMode;
     }
   ): ActiveStreamInfo | null {
     const record = this.streams.get(streamId);
@@ -596,6 +597,7 @@ export class SfuManager {
     if (updates.audioBitrateKbps !== undefined) record.audioBitrateKbps = updates.audioBitrateKbps;
     if (updates.privacy !== undefined) record.privacy = updates.privacy;
     if (updates.viewerLimit !== undefined) record.viewerLimit = updates.viewerLimit;
+    if (updates.connectionMode !== undefined) record.connectionMode = updates.connectionMode;
     return this.serializeStream(record);
   }
 

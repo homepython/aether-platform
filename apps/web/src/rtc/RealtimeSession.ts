@@ -1864,16 +1864,19 @@ export class RealtimeSession {
     }
     await this.stopLiveStream();
 
+    const connectionMode: StreamConnectionMode = options.connectionMode ?? 'auto';
     const targetBitrateKbps = resolveTargetBitrateKbps(
       options.resolution,
       options.fps,
-      options.customBitrateKbps
+      options.customBitrateKbps,
+      connectionMode
     );
-    const audioBitrateKbps = resolveTargetAudioBitrateKbps(options.audioBitrateKbps);
+    const audioBitrateKbps = resolveTargetAudioBitrateKbps(
+      options.audioBitrateKbps ?? (connectionMode === 'ultra-performance' ? 128 : 320)
+    );
     const privacy: StreamPrivacyMode = options.privacy ?? 'public';
     const allowedUserIds = options.allowedUserIds ?? [];
     const viewerLimit = options.viewerLimit ?? null;
-    const connectionMode: StreamConnectionMode = options.connectionMode ?? 'auto';
 
     try {
       await audioEngine.resumeContexts();
@@ -1972,7 +1975,14 @@ export class RealtimeSession {
         throw new Error('Nenhuma fonte de vídeo ativa foi capturada');
       }
 
-      videoTrack.contentHint = options.contentOptimization;
+      videoTrack.contentHint =
+        connectionMode === 'ultra-performance' ? 'motion' : options.contentOptimization;
+      if (typeof document !== 'undefined') {
+        document.documentElement.classList.toggle(
+          'ultra-perf-active',
+          connectionMode === 'ultra-performance'
+        );
+      }
       videoTrack.onended = () => {
         void this.stopLiveStream();
         this.onLocalStreamEndedExternally?.();
@@ -2093,16 +2103,47 @@ export class RealtimeSession {
   }
 
   /**
-   * Real-Time Live Stream Adjustment: updates video/audio bitrates, privacy, or viewer limit
-   * instantaneously on active WebRTC encoders and room metadata without restarting the broadcast!
+   * Real-Time Live Stream Adjustment: updates video/audio bitrates, connectionMode (including Ultra Performance),
+   * privacy, or viewer limit instantaneously on active WebRTC encoders and room metadata without restarting!
    */
   public async updateLiveStreamSettings(patch: {
     targetBitrateKbps?: number;
     audioBitrateKbps?: number;
     privacy?: StreamPrivacyMode;
     viewerLimit?: number | null;
+    connectionMode?: StreamConnectionMode;
   }): Promise<ActiveStreamInfo | null> {
     if (!this.localStreamId) return null;
+
+    if (patch.connectionMode) {
+      if (this.p2pBroadcastTracks) {
+        this.p2pBroadcastTracks.connectionMode = patch.connectionMode;
+        this.p2pBroadcastTracks.videoTrack.contentHint =
+          patch.connectionMode === 'ultra-performance' ? 'motion' : this.lastContentOptimization;
+      }
+      if (typeof document !== 'undefined') {
+        document.documentElement.classList.toggle(
+          'ultra-perf-active',
+          patch.connectionMode === 'ultra-performance'
+        );
+      }
+      const nextDeg = this.resolveDegradationPreference(patch.connectionMode, this.lastStreamFps);
+      for (const pc of this.p2pStreamSenders.values()) {
+        const vSender = pc.getSenders().find((s) => s.track?.kind === 'video');
+        if (vSender) {
+          const p = vSender.getParameters();
+          p.degradationPreference = nextDeg;
+          void vSender.setParameters(p).catch(() => {});
+        }
+      }
+      const sfuSender = this.localVideoProducer?.rtpSender;
+      if (sfuSender) {
+        const p = sfuSender.getParameters();
+        p.degradationPreference = nextDeg;
+        void sfuSender.setParameters(p).catch(() => {});
+      }
+      this.startBroadcasterTelemetryLoop(this.localStreamId);
+    }
 
     if (typeof patch.targetBitrateKbps === 'number' && patch.targetBitrateKbps >= 300) {
       const clampedKbps = Math.min(60000, Math.round(patch.targetBitrateKbps));
@@ -2242,10 +2283,13 @@ export class RealtimeSession {
       } catch {
         // Ignore transient stats error
       }
-    }, 1500);
+    }, this.p2pBroadcastTracks?.connectionMode === 'ultra-performance' ? 2500 : 1500);
   }
 
   public async stopLiveStream(): Promise<void> {
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.remove('ultra-perf-active');
+    }
     if (this.localTelemetryTimer !== null) {
       window.clearInterval(this.localTelemetryTimer);
       this.localTelemetryTimer = null;

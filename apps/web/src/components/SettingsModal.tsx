@@ -11,12 +11,14 @@ import {
   ShieldCheck,
   Volume2,
   X,
+  Zap,
 } from 'lucide-react';
 import {
   STREAM_AUDIO_BITRATE_PRESETS,
   STREAM_FPS_OPTIONS,
   STREAM_RESOLUTIONS,
   STREAM_RESOLUTION_SPECS,
+  ULTRA_PERFORMANCE_PRESET,
   resolveTargetBitrateKbps,
   type OverlayPositionPreset,
   type ShortcutSettings,
@@ -748,6 +750,91 @@ export const SettingsModal: React.FC = () => {
             {/* TAB 2: STREAM STUDIO DEFAULTS */}
             {activeTab === 'stream' && (
               <>
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateSettings((prev) => {
+                      const isUltra =
+                        prev.stream.profile === 'ultra-performance' ||
+                        prev.stream.connectionMode === 'ultra-performance';
+                      if (isUltra) {
+                        return {
+                          ...prev,
+                          stream: {
+                            ...prev.stream,
+                            profile: '1080p',
+                            resolution: '1080p',
+                            fps: 60,
+                            bitrateMode: 'auto',
+                            customBitrateKbps: null,
+                            audioBitrateKbps: 320,
+                            connectionMode: 'auto',
+                            contentOptimization: 'motion',
+                          },
+                        };
+                      }
+                      return {
+                        ...prev,
+                        stream: {
+                          ...prev.stream,
+                          profile: ULTRA_PERFORMANCE_PRESET.profile,
+                          resolution: ULTRA_PERFORMANCE_PRESET.resolution,
+                          fps: ULTRA_PERFORMANCE_PRESET.fps,
+                          bitrateMode: 'auto',
+                          customBitrateKbps: null,
+                          audioBitrateKbps: ULTRA_PERFORMANCE_PRESET.audioBitrateKbps,
+                          connectionMode: ULTRA_PERFORMANCE_PRESET.connectionMode,
+                          contentOptimization: ULTRA_PERFORMANCE_PRESET.contentOptimization,
+                        },
+                      };
+                    })
+                  }
+                  className={`flex w-full items-center justify-between gap-3 rounded-2xl border p-4 text-left transition-all ${
+                    settings.stream.connectionMode === 'ultra-performance'
+                      ? 'ultra-perf-card'
+                      : ''
+                  }`}
+                  style={
+                    settings.stream.connectionMode !== 'ultra-performance'
+                      ? {
+                          borderColor: 'var(--border-strong)',
+                          backgroundColor: 'var(--bg-elevated)',
+                        }
+                      : undefined
+                  }
+                >
+                  <div className="flex items-center gap-3">
+                    <div
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl"
+                      style={{
+                        backgroundColor:
+                          settings.stream.connectionMode === 'ultra-performance'
+                            ? 'rgba(6, 182, 212, 0.22)'
+                            : 'var(--accent-soft)',
+                        color:
+                          settings.stream.connectionMode === 'ultra-performance'
+                            ? '#22d3ee'
+                            : 'var(--accent)',
+                      }}
+                    >
+                      <Zap className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 text-xs font-semibold">
+                        <span>Modo Ultra Performance Padrão (60 FPS • Zero Impacto)</span>
+                        <span className="ultra-perf-badge rounded-full px-2 py-0.5 text-[10px] font-bold uppercase">
+                          {settings.stream.connectionMode === 'ultra-performance'
+                            ? 'PADRÃO ATIVO'
+                            : 'DESEMPENHO EXTREMO'}
+                        </span>
+                      </div>
+                      <div className="mt-0.5 text-[11px]" style={{ color: 'var(--text-secondary)' }}>
+                        Prioriza máximo FPS nos jogos com 60 FPS reais na live, encoder H.264 CAVLC sem B-frames e zero shaders em background.
+                      </div>
+                    </div>
+                  </div>
+                </button>
+
                 <div>
                   <label className="mb-2 block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
                     Resolução Padrão de Transmissão

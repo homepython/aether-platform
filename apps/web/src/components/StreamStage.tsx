@@ -11,6 +11,7 @@ import {
   Volume2,
   VolumeX,
   XCircle,
+  Zap,
 } from 'lucide-react';
 import { hasRoleAtLeast, ROLE_RANK, type ActiveStreamInfo } from '@aether/shared';
 import { useAppStore, type WatchedStreamViewState } from '../store/useAppStore.js';
@@ -196,6 +197,12 @@ const ActiveWatchedPlayer: React.FC<{
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-semibold tabular-nums">
+          {info.connectionMode === 'ultra-performance' && (
+            <span className="ultra-perf-badge inline-flex items-center gap-1 rounded-md px-2 py-0.5 backdrop-blur-md">
+              <Zap className="h-3 w-3" />
+              Ultra Performance
+            </span>
+          )}
           <span
             className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 backdrop-blur-md"
             style={{
@@ -394,6 +401,12 @@ export const StreamStage: React.FC = () => {
                       />
                       <UserRoleBadge role={st.broadcasterRole} compact />
                     </span>
+                    {st.connectionMode === 'ultra-performance' && (
+                      <span className="ultra-perf-badge inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase">
+                        <Zap className="h-2.5 w-2.5" />
+                        Ultra Perf
+                      </span>
+                    )}
                     {st.privacy !== 'public' && (
                       <span
                         className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium"

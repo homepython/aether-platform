@@ -192,6 +192,7 @@ interface AppState {
     audioBitrateKbps?: number;
     privacy?: StreamPrivacyMode;
     viewerLimit?: number | null;
+    connectionMode?: StreamConnectionMode;
   }) => Promise<void>;
   reauthorizeCapture: (source?: DesktopCaptureSourceItem) => Promise<void>;
   stopBroadcast: () => Promise<void>;

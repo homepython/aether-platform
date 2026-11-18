@@ -154,6 +154,7 @@ export const StreamUpdateMetaParamsSchema = z.object({
   audioBitrateKbps: z.number().min(32).max(510).optional(),
   privacy: StreamPrivacyModeSchema.optional(),
   viewerLimit: z.number().int().min(1).max(500).nullable().optional(),
+  connectionMode: StreamConnectionModeSchema.optional(),
 });
 
 export const StreamTelemetryParamsSchema = z.object({

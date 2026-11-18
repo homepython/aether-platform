@@ -19,6 +19,7 @@ import {
   Sliders,
   Users,
   X,
+  Zap,
 } from 'lucide-react';
 import {
   STREAM_AUDIO_BITRATE_PRESETS,
@@ -27,6 +28,7 @@ import {
   STREAM_RESOLUTION_SPECS,
   STREAM_VIDEO_BITRATE_PRESETS,
   STREAM_VIEWER_LIMIT_PRESETS,
+  ULTRA_PERFORMANCE_PRESET,
   resolveTargetAudioBitrateKbps,
   resolveTargetBitrateKbps,
   type StreamConnectionMode,
@@ -57,9 +59,15 @@ const PROFILE_DEFS: {
 }[] = [
   { id: 'auto', label: 'Automático', desc: 'Equilíbrio inteligente GPU/Rede' },
   {
+    id: 'ultra-performance',
+    label: '⚡ Ultra Performance',
+    desc: '60 FPS Reais • Zero Impacto no Jogo',
+    apply: { resolution: '720p', fps: 60, optimization: 'motion' },
+  },
+  {
     id: '720p',
     label: '720p Gaming',
-    desc: 'Máximo FPS em jogos pesados (Fortnite)',
+    desc: 'Alta fluidez em jogos pesados',
     apply: { resolution: '720p', fps: 60, optimization: 'motion' },
   },
   {
@@ -241,13 +249,38 @@ export const StreamLauncherModal: React.FC = () => {
 
   if (!open) return null;
 
-  const autoKbps = resolveTargetBitrateKbps(resolution, fps, null);
+  const isUltraPerf =
+    profile === 'ultra-performance' || connectionMode === 'ultra-performance';
+
+  const autoKbps = resolveTargetBitrateKbps(resolution, fps, null, connectionMode);
   const targetKbps = resolveTargetBitrateKbps(
     resolution,
     fps,
-    bitrateMode === 'custom' ? customBitrateKbps : null
+    bitrateMode === 'custom' ? customBitrateKbps : null,
+    connectionMode
   );
   const effectiveAudioKbps = resolveTargetAudioBitrateKbps(audioBitrateKbps);
+
+  const activateUltraPerformance = () => {
+    if (isUltraPerf) {
+      setProfile('1080p');
+      setResolution('1080p');
+      setFps(60);
+      setBitrateMode('auto');
+      setAudioBitrateKbps(320);
+      setConnectionMode('auto');
+      setContentOptimization('motion');
+    } else {
+      setProfile(ULTRA_PERFORMANCE_PRESET.profile);
+      setResolution(ULTRA_PERFORMANCE_PRESET.resolution);
+      setFps(ULTRA_PERFORMANCE_PRESET.fps);
+      setBitrateMode('auto');
+      setCustomBitrateKbps(ULTRA_PERFORMANCE_PRESET.targetBitrateKbps);
+      setAudioBitrateKbps(ULTRA_PERFORMANCE_PRESET.audioBitrateKbps);
+      setConnectionMode(ULTRA_PERFORMANCE_PRESET.connectionMode);
+      setContentOptimization(ULTRA_PERFORMANCE_PRESET.contentOptimization);
+    }
+  };
 
   const filteredDesktopSources = sources.filter((s) => s.kind === sourceTab);
   const chosenSource = sources.find((s) => s.id === selectedSourceId) || null;
@@ -328,13 +361,15 @@ export const StreamLauncherModal: React.FC = () => {
         : `Privada (${allowedUserIds.length} convidados)`;
 
   const connectionLabel =
-    connectionMode === 'auto'
-      ? 'Auto'
-      : connectionMode === 'quality'
-        ? 'Qualidade Máx.'
-        : connectionMode === 'performance'
-          ? 'Anti-Lag Jogos'
-          : 'Cloud Relay (Compatibilidade)';
+    connectionMode === 'ultra-performance'
+      ? '⚡ Ultra Performance (60 FPS Zero-Lag)'
+      : connectionMode === 'auto'
+        ? 'Auto'
+        : connectionMode === 'quality'
+          ? 'Qualidade Máx.'
+          : connectionMode === 'performance'
+            ? 'Anti-Lag Jogos'
+            : 'Cloud Relay (Compatibilidade)';
 
   const audioModeSummary = !shareAudio
     ? 'Sem Áudio'
@@ -544,6 +579,59 @@ export const StreamLauncherModal: React.FC = () => {
           {/* ================================================================= */}
           {!studioMode ? (
             <>
+              {/* 1-Click Ultra Performance Mode Banner */}
+              <button
+                type="button"
+                onClick={activateUltraPerformance}
+                className={`flex w-full items-center justify-between gap-3 rounded-2xl border p-3.5 text-left transition-all ${
+                  isUltraPerf ? 'ultra-perf-card' : ''
+                }`}
+                style={
+                  !isUltraPerf
+                    ? {
+                        borderColor: 'var(--border-strong)',
+                        backgroundColor: 'var(--bg-elevated)',
+                      }
+                    : undefined
+                }
+              >
+                <div className="flex items-center gap-3">
+                  <div
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl"
+                    style={{
+                      backgroundColor: isUltraPerf
+                        ? 'rgba(6, 182, 212, 0.22)'
+                        : 'var(--accent-soft)',
+                      color: isUltraPerf ? '#22d3ee' : 'var(--accent)',
+                    }}
+                  >
+                    <Zap className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
+                      <span>Modo Ultra Performance (Desempenho Máximo em Jogos)</span>
+                      <span className="ultra-perf-badge rounded-full px-2 py-0.5 text-[10px] font-bold uppercase">
+                        {isUltraPerf ? 'ATIVO • 60 FPS REAIS' : 'NOVO'}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 text-[11px]" style={{ color: 'var(--text-secondary)' }}>
+                      Mantém 60 FPS constantes na live com impacto quase nulo no FPS do jogo, GPU, CPU e RAM.
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  className="shrink-0 rounded-xl px-3 py-1.5 text-xs font-semibold transition-all"
+                  style={{
+                    backgroundColor: isUltraPerf ? '#06b6d4' : 'var(--bg-surface)',
+                    color: isUltraPerf ? '#042f2e' : 'var(--text-secondary)',
+                    border: isUltraPerf ? 'none' : '1px solid var(--border-hairline)',
+                  }}
+                >
+                  {isUltraPerf ? 'Ativado' : 'Ativar'}
+                </div>
+              </button>
+
               <div>
                 <label className="mb-2 block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
                   Qualidade de Resolução
@@ -671,11 +759,20 @@ export const StreamLauncherModal: React.FC = () => {
                             setFps(p.apply.fps);
                             setContentOptimization(p.apply.optimization);
                           }
-                          if (p.id === '720p' || p.id === 'original') {
+                          if (p.id === 'ultra-performance') {
+                            setBitrateMode('auto');
+                            setCustomBitrateKbps(ULTRA_PERFORMANCE_PRESET.targetBitrateKbps);
+                            setAudioBitrateKbps(ULTRA_PERFORMANCE_PRESET.audioBitrateKbps);
+                            setConnectionMode('ultra-performance');
+                          } else if (p.id === '720p' || p.id === 'original') {
                             setConnectionMode('performance');
+                          } else if (connectionMode === 'ultra-performance') {
+                            setConnectionMode('auto');
                           }
                         }}
-                        className="rounded-xl border p-2.5 text-left transition-all"
+                        className={`rounded-xl border p-2.5 text-left transition-all ${
+                          active && p.id === 'ultra-performance' ? 'ultra-perf-card' : ''
+                        }`}
                         style={{
                           borderColor: active ? 'var(--accent)' : 'var(--border-hairline)',
                           backgroundColor: active ? 'var(--bg-active)' : 'var(--bg-elevated)',
@@ -1101,6 +1198,7 @@ export const StreamLauncherModal: React.FC = () => {
                     {(
                       [
                         { id: 'auto', label: 'Automático' },
+                        { id: 'ultra-performance', label: '⚡ Ultra Performance' },
                         { id: 'performance', label: 'Desempenho (Jogos)' },
                         { id: 'quality', label: 'Melhor Nitidez' },
                         { id: 'compatibility', label: 'Compatibilidade (Relay)' },

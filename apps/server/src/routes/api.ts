@@ -114,7 +114,7 @@ function findDesktopInstallerFile(): { fullPath: string; filename: string; sizeB
 }
 
 const DEFAULT_GITHUB_INSTALLER_URL =
-  'https://github.com/homepython/aether-platform/releases/download/v1.1.0/Aether-Setup-1.1.0.exe';
+  'https://github.com/homepython/aether-platform/releases/download/v1.2.0/Aether-Setup-1.2.0.exe';
 
 export async function registerApiRoutes(
   app: FastifyInstance,

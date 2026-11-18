@@ -1067,6 +1067,7 @@ export class RealtimeGateway {
           if (params.audioBitrateKbps !== undefined) p2pRec.audioBitrateKbps = params.audioBitrateKbps;
           if (params.privacy !== undefined) p2pRec.privacy = params.privacy;
           if (params.viewerLimit !== undefined) p2pRec.viewerLimit = params.viewerLimit;
+          if (params.connectionMode !== undefined) p2pRec.connectionMode = params.connectionMode;
           const serialized = this.serializeP2pStream(p2pRec);
           this.broadcastToRoom(p2pRec.roomId, {
             type: 'event',
@@ -1083,6 +1084,7 @@ export class RealtimeGateway {
           audioBitrateKbps: params.audioBitrateKbps,
           privacy: params.privacy,
           viewerLimit: params.viewerLimit,
+          connectionMode: params.connectionMode,
         });
         if (updated) {
           this.broadcastToRoom(updated.roomId, {

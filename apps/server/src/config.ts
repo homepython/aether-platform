@@ -52,7 +52,7 @@ fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadsDir, { recursive: true });
 
 export const config = {
-  appVersion: '1.1.0',
+  appVersion: '1.2.0',
   nodeEnv: process.env.NODE_ENV || 'development',
   isProduction: process.env.NODE_ENV === 'production',
   host: process.env.HOST || '0.0.0.0',

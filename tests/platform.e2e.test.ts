@@ -10,10 +10,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import {
   DEFAULT_USER_SETTINGS,
+  STREAM_CONNECTION_MODES,
   STREAM_FPS_OPTIONS,
+  STREAM_PROFILES,
   STREAM_RESOLUTIONS,
   StreamFpsSchema,
   StreamResolutionSchema,
+  ULTRA_PERFORMANCE_PRESET,
   resolveTargetBitrateKbps,
   type ActiveStreamInfo,
   type ChatMessage,
@@ -176,9 +179,11 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     }
   });
 
-  it('enforces Studio & Quick stream resolutions (360p..original), FPS (5..144), and manual/auto bitrates', () => {
+  it('enforces Studio, Quick & Ultra Performance stream resolutions (360p..original), FPS (5..144), and manual/auto bitrates', () => {
     expect(STREAM_RESOLUTIONS).toEqual(['360p', '480p', '720p', '1080p', '1440p', 'original']);
     expect(STREAM_FPS_OPTIONS).toEqual([5, 30, 60, 75, 100, 120, 144]);
+    expect(STREAM_PROFILES).toContain('ultra-performance');
+    expect(STREAM_CONNECTION_MODES).toContain('ultra-performance');
 
     expect(StreamResolutionSchema.safeParse('1440p').success).toBe(true);
     expect(StreamResolutionSchema.safeParse('480p').success).toBe(true);
@@ -190,8 +195,12 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
     expect(StreamFpsSchema.safeParse(5).success).toBe(true);
     expect(StreamFpsSchema.safeParse(24).success).toBe(false);
 
-    // Verify 1440p @ 75fps gets high-clarity 26 Mbps target bitrate & Studio manual bitrates work cleanly
+    // Verify 1440p @ 75fps gets high-clarity 26 Mbps target bitrate, Ultra Performance gets 4500 Kbps @ 720p60, & Studio manual bitrates work cleanly
     expect(resolveTargetBitrateKbps('1440p', 75, null)).toBe(26000);
+    expect(resolveTargetBitrateKbps('720p', 60, null, 'ultra-performance')).toBe(
+      ULTRA_PERFORMANCE_PRESET.targetBitrateKbps
+    );
+    expect(ULTRA_PERFORMANCE_PRESET.fps).toBe(60);
     expect(resolveTargetBitrateKbps('1080p', 60, 18500)).toBe(18500);
     expect(resolveTargetBitrateKbps('720p', 60, 999999)).toBe(60000);
     expect(resolveTargetBitrateKbps('360p', 30, 50)).toBe(300);
@@ -952,7 +961,7 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
       maxUploadBytes: number;
     };
     expect(health.status).toBe('ok');
-    expect(health.version).toBe('1.1.0');
+    expect(health.version).toBe('1.2.0');
     expect(health.maxUploadBytes).toBe(550 * 1024 * 1024);
 
     const portalRes = await fetch(`${baseUrl}/`);
@@ -977,7 +986,7 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
       downloadUrl: string;
     };
     expect(info.available).toBe(true);
-    expect(info.filename).toBe('Aether-Setup-1.1.0.exe');
+    expect(info.filename).toBe('Aether-Setup-1.2.0.exe');
     expect(info.sizeBytes).toBeGreaterThan(50 * 1024 * 1024);
 
     // Stream first bytes of the real NSIS installer and verify Windows PE 'MZ' header
@@ -1350,15 +1359,17 @@ describe('Aether Production Platform — Real End-to-End Verification', () => {
       wsPedro.rpc('p2p:streamWatch', { streamId: studioStreamId })
     ).rejects.toMatchObject({ code: 'STREAM_PRIVATE' });
 
-    // Live Studio settings update: open stream to public + bump bitrate to 22000 Kbps (keep viewerLimit=1)
+    // Live Studio settings update: open stream to public + switch live to Ultra Performance (keep viewerLimit=1)
     const metaUpd = await wsClaraNew.rpc<{ stream: ActiveStreamInfo }>('stream:updateMeta', {
       streamId: studioStreamId,
       privacy: 'public',
-      targetBitrateKbps: 22000,
+      connectionMode: 'ultra-performance',
+      targetBitrateKbps: 4500,
       viewerLimit: 1,
     });
     expect(metaUpd.stream.privacy).toBe('public');
-    expect(metaUpd.stream.targetBitrateKbps).toBe(22000);
+    expect(metaUpd.stream.connectionMode).toBe('ultra-performance');
+    expect(metaUpd.stream.targetBitrateKbps).toBe(4500);
 
     // Cloud WSS Binary Media Relay: Clara starts relay + caches WebM EBML init segment
     await wsClaraNew.rpc('stream:relayStart', {

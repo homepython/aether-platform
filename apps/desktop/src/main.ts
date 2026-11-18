@@ -73,7 +73,7 @@ export interface UpdaterStatusPayload {
 
 let latestUpdaterStatus: UpdaterStatusPayload = {
   status: 'idle',
-  currentVersion: app.getVersion() || '1.1.0',
+  currentVersion: app.getVersion() || '1.2.0',
   availableVersion: null,
   releaseNotes: null,
   progressPercent: 0,
@@ -84,7 +84,7 @@ let latestUpdaterStatus: UpdaterStatusPayload = {
 function emitUpdaterStatus(patch: Partial<UpdaterStatusPayload>): void {
   latestUpdaterStatus = {
     ...latestUpdaterStatus,
-    currentVersion: app.getVersion() || '1.1.0',
+    currentVersion: app.getVersion() || '1.2.0',
     ...patch,
   };
   if (mainWindow && !mainWindow.isDestroyed()) {

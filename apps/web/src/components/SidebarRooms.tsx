@@ -273,7 +273,7 @@ export const SidebarRooms: React.FC = () => {
                 className="rounded px-1 py-0.2 text-[9px] font-bold uppercase"
                 style={{ backgroundColor: 'var(--accent-soft)', color: 'var(--accent)' }}
               >
-                v1.1
+                v1.2
               </span>
             </div>
             <div className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
@@ -450,12 +450,16 @@ export const SidebarRooms: React.FC = () => {
             backgroundColor: 'var(--bg-sidebar)',
           }}
         >
-          {/* Row 1: Full-width Clickable Identity Card */}
+          {/* Row 1: Full-width Clickable Identity Card (Dedicated Row — Never Overlaps Controls) */}
           <button
             type="button"
             onClick={() => setProfileModalOpen(true)}
-            title="Clique para editar seu perfil, avatar/GIF e @nickname"
-            className="flex w-full items-center gap-2.5 rounded-xl px-2 py-1.5 text-left transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+            title="Clique para editar seu perfil, foto/GIF animado e @nickname"
+            className="flex w-full items-center gap-2.5 rounded-xl border px-2.5 py-2 text-left transition-all hover:opacity-95"
+            style={{
+              borderColor: 'var(--border-hairline)',
+              backgroundColor: 'var(--bg-surface)',
+            }}
           >
             <UserAvatar
               user={user}
@@ -464,13 +468,26 @@ export const SidebarRooms: React.FC = () => {
               showPresence
               isOnline={wsConnected}
             />
-            <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 items-center gap-1.5 text-xs">
-                <StyledUserName name={user.displayName} role={user.role} className="font-semibold" />
-                <UserRoleBadge role={user.role} compact />
+            <div className="min-w-0 flex-1 overflow-hidden">
+              <div className="flex min-w-0 items-center justify-between gap-1.5 text-xs">
+                <span className="min-w-0 truncate">
+                  <StyledUserName
+                    name={user.displayName}
+                    role={user.role}
+                    className="font-semibold"
+                  />
+                </span>
+                <span className="shrink-0">
+                  <UserRoleBadge role={user.role} compact />
+                </span>
               </div>
-              <div className="truncate text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                @{user.username} • {user.presenceStatus === 'busy' ? 'Ocupado' : 'Online'}
+              <div
+                className="mt-0.5 flex items-center gap-1.5 truncate text-[11px]"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                <span className="truncate">@{user.username}</span>
+                <span>•</span>
+                <span>{user.presenceStatus === 'busy' ? 'Ocupado' : 'Online'}</span>
               </div>
             </div>
           </button>
